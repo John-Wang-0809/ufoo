@@ -1,0 +1,5 @@
+{
+  "subscriber": "codex:codex-listener",
+  "current_seq": 76,
+  "last_consumed_at": "2026-01-30T10:10:25.000Z"
+}

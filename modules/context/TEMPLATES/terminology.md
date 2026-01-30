@@ -1,0 +1,4 @@
+# Terminology
+
+| Term | Definition |
+|------|------------|

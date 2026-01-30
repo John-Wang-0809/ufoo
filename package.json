@@ -1,0 +1,21 @@
+{
+  "name": "ufoo",
+  "version": "0.0.0-dev",
+  "private": true,
+  "description": "CLI toolkit for multi-agent AI collaboration (context sharing, event bus, decisions).",
+  "license": "UNLICENSED",
+  "bin": {
+    "ufoo": "bin/ufoo.js",
+    "uclaude": "bin/uclaude",
+    "ucodex": "bin/ucodex"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^13.1.0"
+  }
+}
+

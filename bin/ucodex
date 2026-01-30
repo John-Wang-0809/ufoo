@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ucodex: 启动 Codex 并自动加入事件总线
+#
+# 用法: ucodex [codex 参数...]
+
+set -euo pipefail
+
+# 自动初始化 .ufoo（如果不存在）
+if [[ ! -d ".ufoo/bus" ]]; then
+  echo "[ucodex] 初始化项目总线..."
+  ufoo init --modules context,bus 2>/dev/null || true
+fi
+
+# 生成或复用 session ID
+if [[ -z "${CODEX_SESSION_ID:-}" ]]; then
+  export CODEX_SESSION_ID="$(date +%s%N | shasum | head -c 8)"
+fi
+
+# 加入事件总线（使用固定的 session ID）
+SUBSCRIBER=$(ufoo bus join "$CODEX_SESSION_ID" codex 2>/dev/null | tail -1)
+if [[ -n "$SUBSCRIBER" ]]; then
+  echo "[ucodex] 已连接 → $SUBSCRIBER"
+else
+  echo "[ucodex] ⚠ 无法连接总线"
+fi
+
+# 自动启动项目级 daemon（如果未运行）
+PID_FILE=".ufoo/bus/.daemon.pid"
+if [[ -f "$PID_FILE" ]]; then
+  existing="$(cat "$PID_FILE" 2>/dev/null || true)"
+  if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+    echo "[ucodex] 消息监听已就绪"
+  else
+    # pid 文件存在但进程已死，重启
+    ufoo bus daemon --daemon 2>/dev/null && echo "[ucodex] 消息监听已启动"
+  fi
+else
+  ufoo bus daemon --daemon 2>/dev/null && echo "[ucodex] 消息监听已启动"
+fi
+
+echo ""
+# 传递 CODEX_SESSION_ID 环境变量给 codex 进程
+exec codex "$@"

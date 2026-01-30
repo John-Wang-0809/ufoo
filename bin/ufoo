@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+usage() {
+  cat <<'USAGE'
+ufoo
+
+Monorepo layout:
+  ~/.ufoo/                   (clone of ufoo)
+    modules/ai-context/              (protocol module)
+    modules/ai-resources/            (optional resources)
+
+Usage:
+  ufoo doctor
+  ufoo init [--modules context[,resources]] [--project <dir>]
+  ufoo bus <...>            # delegates to ./scripts/bus.sh in the current project
+  ufoo ctx <...>            # delegates to ./scripts/ai-context-*.sh in the current project
+  ufoo skills list
+  ufoo skills install <name|all> [--codex|--agents|--target <dir>]
+
+Notes:
+  - `init` creates/updates <project>/.ai-context and injects CLAUDE.md/AGENTS.md blocks.
+  - For Codex notifications, prefer `scripts/bus-alert.sh` / `scripts/bus-listen.sh` (no IME issues).
+USAGE
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  ""|--help|-h)
+    usage
+    exit 0
+    ;;
+  doctor)
+    exec bash "$repo_root/scripts/doctor.sh"
+    ;;
+  init)
+    exec bash "$repo_root/scripts/init.sh" "$@"
+    ;;
+  bus)
+    # Project-local bus commands. Must be run from within the target project.
+    if [[ ! -x "./scripts/bus.sh" ]]; then
+      echo "FAIL: missing ./scripts/bus.sh. Run: ufoo init --modules bus" >&2
+      exit 1
+    fi
+    exec bash "./scripts/bus.sh" "$@"
+    ;;
+  ctx)
+    # Project-local ctx commands. Must be run from within the target project.
+    sub="${1:-doctor}"
+    shift || true
+    case "$sub" in
+      doctor)
+        exec bash "./scripts/ai-context-doctor.sh" "$@"
+        ;;
+      lint)
+        exec bash "./scripts/ai-context-lint.sh" "$@"
+        ;;
+      decisions)
+        exec bash "./scripts/ai-context-decisions.sh" "$@"
+        ;;
+      *)
+        echo "Unknown ctx subcommand: $sub" >&2
+        echo "Supported: doctor, lint, decisions" >&2
+        exit 1
+        ;;
+    esac
+    ;;
+  skills)
+    sub="${1:-}"
+    shift || true
+    exec bash "$repo_root/scripts/skills.sh" "$sub" "$@"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
