@@ -53,6 +53,34 @@ async function runCli(argv) {
         const repoRoot = getPackageRoot();
         run("bash", [path.join(repoRoot, "scripts/doctor.sh")]);
       });
+    program
+      .command("status")
+      .description("Show project status (banner, unread bus, open decisions)")
+      .action(() => {
+        const repoRoot = getPackageRoot();
+        run("bash", [path.join(repoRoot, "scripts/status.sh")]);
+      });
+    program
+      .command("daemon")
+      .description("Start/stop ufoo daemon")
+      .option("--start", "Start daemon")
+      .option("--stop", "Stop daemon")
+      .option("--status", "Check daemon status")
+      .action((opts) => {
+        const repoRoot = getPackageRoot();
+        const args = ["daemon"];
+        if (opts.start) args.push("start");
+        else if (opts.stop) args.push("stop");
+        else if (opts.status) args.push("status");
+        run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), ...args]);
+      });
+    program
+      .command("chat")
+      .description("Launch ufoo chat UI")
+      .action(() => {
+        const repoRoot = getPackageRoot();
+        run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "chat"]);
+      });
 
     program
       .command("init")
@@ -214,6 +242,9 @@ async function runCli(argv) {
     console.log("");
     console.log("Usage:");
     console.log("  ufoo doctor");
+    console.log("  ufoo status");
+    console.log("  ufoo daemon --start|--stop|--status");
+    console.log("  ufoo chat");
     console.log("  ufoo init [--modules <list>] [--project <dir>]");
     console.log("  ufoo skills list");
     console.log("  ufoo skills install <name|all> [--target <dir> | --codex | --agents]");
@@ -231,6 +262,18 @@ async function runCli(argv) {
 
   if (cmd === "doctor") {
     run("bash", [path.join(repoRoot, "scripts/doctor.sh")]);
+    return;
+  }
+  if (cmd === "status") {
+    run("bash", [path.join(repoRoot, "scripts/status.sh")]);
+    return;
+  }
+  if (cmd === "daemon") {
+    run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "daemon", ...rest]);
+    return;
+  }
+  if (cmd === "chat") {
+    run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "chat"]);
     return;
   }
   if (cmd === "init") {

@@ -143,7 +143,54 @@ set_last_count() {
   echo "$count" > "$COUNTS_DIR/$safe_name"
 }
 
+# Cleanup dead agents (check PID and mark offline)
+cleanup_dead_agents() {
+  if [[ ! -f "$BUS_DIR/bus.json" ]]; then
+    return
+  fi
+
+  local changed=0
+  local tmp_file
+  tmp_file=$(mktemp)
+
+  # Get all active subscribers with their PIDs
+  while IFS='|' read -r subscriber pid; do
+    [[ -z "$subscriber" || -z "$pid" ]] && continue
+
+    # Check if PID is still running AND is a claude/codex/node process
+    local proc_cmd
+    proc_cmd=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+    if [[ -z "$proc_cmd" ]] || ! echo "$proc_cmd" | grep -qiE "(claude|codex|node)"; then
+      echo "[daemon] $(date '+%H:%M:%S') Agent $subscriber (pid=$pid) is dead, marking offline"
+
+      # Mark as offline in bus.json
+      jq --arg name "$subscriber" \
+         '.subscribers[$name].status = "offline"' \
+         "$BUS_DIR/bus.json" > "$tmp_file" && mv "$tmp_file" "$BUS_DIR/bus.json"
+      tmp_file=$(mktemp)
+
+      # Clean up queue directory
+      local safe_name="${subscriber//:/_}"
+      rm -rf "$BUS_DIR/queues/${safe_name}" 2>/dev/null || true
+      rm -f "$BUS_DIR/offsets/${safe_name}.offset" 2>/dev/null || true
+
+      changed=1
+    fi
+  done < <(jq -r '.subscribers | to_entries[] | select(.value.status == "active") | "\(.key)|\(.value.pid)"' "$BUS_DIR/bus.json" 2>/dev/null)
+
+  rm -f "$tmp_file" 2>/dev/null || true
+}
+
+CLEANUP_COUNTER=0
+CLEANUP_INTERVAL=5  # Run cleanup every 5 cycles (10 seconds with default interval)
+
 while true; do
+  # Periodic cleanup of dead agents
+  ((CLEANUP_COUNTER++)) || true
+  if [[ $CLEANUP_COUNTER -ge $CLEANUP_INTERVAL ]]; then
+    cleanup_dead_agents
+    CLEANUP_COUNTER=0
+  fi
   # Find all subscriber queue files
   for queue_file in "$BUS_DIR/queues"/*/pending.jsonl; do
     if [[ ! -f "$queue_file" ]]; then

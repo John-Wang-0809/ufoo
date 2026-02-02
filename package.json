@@ -1,21 +1,40 @@
 {
-  "name": "ufoo",
-  "version": "0.0.0-dev",
-  "private": true,
-  "description": "CLI toolkit for multi-agent AI collaboration (context sharing, event bus, decisions).",
-  "license": "UNLICENSED",
+  "name": "u-foo",
+  "version": "1.0.2",
+  "description": "Multi-Agent Workspace Protocol. Just add u. claude → uclaude, codex → ucodex.",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://ufoo.dev",
+  "author": "UFOO Team",
+  "keywords": [
+    "cli",
+    "ai",
+    "agent",
+    "multi-agent",
+    "claude",
+    "codex",
+    "orchestration",
+    "workspace"
+  ],
   "bin": {
     "ufoo": "bin/ufoo.js",
     "uclaude": "bin/uclaude",
     "ucodex": "bin/ucodex"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "modules/",
+    "LICENSE",
+    "README.md"
+  ],
   "type": "commonjs",
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
-    "chalk": "^5.4.1",
+    "blessed": "^0.1.81",
+    "chalk": "^4.1.2",
     "commander": "^13.1.0"
   }
 }
-

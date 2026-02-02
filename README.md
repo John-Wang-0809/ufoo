@@ -1,37 +1,164 @@
 # ufoo
 
-## Project Instructions Files
+Multi-agent AI collaboration toolkit for Claude Code and OpenAI Codex.
 
-`AGENTS.md` is the canonical project instructions file. `CLAUDE.md` should contain a single line: `AGENTS.md` to avoid drift.
+## Features
 
-A global workspace manager for AI-assisted coding.
+- **Event Bus** - Real-time inter-agent messaging (`ufoo bus`)
+- **Context Sharing** - Shared decisions and project context (`ufoo ctx`)
+- **Agent Wrappers** - Auto-initialization for Claude Code (`uclaude`) and Codex (`ucodex`)
+- **Skills System** - Extensible agent capabilities (`ufoo skills`)
 
-Goal: provide a single, best-practice entrypoint to install/update optional modules globally (under `~/.ufoo/`) and initialize per-project collaboration context (under `<project>/.context/`).
+## Quick Start
 
-## Modules
+```bash
+# Clone and link globally
+git clone <repo> ~/.ufoo
+cd ~/.ufoo && npm link
 
-- `context`: multi-agent decision + context synchronization (project `.context/`)
-- `resources`: optional UI/ICONS references (non-core)
+# Initialize a project
+cd your-project
+ufoo init
 
-## Intended global layout
+# Or use agent wrappers (auto-init + bus join)
+uclaude   # instead of 'claude'
+ucodex    # instead of 'codex'
+```
+
+## Architecture
 
 ```
-~/.ufoo/
-  bin/
-  modules/
-    context/
-    resources/
-  config.yml
-  lock.yml
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│   uclaude   │     │   ucodex    │     │  other...   │
+└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
+       │                   │                   │
+       └───────────────────┼───────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  ufoo bus   │  Event Bus
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              │            │            │
+       ┌──────▼──────┐ ┌───▼───┐ ┌──────▼──────┐
+       │  .ufoo/bus  │ │context│ │  decisions  │
+       └─────────────┘ └───────┘ └─────────────┘
 ```
 
-## Next
+## Commands
 
-This repo will provide:
-- `ufoo install|update|doctor|init|skills`
-- a project initializer that creates `.context/` and injects `CLAUDE.md`/`AGENTS.md` blocks.
+| Command | Description |
+|---------|-------------|
+| `ufoo init` | Initialize .ufoo in current project |
+| `ufoo status` | Show banner, unread bus messages, open decisions |
+| `ufoo daemon --start|--stop|--status` | Manage ufoo daemon |
+| `ufoo chat` | Launch ufoo chat UI (also default when no args) |
+| `ufoo bus join` | Join event bus (auto by uclaude/ucodex) |
+| `ufoo bus send <id> <msg>` | Send message to agent |
+| `ufoo bus check <id>` | Check pending messages |
+| `ufoo bus status` | Show bus status |
+| `ufoo ctx decisions -l` | List all decisions |
+| `ufoo ctx decisions -n 1` | Show latest decision |
+| `ufoo skills list` | List available skills |
+| `ufoo doctor` | Check installation health |
 
-## CLI (local dev)
+Notes:
+- Claude CLI headless agent uses `--dangerously-skip-permissions`.
 
-- Bash CLI (works without Node): `./bin/ufoo --help`
-- Node/npm CLI (for global `ufoo`): `npm link` (uses `bin/ufoo.js`; has a dependency-free fallback parser)
+## Project Structure
+
+```
+ufoo/
+├── bin/
+│   ├── ufoo         # Main CLI entry (bash)
+│   ├── ufoo.js      # Node wrapper
+│   ├── uclaude      # Claude Code wrapper
+│   └── ucodex       # Codex wrapper
+├── SKILLS/          # Global skills (uinit, ustatus)
+├── scripts/
+│   ├── bus.sh       # Event bus implementation
+│   ├── bus-*.sh     # Bus utilities (inject, daemon, alert)
+│   ├── context-*.sh # Context management
+│   ├── init.sh      # Project initialization
+│   └── skills.sh    # Skills management
+├── modules/
+│   ├── context/     # Decision/context protocol
+│   ├── bus/         # Bus module resources
+│   └── resources/   # UI/icons (optional)
+├── AGENTS.md        # Project instructions (canonical)
+└── CLAUDE.md        # Points to AGENTS.md
+```
+
+## Per-Project Layout
+
+After `ufoo init`, your project gets:
+
+```
+your-project/
+├── .ufoo/
+│   ├── bus/
+│   │   ├── events/      # Event log (append-only)
+│   │   ├── queues/      # Per-agent message queues
+│   │   └── offsets/     # Read position tracking
+│   └── context/
+│       └── DECISIONS/   # Decision records
+├── scripts/             # Symlinked ufoo scripts
+├── AGENTS.md            # Injected protocol blocks
+└── CLAUDE.md            # → AGENTS.md
+```
+
+## Agent Communication
+
+Agents communicate via the event bus:
+
+```bash
+# Agent A sends task to Agent B
+ufoo bus send "codex:abc123" "Please analyze the project structure"
+
+# Agent B checks and executes
+ufoo bus check "codex:abc123"
+# → Executes task automatically
+# → Replies with result
+ufoo bus send "claude-code:xyz789" "分析完成：..."
+```
+
+## Skills (for Agents)
+
+Built-in skills triggered by slash commands:
+
+- `/ubus` - Check and auto-execute pending messages
+- `/uctx` - Quick context status check
+- `/ustatus` - Unified status view (banner, unread bus, open decisions)
+- `/uinit` - Manual .ufoo initialization
+
+## Requirements
+
+- macOS (for Terminal.app/iTerm2 injection features)
+- Node.js >= 18 (optional, for npm global install)
+- Bash 4+
+
+## Codex CLI Notes
+
+`ufoo chat` automatically starts the daemon if not running - no need to run `ufoo daemon start` separately.
+
+If Codex CLI fails with permission errors under `~/.codex` (e.g. sessions dir), set `CODEX_HOME` to a writable path:
+
+```bash
+export CODEX_HOME="$PWD/.ufoo/codex"
+ufoo chat  # daemon auto-starts
+```
+
+## Development
+
+```bash
+# Local development
+./bin/ufoo --help
+
+# Or via Node
+npm link
+ufoo --help
+```
+
+## License
+
+UNLICENSED (Private)

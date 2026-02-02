@@ -45,6 +45,14 @@ fi
 TARGET_TTY=$(cat "$tty_file")
 echo "[inject] Looking for Terminal tab with tty: $TARGET_TTY"
 
+# Determine command based on agent type
+# codex uses "ubus" without slash, claude-code uses "/ubus"
+if [[ "$SUBSCRIBER" == codex:* ]]; then
+  INJECT_CMD="ubus"
+else
+  INJECT_CMD="/ubus"
+fi
+
 # Detect terminal type from tty path or environment
 # iTerm2 uses "write text", Terminal.app uses "do script"
 
@@ -69,7 +77,7 @@ tell application "iTerm2"
                     if tty of s is "$TARGET_TTY" then
                         select s
                         -- Use write text which includes newline automatically
-                        write text "/ubus" to s
+                        write text "$INJECT_CMD" to s
                         return
                     end if
                 end try
@@ -112,7 +120,7 @@ end tell
 -- Save current clipboard, set /ubus, paste, restore
 set oldClipboard to the clipboard
 
-set the clipboard to "/ubus"
+set the clipboard to "$INJECT_CMD"
 delay 0.1
 
 tell application "System Events"

@@ -1,12 +1,12 @@
 ---
-name: ctx
+name: uctx
 description: |
   Quick ufoo context status check. Shows decisions and context health.
-  Use when: (1) Starting a session, (2) User says "ctx", (3) Need quick context refresh.
-  For full initialization, use ufoo init.
+  Use when: (1) Starting a session, (2) User says "uctx", (3) Need quick context refresh.
+  For full initialization, use uinit (ufoo init CLI).
 ---
 
-# AI Context Quick Check
+# /uctx - AI Context Quick Check
 
 ## What this does
 
@@ -19,7 +19,7 @@ Pre-flight reminder:
 
 ### 1. Verify structure exists
 
-Check `.ufoo/context/` exists. If missing, tell user to run `ufoo init`.
+Check `.ufoo/context/` exists. If missing, tell user to run `uinit` (ufoo init CLI).
 
 ### 2. List all decisions
 

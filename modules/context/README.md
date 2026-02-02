@@ -75,8 +75,8 @@ context/                 # This repo
 
 ```bash
 # protocol repo
-bash scripts/context-lint.sh
+ufoo ctx lint
 
 # project-local context (in a real project repo)
-bash scripts/context-lint.sh --project <path-to-project-context>
+ufoo ctx lint --project <path-to-project-context>
 ```

@@ -7,8 +7,7 @@ Protocol-level skills that enforce context rules.
 - Only bootstrap and validate protocol compliance
 
 Available:
-- `ctx` — quick context check (list decisions, show latest, report status)
-- `context-lint` — validate protocol and project-local context structure
+- `uctx` — quick context check (list decisions, show latest, report status)
 
 Helpers:
 - `bash scripts/skills.sh list`

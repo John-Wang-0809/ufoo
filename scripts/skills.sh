@@ -2,7 +2,16 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-skills_src="$repo_root/modules/context/SKILLS"
+
+skill_roots=()
+if [[ -d "$repo_root/SKILLS" ]]; then
+  skill_roots+=("$repo_root/SKILLS")
+fi
+if [[ -d "$repo_root/modules" ]]; then
+  while IFS= read -r d; do
+    skill_roots+=("$d")
+  done < <(find "$repo_root/modules" -maxdepth 2 -type d -name SKILLS | sort)
+fi
 
 usage() {
   cat <<'EOFU'
@@ -19,7 +28,9 @@ shift || true
 
 case "$cmd" in
   list)
-    find "$skills_src" -mindepth 1 -maxdepth 1 -type d -print | sed 's|.*/||' | sort
+    for root in "${skill_roots[@]}"; do
+      find "$root" -mindepth 1 -maxdepth 1 -type d -print
+    done | sed 's|.*/||' | sort -u
     ;;
   install)
     name="${1:-}"
@@ -53,16 +64,34 @@ case "$cmd" in
 
     mkdir -p "$target"
 
-    install_one() {
+    find_skill() {
       local skill_name="$1"
-      local src_file="$skills_src/$skill_name/SKILL.md"
-      local dst_dir="$target/$skill_name"
-      local dst_file="$dst_dir/SKILL.md"
-
-      if [[ ! -f "$src_file" ]]; then
-        echo "FAIL: missing $src_file" >&2
+      local matches=()
+      local root
+      for root in "${skill_roots[@]}"; do
+        if [[ -f "$root/$skill_name/SKILL.md" ]]; then
+          matches+=("$root/$skill_name")
+        fi
+      done
+      if (( ${#matches[@]} == 0 )); then
+        echo "FAIL: missing skill '$skill_name'" >&2
         exit 1
       fi
+      if (( ${#matches[@]} > 1 )); then
+        echo "FAIL: duplicate skill name '$skill_name' in:" >&2
+        printf '  - %s\n' "${matches[@]}" >&2
+        exit 1
+      fi
+      echo "${matches[0]}"
+    }
+
+    install_one() {
+      local skill_name="$1"
+      local src_dir
+      src_dir="$(find_skill "$skill_name")"
+      local src_file="$src_dir/SKILL.md"
+      local dst_dir="$target/$skill_name"
+      local dst_file="$dst_dir/SKILL.md"
 
       mkdir -p "$dst_dir"
       cp "$src_file" "$dst_file"
@@ -72,7 +101,7 @@ case "$cmd" in
     if [[ "$name" == "all" ]]; then
       while IFS= read -r d; do
         install_one "$d"
-      done < <(find "$skills_src" -mindepth 1 -maxdepth 1 -type d -print | sed 's|.*/||' | sort)
+      done < <(for root in "${skill_roots[@]}"; do find "$root" -mindepth 1 -maxdepth 1 -type d -print; done | sed 's|.*/||' | sort -u)
     else
       install_one "$name"
     fi
