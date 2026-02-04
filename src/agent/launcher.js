@@ -89,27 +89,6 @@ class AgentLauncher {
   }
 
   /**
-   * 确保 UfooNotifier 应用存在
-   */
-  async ensureUfooNotifier() {
-    const notifierPath = path.join(this.cwd, ".ufoo/UfooNotifier.app/Contents/MacOS/UfooNotifier");
-
-    // 如果已存在，直接返回
-    if (fs.existsSync(notifierPath)) {
-      return;
-    }
-
-    // 构建 UfooNotifier
-    const buildScript = path.join(__dirname, "..", "..", "scripts", "build-ufoo-notifier.sh");
-    if (fs.existsSync(buildScript)) {
-      spawnSync("bash", [buildScript], {
-        cwd: this.cwd,
-        stdio: "ignore",
-      });
-    }
-  }
-
-  /**
    * 确保 daemon 正在运行
    */
   async ensureDaemon() {
@@ -162,19 +141,16 @@ class AgentLauncher {
       // 1. 确保初始化
       await this.ensureInit();
 
-      // 2. 确保 UfooNotifier 应用存在
-      await this.ensureUfooNotifier();
-
-      // 3. 生成 session ID
+      // 2. 生成 session ID
       const sessionId = this.generateSessionId();
 
-      // 4. Join bus
+      // 3. Join bus
       const result = await this.joinBus(sessionId);
 
-      // 5. 确保 daemon 运行
+      // 4. 确保 daemon 运行
       const daemonStatus = await this.ensureDaemon();
 
-      // 6. 显示 banner
+      // 5. 显示 banner
       showBanner({
         agentType: this.agentType,
         sessionId,
@@ -182,11 +158,11 @@ class AgentLauncher {
         daemonStatus,
       });
 
-      // 7. 启动消息通知监听器
+      // 6. 启动消息通知监听器
       const notifier = new AgentNotifier(this.cwd, result.subscriber);
       notifier.start();
 
-      // 8. 启动命令
+      // 7. 启动命令
       const child = spawn(this.command, args, {
         cwd: this.cwd,
         stdio: "inherit",
@@ -203,7 +179,20 @@ class AgentLauncher {
         process.exit(1);
       });
 
-      child.on("exit", (code) => {
+      child.on("exit", async (code, signal) => {
+        // 清理 bus 状态
+        try {
+          const bus = new EventBus(this.cwd);
+          bus.loadBusData();
+          await bus.subscriberManager.leave(result.subscriber);
+          bus.saveBusData();
+        } catch {
+          // ignore cleanup errors
+        }
+
+        if (signal) {
+          console.log(`\n[${this.command}] killed by signal ${signal}`);
+        }
         process.exit(code || 0);
       });
     } catch (err) {

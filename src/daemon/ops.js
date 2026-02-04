@@ -49,9 +49,13 @@ function shellEscape(value) {
 async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "") {
   const runner = path.join(projectRoot, "bin", "ufoo.js");
   const logDir = path.join(projectRoot, ".ufoo", "run");
-  const logFile = path.join(logDir, `agent-${agent}-${Date.now()}.log`);
-  const errLog = fs.openSync(logFile, "a");
+  fs.mkdirSync(logDir, { recursive: true });
+
+  const children = [];
   for (let i = 0; i < count; i += 1) {
+    const logFile = path.join(logDir, `agent-${agent}-${Date.now()}-${i}.log`);
+    const errLog = fs.openSync(logFile, "a");
+
     const child = spawn(process.execPath, [runner, "agent-runner", agent], {
       detached: true,
       stdio: ["ignore", errLog, errLog],
@@ -63,15 +67,37 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "") 
         UFOO_LAUNCH_MODE: "internal"
       },
     });
+
+    // 监听退出事件以清理 bus 状态
+    child.on("exit", (code, signal) => {
+      try {
+        fs.closeSync(errLog);
+      } catch {
+        // ignore
+      }
+
+      if (signal) {
+        fs.appendFileSync(logFile, `\n[internal-agent] killed by signal ${signal}\n`);
+      } else {
+        fs.appendFileSync(logFile, `\n[internal-agent] exited with code ${code}\n`);
+      }
+    });
+
+    child.on("error", (err) => {
+      fs.appendFileSync(logFile, `\n[internal-agent] spawn failed: ${err.message}\n`);
+      try {
+        fs.closeSync(errLog);
+      } catch {
+        // ignore
+      }
+    });
+
+    // 仍然 unref，但保留引用以便监听 exit 事件
     child.unref();
+    children.push(child);
   }
-  setTimeout(() => {
-    try {
-      fs.closeSync(errLog);
-    } catch {
-      // ignore
-    }
-  }, 1000);
+
+  return children;
 }
 
 function spawnTmuxWindow(projectRoot, agent, nickname = "") {

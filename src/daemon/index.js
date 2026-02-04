@@ -249,7 +249,7 @@ async function dispatchMessages(projectRoot, dispatch = []) {
   }
 }
 
-function startBusBridge(projectRoot, onEvent, onStatus) {
+function startBusBridge(projectRoot, provider, onEvent, onStatus) {
   const state = {
     subscriber: null,
     queueFile: null,
@@ -280,8 +280,10 @@ function startBusBridge(projectRoot, onEvent, onStatus) {
     (async () => {
       try {
         fs.writeFileSync(debugFile, `Attempting join at ${new Date().toISOString()}\n`, { flag: "a" });
+        // Determine agent type based on provider configuration
+        const agentType = provider === "codex-cli" ? "codex" : "claude-code";
         // Use fixed ID "ufoo-agent" for daemon's bus identity with explicit nickname
-        const sub = await eventBus.join("ufoo-agent", "ufoo-agent", "ufoo-agent");
+        const sub = await eventBus.join("ufoo-agent", agentType, "ufoo-agent");
         if (!sub) {
           fs.writeFileSync(debugFile, "Join returned empty subscriber\n", { flag: "a" });
           return;
@@ -289,7 +291,7 @@ function startBusBridge(projectRoot, onEvent, onStatus) {
         state.subscriber = sub;
         const safe = subscriberToSafeName(sub);
         state.queueFile = path.join(projectRoot, ".ufoo", "bus", "queues", safe, "pending.jsonl");
-        fs.writeFileSync(debugFile, `Successfully joined as ${sub}\n`, { flag: "a" });
+        fs.writeFileSync(debugFile, `Successfully joined as ${sub} (type: ${agentType})\n`, { flag: "a" });
       } catch (err) {
         fs.writeFileSync(debugFile, `Exception: ${err.message || err}\n`, { flag: "a" });
       } finally {
@@ -373,6 +375,37 @@ function startDaemon({ projectRoot, provider, model }) {
 
   const runDir = path.join(projectRoot, ".ufoo", "run");
   ensureDir(runDir);
+
+  // 文件锁机制：防止多个 daemon 同时启动
+  const lockFile = path.join(runDir, "daemon.lock");
+  let lockFd;
+  try {
+    // 尝试独占方式打开锁文件（如果已存在且被锁定则失败）
+    lockFd = fs.openSync(lockFile, "wx");
+    fs.writeSync(lockFd, `${process.pid}\n`);
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      // 锁文件已存在，检查是否仍有效
+      try {
+        const existingPid = parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
+        // 检查该进程是否还活着
+        try {
+          process.kill(existingPid, 0);
+          throw new Error(`Daemon already running with PID ${existingPid}`);
+        } catch {
+          // 进程已死，清理旧锁
+          fs.unlinkSync(lockFile);
+          lockFd = fs.openSync(lockFile, "wx");
+          fs.writeSync(lockFd, `${process.pid}\n`);
+        }
+      } catch (readErr) {
+        throw new Error(`Failed to acquire daemon lock: ${readErr.message}`);
+      }
+    } else {
+      throw err;
+    }
+  }
+
   removeSocket(projectRoot);
   writePid(projectRoot);
 
@@ -394,7 +427,7 @@ function startDaemon({ projectRoot, provider, model }) {
     }
   };
 
-  const busBridge = startBusBridge(projectRoot, (evt) => {
+  const busBridge = startBusBridge(projectRoot, provider, (evt) => {
     sendToSockets({ type: "bus", data: evt });
   }, (status) => {
     sendToSockets({ type: "status", data: status });
@@ -470,6 +503,40 @@ function startDaemon({ projectRoot, provider, model }) {
                 opsResults,
               })}\n`,
             );
+            continue;
+          }
+          if (req.type === "bus_send") {
+            // Direct bus send request from chat UI
+            const { target, message } = req;
+            if (!target || !message) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: "bus_send requires target and message",
+                })}\n`,
+              );
+              continue;
+            }
+            try {
+              const publisher = busBridge.getSubscriber() || "ufoo-agent";
+              const eventBus = new EventBus(projectRoot);
+              await eventBus.send(target, message, publisher);
+              log(`bus_send target=${target} publisher=${publisher}`);
+              socket.write(
+                `${JSON.stringify({
+                  type: "bus_send_ok",
+                })}\n`,
+              );
+            } catch (err) {
+              log(`bus_send failed: ${err.message}`);
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "bus_send failed",
+                })}\n`,
+              );
+            }
+            continue;
           }
         }
       }
@@ -479,13 +546,30 @@ function startDaemon({ projectRoot, provider, model }) {
   server.listen(socketPath(projectRoot));
   log(`Started pid=${process.pid}`);
 
-  process.on("exit", () => {
+  const cleanup = () => {
     busBridge.stop();
     removeSocket(projectRoot);
-  });
+    // 释放锁文件
+    try {
+      if (lockFd !== undefined) {
+        fs.closeSync(lockFd);
+      }
+      const lockFile = path.join(projectRoot, ".ufoo", "run", "daemon.lock");
+      if (fs.existsSync(lockFile)) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  };
+
+  process.on("exit", cleanup);
   process.on("SIGTERM", () => {
-    busBridge.stop();
-    removeSocket(projectRoot);
+    cleanup();
+    process.exit(0);
+  });
+  process.on("SIGINT", () => {
+    cleanup();
     process.exit(0);
   });
 }
@@ -525,6 +609,17 @@ function stopDaemon(projectRoot) {
     // ignore
   }
   removeSocket(projectRoot);
+
+  // 清理锁文件
+  try {
+    const lockFile = path.join(projectRoot, ".ufoo", "run", "daemon.lock");
+    if (fs.existsSync(lockFile)) {
+      fs.unlinkSync(lockFile);
+    }
+  } catch {
+    // ignore
+  }
+
   return killed;
 }
 

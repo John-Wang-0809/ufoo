@@ -1902,8 +1902,6 @@ async function runChat(projectRoot) {
     const subcommand = args[0];
 
     try {
-      const bus = new EventBus(projectRoot);
-
       if (subcommand === "send") {
         if (args.length < 3) {
           logMessage("error", "{red-fg}✗{/red-fg} Usage: /bus send <target> <message>");
@@ -1911,9 +1909,15 @@ async function runChat(projectRoot) {
         }
         const target = args[1];
         const message = args.slice(2).join(" ");
-        await bus.send(target, message);
+        // Send via daemon to ensure proper publisher ID
+        send({ type: "bus_send", target, message });
         logMessage("system", `{green-fg}✓{/green-fg} Message sent to ${target}`);
-      } else if (subcommand === "rename") {
+        return;
+      }
+
+      const bus = new EventBus(projectRoot);
+
+      if (subcommand === "rename") {
         if (args.length < 3) {
           logMessage("error", "{red-fg}✗{/red-fg} Usage: /bus rename <agent> <nickname>");
           return;
@@ -2135,28 +2139,13 @@ async function runChat(projectRoot) {
     historyIndex = inputHistory.length;
     historyDraft = "";
 
-    // If target agent is selected, send directly via bus
+    // If target agent is selected, send via daemon
     if (targetAgent) {
       const label = getAgentLabel(targetAgent);
       logMessage("user", `{cyan-fg}→{/cyan-fg} {magenta-fg}@${label}{/magenta-fg} ${text}`);
 
-      // Use bus send command - suppress console to avoid [bus] output in UI
-      const bus = new EventBus(projectRoot);
-      const originalLog = console.log;
-      const originalError = console.error;
-      console.log = () => {};
-      console.error = () => {};
-
-      bus.send(targetAgent, text)
-        .then(() => {
-          console.log = originalLog;
-          console.error = originalError;
-        })
-        .catch((err) => {
-          console.log = originalLog;
-          console.error = originalError;
-          logMessage("error", `{red-fg}✗{/red-fg} Failed to send: ${err.message}`);
-        });
+      // Send via daemon socket to ensure proper publisher ID
+      send({ type: "bus_send", target: targetAgent, message: text });
 
       clearTargetAgent();
       input.focus();

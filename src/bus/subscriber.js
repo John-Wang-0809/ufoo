@@ -121,7 +121,7 @@ class SubscriberManager {
    */
   async join(sessionId, agentType, nickname = null) {
     // Special case: ufoo-agent uses fixed ID without suffix
-    const subscriber = (agentType === "ufoo-agent" && sessionId === "ufoo-agent")
+    const subscriber = (sessionId === "ufoo-agent")
       ? "ufoo-agent"
       : `${agentType}:${sessionId}`;
 
