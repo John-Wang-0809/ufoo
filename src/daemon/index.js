@@ -7,6 +7,77 @@ const { buildStatus } = require("./status");
 const EventBus = require("../bus");
 const { generateInstanceId, subscriberToSafeName } = require("../bus/utils");
 
+/**
+ * Agent 进程管理器 - daemon 作为父进程监控所有 internal agents
+ */
+class AgentProcessManager {
+  constructor(projectRoot) {
+    this.projectRoot = projectRoot;
+    this.processes = new Map(); // subscriber_id -> child_process
+  }
+
+  /**
+   * 注册子进程并监听退出事件
+   */
+  register(subscriberId, childProcess) {
+    if (!subscriberId || !childProcess) return;
+
+    this.processes.set(subscriberId, childProcess);
+
+    childProcess.on("exit", (code, signal) => {
+      this.processes.delete(subscriberId);
+
+      // 自动清理 bus 状态
+      try {
+        const eventBus = new EventBus(this.projectRoot);
+        eventBus.loadBusData();
+        if (eventBus.busData.subscribers?.[subscriberId]) {
+          eventBus.busData.subscribers[subscriberId].status = "inactive";
+          eventBus.busData.subscribers[subscriberId].last_seen = new Date().toISOString();
+          eventBus.saveBusData();
+          console.log(`[daemon] Agent ${subscriberId} exited (code=${code}, signal=${signal}), marked inactive`);
+        }
+      } catch (err) {
+        console.error(`[daemon] Failed to cleanup ${subscriberId}:`, err.message);
+      }
+    });
+
+    childProcess.on("error", (err) => {
+      console.error(`[daemon] Agent ${subscriberId} error:`, err.message);
+      this.processes.delete(subscriberId);
+    });
+  }
+
+  /**
+   * 获取运行中的进程
+   */
+  get(subscriberId) {
+    return this.processes.get(subscriberId);
+  }
+
+  /**
+   * 获取所有进程数量
+   */
+  count() {
+    return this.processes.size;
+  }
+
+  /**
+   * 清理所有子进程
+   */
+  cleanup() {
+    for (const [subscriberId, child] of this.processes.entries()) {
+      try {
+        child.kill("SIGTERM");
+        console.log(`[daemon] Killed agent ${subscriberId}`);
+      } catch {
+        // ignore
+      }
+    }
+    this.processes.clear();
+  }
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -166,7 +237,7 @@ function checkAndCleanupNickname(projectRoot, nickname) {
   }
 }
 
-async function handleOps(projectRoot, ops = []) {
+async function handleOps(projectRoot, ops = [], processManager = null) {
   const results = [];
   for (const op of ops) {
     if (op.action === "launch") {
@@ -203,7 +274,7 @@ async function handleOps(projectRoot, ops = []) {
           continue;
         }
         // eslint-disable-next-line no-await-in-loop
-        const launchResult = await launchAgent(projectRoot, agent, count, nickname);
+        const launchResult = await launchAgent(projectRoot, agent, count, nickname, processManager);
         results.push({
           action: "launch",
           mode: launchResult.mode,
@@ -414,6 +485,10 @@ function startDaemon({ projectRoot, provider, model }) {
     logFile.write(`[daemon] ${new Date().toISOString()} ${msg}\n`);
   };
 
+  // 创建进程管理器 - daemon 作为父进程监控所有 internal agents
+  const processManager = new AgentProcessManager(projectRoot);
+  log(`Process manager initialized`);
+
   const sockets = new Set();
   const sendToSockets = (payload) => {
     const line = `${JSON.stringify(payload)}\n`;
@@ -494,7 +569,7 @@ function startDaemon({ projectRoot, provider, model }) {
               }
             }
             await dispatchMessages(projectRoot, result.payload.dispatch || []);
-            const opsResults = await handleOps(projectRoot, result.payload.ops || []);
+            const opsResults = await handleOps(projectRoot, result.payload.ops || [], processManager);
             log(`ok reply=${Boolean(result.payload.reply)} dispatch=${(result.payload.dispatch || []).length} ops=${(result.payload.ops || []).length}`);
             socket.write(
               `${JSON.stringify({
@@ -547,8 +622,14 @@ function startDaemon({ projectRoot, provider, model }) {
   log(`Started pid=${process.pid}`);
 
   const cleanup = () => {
+    log(`Shutting down daemon (managed agents: ${processManager.count()})`);
+
+    // 清理所有子进程
+    processManager.cleanup();
+
     busBridge.stop();
     removeSocket(projectRoot);
+
     // 释放锁文件
     try {
       if (lockFd !== undefined) {

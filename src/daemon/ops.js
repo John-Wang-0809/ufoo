@@ -46,29 +46,42 @@ function shellEscape(value) {
   return `'${str.replace(/'/g, `'\\''`)}'`;
 }
 
-async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "") {
+async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", processManager = null) {
   const runner = path.join(projectRoot, "bin", "ufoo.js");
   const logDir = path.join(projectRoot, ".ufoo", "run");
   fs.mkdirSync(logDir, { recursive: true });
 
+  const crypto = require("crypto");
   const children = [];
+  const subscriberIds = [];
+
   for (let i = 0; i < count; i += 1) {
     const logFile = path.join(logDir, `agent-${agent}-${Date.now()}-${i}.log`);
     const errLog = fs.openSync(logFile, "a");
 
+    // 预生成 session ID，这样父进程就知道 subscriber_id 了
+    const sessionId = crypto.randomBytes(4).toString("hex");
+    const agentType = agent === "codex" ? "codex" : "claude-code";
+    const subscriberId = `${agentType}:${sessionId}`;
+    subscriberIds.push(subscriberId);
+
     const child = spawn(process.execPath, [runner, "agent-runner", agent], {
-      detached: true,
+      // 关键改动：不使用 detached，daemon 作为父进程
+      detached: false,
       stdio: ["ignore", errLog, errLog],
       cwd: projectRoot,
       env: {
         ...process.env,
         UFOO_INTERNAL_AGENT: "1",
         UFOO_NICKNAME: nickname || "",
-        UFOO_LAUNCH_MODE: "internal"
+        UFOO_LAUNCH_MODE: "internal",
+        // 传递预生成的 session ID
+        CLAUDE_SESSION_ID: sessionId,
+        CODEX_SESSION_ID: sessionId
       },
     });
 
-    // 监听退出事件以清理 bus 状态
+    // 本地日志记录
     child.on("exit", (code, signal) => {
       try {
         fs.closeSync(errLog);
@@ -77,14 +90,14 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "") 
       }
 
       if (signal) {
-        fs.appendFileSync(logFile, `\n[internal-agent] killed by signal ${signal}\n`);
+        fs.appendFileSync(logFile, `\n[internal-agent] ${subscriberId} killed by signal ${signal}\n`);
       } else {
-        fs.appendFileSync(logFile, `\n[internal-agent] exited with code ${code}\n`);
+        fs.appendFileSync(logFile, `\n[internal-agent] ${subscriberId} exited with code ${code}\n`);
       }
     });
 
     child.on("error", (err) => {
-      fs.appendFileSync(logFile, `\n[internal-agent] spawn failed: ${err.message}\n`);
+      fs.appendFileSync(logFile, `\n[internal-agent] ${subscriberId} spawn failed: ${err.message}\n`);
       try {
         fs.closeSync(errLog);
       } catch {
@@ -92,12 +105,15 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "") 
       }
     });
 
-    // 仍然 unref，但保留引用以便监听 exit 事件
-    child.unref();
+    // 注册到进程管理器（父子进程监控）
+    if (processManager) {
+      processManager.register(subscriberId, child);
+    }
+
     children.push(child);
   }
 
-  return children;
+  return { children, subscriberIds };
 }
 
 function spawnTmuxWindow(projectRoot, agent, nickname = "") {
@@ -134,13 +150,13 @@ function spawnTmuxWindow(projectRoot, agent, nickname = "") {
   });
 }
 
-async function launchAgent(projectRoot, agent, count = 1, nickname = "") {
+async function launchAgent(projectRoot, agent, count = 1, nickname = "", processManager = null) {
   const config = loadConfig(projectRoot);
   const mode = config.launchMode || "terminal";
 
   if (mode === "internal") {
-    await spawnInternalAgent(projectRoot, agent, count, nickname);
-    return { mode: "internal" };
+    const result = await spawnInternalAgent(projectRoot, agent, count, nickname, processManager);
+    return { mode: "internal", subscriberIds: result.subscriberIds };
   }
   if (mode === "tmux") {
     // Check if tmux is available

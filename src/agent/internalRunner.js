@@ -123,7 +123,12 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
 }
 
 async function runInternalRunner({ projectRoot, agentType = "codex" }) {
-  const sessionId = generateSessionId();
+  // 优先使用环境变量中预生成的 sessionId（daemon 父子进程监控模式）
+  const envSessionId = agentType === "codex"
+    ? process.env.CODEX_SESSION_ID
+    : process.env.CLAUDE_SESSION_ID;
+  const sessionId = envSessionId || generateSessionId();
+
   const nickname = process.env.UFOO_NICKNAME || "";
   const { subscriber } = joinBus(projectRoot, agentType, sessionId, nickname);
   if (!subscriber) {
