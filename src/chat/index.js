@@ -79,6 +79,8 @@ async function runChat(projectRoot) {
       // Retry once with a fresh daemon start and longer wait.
       if (!isRunning(projectRoot)) {
         startDaemon(projectRoot);
+        // Wait for daemon to write PID file and create socket
+        await new Promise(r => setTimeout(r, 1000));
       }
       newClient = await connectWithRetry(sock, 50, 200);
     }
@@ -2120,17 +2122,24 @@ async function runChat(projectRoot) {
       const label = getAgentLabel(targetAgent);
       logMessage("user", `{cyan-fg}→{/cyan-fg} {magenta-fg}@${label}{/magenta-fg} ${text}`);
 
-      // Use bus send command
+      // Use bus send command - suppress console to avoid [bus] output in UI
       const bus = new EventBus(projectRoot);
-      try {
-        bus.send(targetAgent, text).then(() => {
-          logMessage("system", `{green-fg}✓{/green-fg} Message sent to ${label}`);
-        }).catch((err) => {
-          logMessage("error", `{red-fg}✗{/red-fg} Failed to send: ${err.message}`);
+      const originalLog = console.log;
+      const originalError = console.error;
+      console.log = () => {};
+      console.error = () => {};
+
+      bus.send(targetAgent, text)
+        .then(() => {
+          console.log = originalLog;
+          console.error = originalError;
+          logMessage("system", `{green-fg}✓{/green-fg} Sent to ${label}`);
+        })
+        .catch((err) => {
+          console.log = originalLog;
+          console.error = originalError;
+          logMessage("error", `{red-fg}✗{/red-fg} Failed: ${err.message}`);
         });
-      } catch (err) {
-        logMessage("error", `{red-fg}✗{/red-fg} Failed to send: ${err.message}`);
-      }
 
       clearTargetAgent();
       input.focus();
