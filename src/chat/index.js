@@ -60,6 +60,24 @@ async function runChat(projectRoot) {
     const init = new UfooInit(repoRoot);
     await init.init({ modules: "context,bus", project: projectRoot });
   }
+
+  // Ensure session ID exists for chat (persistent across restarts)
+  if (!process.env.CLAUDE_SESSION_ID && !process.env.CODEX_SESSION_ID) {
+    const crypto = require("crypto");
+    const sessionFile = path.join(projectRoot, ".ufoo", "chat", "session-id.txt");
+    const sessionDir = path.dirname(sessionFile);
+    fs.mkdirSync(sessionDir, { recursive: true });
+
+    let sessionId;
+    if (fs.existsSync(sessionFile)) {
+      sessionId = fs.readFileSync(sessionFile, "utf8").trim();
+    } else {
+      sessionId = crypto.randomBytes(4).toString("hex");
+      fs.writeFileSync(sessionFile, sessionId, "utf8");
+    }
+    process.env.CLAUDE_SESSION_ID = sessionId;
+  }
+
   if (!isRunning(projectRoot)) {
     startDaemon(projectRoot);
   }
