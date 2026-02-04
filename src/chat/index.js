@@ -2129,16 +2129,19 @@ async function runChat(projectRoot) {
       console.log = () => {};
       console.error = () => {};
 
+      // Show sending status in status line (above input)
+      queueStatusLine(`Sending to ${label}`);
+
       bus.send(targetAgent, text)
         .then(() => {
           console.log = originalLog;
           console.error = originalError;
-          logMessage("system", `{green-fg}✓{/green-fg} Sent to ${label}`);
+          resolveStatusLine(`{green-fg}✓{/green-fg} Sent to ${label}`);
         })
         .catch((err) => {
           console.log = originalLog;
           console.error = originalError;
-          logMessage("error", `{red-fg}✗{/red-fg} Failed: ${err.message}`);
+          resolveStatusLine(`{red-fg}✗{/red-fg} Failed: ${err.message}`);
         });
 
       clearTargetAgent();
