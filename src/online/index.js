@@ -27,6 +27,9 @@ class OnlineServer extends EventEmitter {
     this.allowedTokens = this.loadTokens(options);
     this.allowAnyToken = this.allowedTokens === null;
     this.version = options.version || "0.1.0";
+    this.idleTimeoutMs = options.idleTimeoutMs ?? 30000;
+    this.sweepIntervalMs = options.sweepIntervalMs ?? 10000;
+    this.sweepTimer = null;
   }
 
   loadTokens(options) {
@@ -78,6 +81,7 @@ class OnlineServer extends EventEmitter {
         const actualPort = address && typeof address === "object" ? address.port : this.port;
         this.port = actualPort;
         this.emit("listening", { host: this.host, port: this.port });
+        this.startIdleSweep();
         resolve();
       });
     });
@@ -88,6 +92,8 @@ class OnlineServer extends EventEmitter {
     const wsServer = this.wsServer;
     this.server = null;
     this.wsServer = null;
+
+    this.stopIdleSweep();
 
     if (wsServer) {
       wsServer.clients.forEach((client) => client.terminate());
@@ -101,6 +107,28 @@ class OnlineServer extends EventEmitter {
     });
   }
 
+  startIdleSweep() {
+    if (this.sweepTimer || this.idleTimeoutMs <= 0) return;
+    this.sweepTimer = setInterval(() => {
+      const now = Date.now();
+      if (!this.wsServer) return;
+      this.wsServer.clients.forEach((ws) => {
+        const client = ws._ufooClient;
+        if (!client) return;
+        if (now - client.lastSeen >= this.idleTimeoutMs) {
+          this.sendError(ws, "Disconnected due to inactivity", true, "IDLE_TIMEOUT");
+        }
+      });
+    }, this.sweepIntervalMs);
+  }
+
+  stopIdleSweep() {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+  }
+
   handleConnection(ws) {
     const client = {
       ws,
@@ -109,9 +137,13 @@ class OnlineServer extends EventEmitter {
       nickname: null,
       channels: new Set(),
       helloReceived: false,
+      lastSeen: Date.now(),
     };
 
+    ws._ufooClient = client;
+
     ws.on("message", (data) => {
+      client.lastSeen = Date.now();
       this.handleMessage(client, data);
     });
 

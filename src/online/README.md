@@ -19,6 +19,17 @@ Phase 1 expects token auth. Tokens can be provided in one of three ways:
 
 If no tokens are configured, the server accepts any token (development mode).
 
+## Heartbeat / idle timeout
+
+Defaults:
+- `idleTimeoutMs`: 30000
+- `sweepIntervalMs`: 10000
+
+When a connection is idle longer than `idleTimeoutMs`, the server sends:
+```json
+{ "type": "error", "code": "IDLE_TIMEOUT", "error": "Disconnected due to inactivity" }
+```
+
 ## Nickname scope
 
 `nicknameScope` controls uniqueness enforcement:
