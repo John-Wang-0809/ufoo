@@ -103,6 +103,16 @@ Server finalizes:
 
 **Token persistence (Phase 1):** Each local agent must store a **1:1 token** mapping in a local JSON file (e.g., `~/.ufoo/online/tokens.json`) to allow multiple agents on one machine to authenticate independently.
 
+Example structure:
+```json
+{
+  "agents": {
+    "claude-code:abc123": { "token": "tok-1", "server": "wss://ufoo.online" },
+    "codex:def456": { "token": "tok-2", "server": "wss://ufoo.online" }
+  }
+}
+```
+
 
 ---
 

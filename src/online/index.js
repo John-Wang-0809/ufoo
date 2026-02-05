@@ -39,6 +39,9 @@ class OnlineServer extends EventEmitter {
       if (Array.isArray(parsed)) return new Set(parsed);
       if (Array.isArray(parsed.tokens)) return new Set(parsed.tokens);
       if (parsed.tokens && typeof parsed.tokens === "object") return new Set(Object.keys(parsed.tokens));
+      if (parsed.agents && typeof parsed.agents === "object") {
+        return new Set(Object.values(parsed.agents).map((entry) => entry && entry.token).filter(Boolean));
+      }
       if (typeof parsed === "object") return new Set(Object.keys(parsed));
       return new Set();
     }
