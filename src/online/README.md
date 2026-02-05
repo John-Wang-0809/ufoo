@@ -19,6 +19,18 @@ Phase 1 expects token auth. Tokens can be provided in one of three ways:
 
 If no tokens are configured, the server accepts any token (development mode).
 
+## Nickname scope
+
+`nicknameScope` controls uniqueness enforcement:
+
+- `global` (default): nickname must be unique across server
+- `world`: nickname unique per `client.world`
+
+Example:
+```js
+new OnlineServer({ nicknameScope: "world" })
+```
+
 ### Token persistence (1:1 per agent)
 
 Recommended storage (per machine): `~/.ufoo/online/tokens.json`

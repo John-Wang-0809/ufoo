@@ -69,6 +69,7 @@ describe('OnlineServer (Phase 1)', () => {
         agent_type: 'claude-code',
         nickname: 'agent-1',
         channel_type: 'private',
+        world: 'world-1',
         version: '0.1.0',
         capabilities: [],
         project: { slug: 'demo' },
@@ -105,6 +106,7 @@ describe('OnlineServer (Phase 1)', () => {
         agent_type: 'claude-code',
         nickname: 'agent-dup',
         channel_type: 'private',
+        world: 'world-1',
       },
     }));
     await next1();
@@ -118,6 +120,7 @@ describe('OnlineServer (Phase 1)', () => {
         agent_type: 'codex',
         nickname: 'agent-dup',
         channel_type: 'private',
+        world: 'world-1',
       },
     }));
 
@@ -145,7 +148,7 @@ describe('OnlineServer (Phase 1)', () => {
 
     ws1.send(JSON.stringify({
       type: 'hello',
-      client: { subscriber_id: 'claude-code:one', agent_type: 'claude-code', nickname: 'one', channel_type: 'private' },
+      client: { subscriber_id: 'claude-code:one', agent_type: 'claude-code', nickname: 'one', channel_type: 'private', world: 'world-1' },
     }));
     await next1();
     await next1();
@@ -154,7 +157,7 @@ describe('OnlineServer (Phase 1)', () => {
 
     ws2.send(JSON.stringify({
       type: 'hello',
-      client: { subscriber_id: 'codex:two', agent_type: 'codex', nickname: 'two', channel_type: 'private' },
+      client: { subscriber_id: 'codex:two', agent_type: 'codex', nickname: 'two', channel_type: 'private', world: 'world-1' },
     }));
     await next2();
     await next2();
@@ -197,7 +200,7 @@ describe('OnlineServer (Phase 1)', () => {
 
     ws1.send(JSON.stringify({
       type: 'hello',
-      client: { subscriber_id: 'claude-code:alpha', agent_type: 'claude-code', nickname: 'alpha', channel_type: 'private' },
+      client: { subscriber_id: 'claude-code:alpha', agent_type: 'claude-code', nickname: 'alpha', channel_type: 'private', world: 'world-1' },
     }));
     await next1();
     await next1();
@@ -206,7 +209,7 @@ describe('OnlineServer (Phase 1)', () => {
 
     ws2.send(JSON.stringify({
       type: 'hello',
-      client: { subscriber_id: 'codex:beta', agent_type: 'codex', nickname: 'beta', channel_type: 'private' },
+      client: { subscriber_id: 'codex:beta', agent_type: 'codex', nickname: 'beta', channel_type: 'private', world: 'world-1' },
     }));
     await next2();
     await next2();

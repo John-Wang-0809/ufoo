@@ -22,6 +22,8 @@ class OnlineServer extends EventEmitter {
     this.clientsByNickname = new Map();
     this.channels = new Map();
 
+    this.nicknameScope = options.nicknameScope || "global"; // global | world
+
     this.allowedTokens = this.loadTokens(options);
     this.allowAnyToken = this.allowedTokens === null;
     this.version = options.version || "0.1.0";
@@ -197,6 +199,7 @@ class OnlineServer extends EventEmitter {
     const subscriberId = info.subscriber_id;
     const nickname = info.nickname;
     const channelType = info.channel_type;
+    const world = info.world || "default";
 
     if (!subscriberId || !nickname) {
       this.sendError(client.ws, "Missing subscriber_id or nickname", false, "HELLO_INVALID");
@@ -213,7 +216,7 @@ class OnlineServer extends EventEmitter {
       return;
     }
 
-    if (this.clientsByNickname.has(nickname)) {
+    if (this.isNicknameTaken(nickname, world)) {
       this.sendError(client.ws, `Nickname "${nickname}" already exists`, true, "NICKNAME_TAKEN");
       return;
     }
@@ -222,6 +225,7 @@ class OnlineServer extends EventEmitter {
     client.subscriberId = subscriberId;
     client.nickname = nickname;
     client.channelType = channelType;
+    client.world = world;
 
     this.clientsById.set(subscriberId, client);
     this.clientsByNickname.set(nickname, client);
@@ -239,6 +243,16 @@ class OnlineServer extends EventEmitter {
       type: "auth_required",
       methods: ["token"],
     });
+  }
+
+  isNicknameTaken(nickname, world) {
+    if (this.nicknameScope === "global") {
+      return this.clientsByNickname.has(nickname);
+    }
+    for (const client of this.clientsByNickname.values()) {
+      if (client.nickname === nickname && client.world === world) return true;
+    }
+    return false;
   }
 
   handleAuth(client, message) {
