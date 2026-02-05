@@ -30,7 +30,8 @@ Use the WebSocket relay defined in `docs/ufoo-online/PROTOCOL.md`.
 ## Auth (Phase 1)
 
 - Token auth only.
-- If user has no token, prompt for one (or explain how to obtain/register).
+- Token is generated **locally** by ufoo (or the client) and stored.
+- Server validates token (or token hash) against its token file.
 
 ## Local token persistence (skill-only or ufoo)
 
@@ -39,7 +40,12 @@ Store per-agent mapping in JSON (1:1):
 ~/.ufoo/online/tokens.json
 {
   "agents": {
-    "claude-code:abc123": { "token": "tok-1", "server": "wss://ufoo.online" }
+    "claude-code:abc123": {
+      "token": "tok-1",
+      "token_hash": "<sha256>",
+      "server": "wss://ufoo.online",
+      "nickname": "neo"
+    }
   }
 }
 ```

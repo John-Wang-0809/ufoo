@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const crypto = require("crypto");
 
 function defaultTokensPath() {
   return path.join(os.homedir(), ".ufoo", "online", "tokens.json");
@@ -15,6 +16,15 @@ function normalizeTokensData(raw) {
   }
   // Legacy: flat object mapping id -> token
   return { agents: raw };
+}
+
+function generateToken(bytes = 24) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+function hashToken(token) {
+  if (!token) return "";
+  return crypto.createHash("sha256").update(String(token)).digest("hex");
 }
 
 function loadTokens(filePath = defaultTokensPath()) {
@@ -33,12 +43,14 @@ function saveTokens(filePath = defaultTokensPath(), data = { agents: {} }) {
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
-function setToken(filePath, agentId, token, server = "") {
+function setToken(filePath, agentId, token, server = "", extra = {}) {
   if (!agentId || !token) throw new Error("agentId and token are required");
   const data = loadTokens(filePath);
   data.agents[agentId] = {
     token,
+    token_hash: hashToken(token),
     server,
+    nickname: extra.nickname || data.agents[agentId]?.nickname || "",
     updated_at: new Date().toISOString(),
   };
   saveTokens(filePath, data);
@@ -66,6 +78,8 @@ function listTokens(filePath) {
 
 module.exports = {
   defaultTokensPath,
+  generateToken,
+  hashToken,
   loadTokens,
   saveTokens,
   setToken,

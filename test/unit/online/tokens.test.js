@@ -8,6 +8,8 @@ const {
   removeToken,
   getToken,
   listTokens,
+  generateToken,
+  hashToken,
 } = require('../../../src/online/tokens');
 
 describe('online tokens', () => {
@@ -37,6 +39,14 @@ describe('online tokens', () => {
     setToken(file, 'b', 't2', 's2');
     const list = listTokens(file);
     expect(list.length).toBe(2);
+  });
+
+  test('generate + hash token', () => {
+    const token = generateToken(16);
+    const hashed = hashToken(token);
+    expect(typeof token).toBe('string');
+    expect(token.length).toBeGreaterThan(0);
+    expect(hashed).toHaveLength(64);
   });
 
   test('load legacy flat object', () => {
