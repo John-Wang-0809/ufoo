@@ -1,5 +1,8 @@
 const path = require("path");
 const { spawnSync } = require("child_process");
+const net = require("net");
+const fs = require("fs");
+const { socketPath, isRunning } = require("./daemon");
 
 function getPackageRoot() {
   return path.resolve(__dirname, "..");
@@ -20,6 +23,97 @@ function run(cmd, args, options = {}) {
 
 function getPackageScript(rel) {
   return path.join(getPackageRoot(), rel);
+}
+
+function connectSocket(sockPath) {
+  return new Promise((resolve, reject) => {
+    const client = net.createConnection(sockPath, () => resolve(client));
+    client.on("error", reject);
+  });
+}
+
+async function connectWithRetry(sockPath, retries, delayMs) {
+  for (let i = 0; i < retries; i += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const client = await connectSocket(sockPath);
+      return client;
+    } catch {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  return null;
+}
+
+async function ensureDaemonRunning(projectRoot) {
+  if (isRunning(projectRoot)) return;
+  const repoRoot = getPackageRoot();
+  run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "daemon", "start"]);
+  const sock = socketPath(projectRoot);
+  for (let i = 0; i < 30; i += 1) {
+    if (fs.existsSync(sock)) {
+      return;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+async function sendDaemonRequest(projectRoot, payload) {
+  const sock = socketPath(projectRoot);
+  const client = await connectWithRetry(sock, 25, 200);
+  if (!client) {
+    throw new Error("Failed to connect to ufoo daemon");
+  }
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const timeout = setTimeout(() => {
+      try {
+        client.destroy();
+      } catch {
+        // ignore
+      }
+      reject(new Error("Daemon request timeout"));
+    }, 8000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      client.removeAllListeners();
+      try {
+        client.end();
+      } catch {
+        // ignore
+      }
+    };
+    client.on("data", (data) => {
+      buffer += data.toString("utf8");
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (msg.type === "response" || msg.type === "error") {
+          cleanup();
+          if (msg.type === "error") {
+            reject(new Error(msg.error || "Daemon error"));
+          } else {
+            resolve(msg);
+          }
+          return;
+        }
+      }
+    });
+    client.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
+    client.write(`${JSON.stringify(payload)}\n`);
+  });
 }
 
 function requireOptional(name) {
@@ -85,6 +179,31 @@ async function runCli(argv) {
         const repoRoot = getPackageRoot();
         run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "chat"]);
       });
+    program
+      .command("resume")
+      .description("Resume agent sessions (optional nickname)")
+      .argument("[nickname]", "Nickname or subscriber ID to resume")
+      .action(async (nickname) => {
+        try {
+          const projectRoot = process.cwd();
+          await ensureDaemonRunning(projectRoot);
+          const resp = await sendDaemonRequest(projectRoot, {
+            type: "resume_agents",
+            target: nickname || "",
+          });
+          const reply = resp?.data?.reply || "Resume requested";
+          console.log(reply);
+          if (resp?.data?.resume?.resumed?.length) {
+            resp.data.resume.resumed.forEach((item) => {
+              const label = item.nickname ? ` (${item.nickname})` : "";
+              console.log(`  - ${item.agent}${label}`);
+            });
+          }
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
 
     program
       .command("init")
@@ -129,6 +248,36 @@ async function runCli(argv) {
           await manager.install(name, opts);
         } catch (err) {
           console.error(err.message);
+          process.exitCode = 1;
+        }
+      });
+
+    const online = program.command("online").description("ufoo online helpers");
+    online
+      .command("token")
+      .description("Generate and store a ufoo-online token")
+      .argument("<subscriber>", "Subscriber ID (e.g., claude-code:abc123)")
+      .option("--nickname <name>", "Nickname for this agent")
+      .option("--server <url>", "Online server URL")
+      .option("--file <path>", "Tokens file path")
+      .action((subscriber, opts) => {
+        try {
+          const { generateToken, setToken, defaultTokensPath } = require("./online/tokens");
+          const filePath = opts.file || defaultTokensPath();
+          const token = generateToken();
+          const entry = setToken(filePath, subscriber, token, opts.server || "", {
+            nickname: opts.nickname || "",
+          });
+          console.log(JSON.stringify({
+            subscriber,
+            token,
+            token_hash: entry.token_hash,
+            server: entry.server,
+            nickname: entry.nickname,
+            file: filePath,
+          }, null, 2));
+        } catch (err) {
+          console.error(err.message || String(err));
           process.exitCode = 1;
         }
       });
@@ -267,10 +416,18 @@ async function runCli(argv) {
               await eventBus.leave(cmdArgs[0]);
               break;
             case "send":
-              await eventBus.send(cmdArgs[0], cmdArgs[1]);
+              {
+                // 自动 join（如果还没有 join）并获取 subscriber ID
+                const publisher = await eventBus.ensureJoined();
+                await eventBus.send(cmdArgs[0], cmdArgs[1], publisher);
+              }
               break;
             case "broadcast":
-              await eventBus.broadcast(cmdArgs[0]);
+              {
+                // 自动 join（如果还没有 join）并获取 subscriber ID
+                const publisher = await eventBus.ensureJoined();
+                await eventBus.broadcast(cmdArgs[0], publisher);
+              }
               break;
             case "check":
               await eventBus.check(cmdArgs[0]);
@@ -434,9 +591,11 @@ async function runCli(argv) {
     console.log("  ufoo status");
     console.log("  ufoo daemon --start|--stop|--status");
     console.log("  ufoo chat");
+    console.log("  ufoo resume [nickname]");
     console.log("  ufoo init [--modules <list>] [--project <dir>]");
     console.log("  ufoo skills list");
     console.log("  ufoo skills install <name|all> [--target <dir> | --codex | --agents]");
+    console.log("  ufoo online token <subscriber> [--nickname <name>] [--server <url>] [--file <path>]");
     console.log("  ufoo bus <args...>    (JS bus implementation)");
     console.log("  ufoo ctx <subcmd> ... (doctor|lint|decisions)");
     console.log("");
@@ -477,6 +636,25 @@ async function runCli(argv) {
   }
   if (cmd === "chat") {
     run(process.execPath, [path.join(repoRoot, "bin", "ufoo.js"), "chat"]);
+    return;
+  }
+  if (cmd === "resume") {
+    const nickname = rest[0] || "";
+    (async () => {
+      try {
+        const projectRoot = process.cwd();
+        await ensureDaemonRunning(projectRoot);
+        const resp = await sendDaemonRequest(projectRoot, {
+          type: "resume_agents",
+          target: nickname,
+        });
+        const reply = resp?.data?.reply || "Resume requested";
+        console.log(reply);
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
+    })();
     return;
   }
   if (cmd === "init") {
@@ -531,6 +709,45 @@ async function runCli(argv) {
         console.error(err.message);
         process.exitCode = 1;
       });
+      return;
+    }
+    help();
+    process.exitCode = 1;
+    return;
+  }
+  if (cmd === "online") {
+    const sub = rest[0] || "";
+    if (sub === "token") {
+      const subscriber = rest[1];
+      if (!subscriber) {
+        console.error("online token requires <subscriber>");
+        process.exitCode = 1;
+        return;
+      }
+      const getOpt = (name) => {
+        const i = rest.indexOf(name);
+        if (i === -1) return "";
+        return rest[i + 1] || "";
+      };
+      try {
+        const { generateToken, setToken, defaultTokensPath } = require("./online/tokens");
+        const filePath = getOpt("--file") || defaultTokensPath();
+        const token = generateToken();
+        const entry = setToken(filePath, subscriber, token, getOpt("--server"), {
+          nickname: getOpt("--nickname"),
+        });
+        console.log(JSON.stringify({
+          subscriber,
+          token,
+          token_hash: entry.token_hash,
+          server: entry.server,
+          nickname: entry.nickname,
+          file: filePath,
+        }, null, 2));
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
       return;
     }
     help();
@@ -651,10 +868,18 @@ async function runCli(argv) {
             await eventBus.leave(cmdArgs[0]);
             break;
           case "send":
-            await eventBus.send(cmdArgs[0], cmdArgs[1]);
+            {
+              // 自动 join（如果还没有 join）并获取 subscriber ID
+              const publisher = await eventBus.ensureJoined();
+              await eventBus.send(cmdArgs[0], cmdArgs[1], publisher);
+            }
             break;
           case "broadcast":
-            await eventBus.broadcast(cmdArgs[0]);
+            {
+              // 自动 join（如果还没有 join）并获取 subscriber ID
+              const publisher = await eventBus.ensureJoined();
+              await eventBus.broadcast(cmdArgs[0], publisher);
+            }
             break;
           case "check":
             await eventBus.check(cmdArgs[0]);
