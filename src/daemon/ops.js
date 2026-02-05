@@ -2,14 +2,17 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const { loadConfig } = require("../config");
+const { getUfooPaths } = require("../ufoo/paths");
+const { loadAgentsData, saveAgentsData } = require("../ufoo/agentsStore");
+const { isAgentPidAlive, getTtyProcessInfo } = require("../bus/utils");
 
 function resolveAgentId(projectRoot, agentId) {
   if (!agentId) return agentId;
   if (agentId.includes(":")) return agentId;
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   try {
     const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-    const entries = Object.entries(bus.subscribers || {});
+    const entries = Object.entries(bus.agents || {});
     const match = entries.find(([, meta]) => meta?.nickname === agentId);
     if (match) return match[0];
     const targetType = agentId === "claude" ? "claude-code" : agentId;
@@ -37,6 +40,31 @@ function runAppleScript(lines) {
   });
 }
 
+function listSubscribers(projectRoot, agentType) {
+  const busPath = getUfooPaths(projectRoot).agentsFile;
+  try {
+    const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
+    return Object.entries(bus.agents || {})
+      .filter(([, meta]) => meta && meta.agent_type === agentType && meta.status === "active")
+      .map(([id]) => id);
+  } catch {
+    return [];
+  }
+}
+
+async function waitForNewSubscriber(projectRoot, agentType, existing, timeoutMs = 15000) {
+  const start = Date.now();
+  const seen = new Set(existing || []);
+  while (Date.now() - start < timeoutMs) {
+    const current = listSubscribers(projectRoot, agentType);
+    const diff = current.find((id) => !seen.has(id));
+    if (diff) return diff;
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return null;
+}
+
 function escapeCommand(cmd) {
   return cmd.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -46,110 +74,112 @@ function shellEscape(value) {
   return `'${str.replace(/'/g, `'\\''`)}'`;
 }
 
-/**
- * Spawn managed terminal agent - daemon 作为父进程，输出到终端窗口
- */
-async function spawnManagedTerminalAgent(projectRoot, agent, nickname = "", processManager = null) {
-  const binary = agent === "codex" ? "ucodex" : "uclaude";
-  const logDir = path.join(projectRoot, ".ufoo", "run");
-  fs.mkdirSync(logDir, { recursive: true });
+function buildTitleCmd(title) {
+  if (!title) return "";
+  return `printf '\\033]0;%s\\007' ${shellEscape(title)}`;
+}
 
-  const crypto = require("crypto");
+function buildResumeCommand(projectRoot, agent, sessionId) {
+  const binary = agent === "codex" ? "./bin/ucodex.js" : "./bin/uclaude.js";
+  const args = buildResumeArgs(agent, sessionId);
+  const argText = args.length > 0 ? ` ${args.map(shellEscape).join(" ")}` : "";
+  const skipProbeEnv = "UFOO_SKIP_SESSION_PROBE=1 ";
+  return `cd ${shellEscape(projectRoot)} && ${skipProbeEnv}${binary}${argText}`;
+}
 
-  // 预生成 session ID
-  const sessionId = crypto.randomBytes(4).toString("hex");
-  const agentType = agent === "codex" ? "codex" : "claude-code";
-  const subscriberId = `${agentType}:${sessionId}`;
-
-  // 日志文件路径
-  const logFile = path.join(logDir, `agent-${agent}-${sessionId}.log`);
-
-  // daemon spawn 子进程（父子关系）
-  const logFd = fs.openSync(logFile, "a");
-  const child = spawn(binary, [], {
-    detached: false, // daemon 作为父进程
-    stdio: ["ignore", logFd, logFd],
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      UFOO_NICKNAME: nickname || "",
-      UFOO_LAUNCH_MODE: "terminal",
-      // 只设置对应类型的 session ID
-      ...(agent === "codex"
-        ? { CODEX_SESSION_ID: sessionId, CLAUDE_SESSION_ID: "" }
-        : { CLAUDE_SESSION_ID: sessionId, CODEX_SESSION_ID: "" }),
-    },
-  });
-
-  // 日志记录
-  child.on("exit", (code, signal) => {
-    try {
-      fs.closeSync(logFd);
-    } catch {
-      // ignore
-    }
-
-    const exitMsg = signal
-      ? `\n[terminal-agent] ${subscriberId} killed by signal ${signal}\n`
-      : `\n[terminal-agent] ${subscriberId} exited with code ${code}\n`;
-    try {
-      fs.appendFileSync(logFile, exitMsg);
-    } catch {
-      // ignore
-    }
-  });
-
-  child.on("error", (err) => {
-    const errMsg = `\n[terminal-agent] ${subscriberId} spawn failed: ${err.message}\n`;
-    try {
-      fs.appendFileSync(logFile, errMsg);
-      fs.closeSync(logFd);
-    } catch {
-      // ignore
-    }
-  });
-
-  // 注册到进程管理器（父子进程监控）
-  if (processManager) {
-    processManager.register(subscriberId, child);
+async function tryReuseTerminal(projectRoot, subscriberId, meta, agent, sessionId) {
+  if (!meta || !meta.tty) return false;
+  const info = getTtyProcessInfo(meta.tty);
+  if (!info.alive || info.hasAgent || !info.idle) return false;
+  const titleCmd = buildTitleCmd(meta.nickname || "");
+  const baseCmd = buildResumeCommand(projectRoot, agent, sessionId);
+  const command = titleCmd ? `${titleCmd} && ${baseCmd}` : baseCmd;
+  try {
+    const EventBus = require("../bus");
+    const bus = new EventBus(projectRoot);
+    bus.ensureBus();
+    await bus.inject(subscriberId, command);
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  // 打开终端窗口显示日志
+/**
+ * Spawn managed terminal agent - open a real Terminal session to run the agent
+ */
+async function spawnManagedTerminalAgent(projectRoot, agent, nickname = "", processManager = null, extraArgs = [], extraEnv = "") {
+  const binary = agent === "codex" ? "./bin/ucodex.js" : "./bin/uclaude.js";
+  const agentType = agent === "codex" ? "codex" : "claude-code";
+  const existing = listSubscribers(projectRoot, agentType);
+
+  // Run in Terminal.app to ensure a real TTY is available
   if (process.platform === "darwin") {
-    const displayName = nickname || `${agent}-${sessionId.slice(0, 6)}`;
-    const tailCmd = `tail -f "${logFile}"`;
+    const nickEnv = nickname ? `UFOO_NICKNAME=${shellEscape(nickname)} ` : "";
+    const modeEnv = "UFOO_LAUNCH_MODE=terminal ";
+    const ttyEnv = "UFOO_TTY_OVERRIDE=$(tty) ";
+    const args = Array.isArray(extraArgs) ? extraArgs : [];
+    const envPrefix = extraEnv ? `${String(extraEnv).trim()} ` : "";
+    const argText = args.length > 0 ? ` ${args.map(shellEscape).join(" ")}` : "";
+    const titleCmd = buildTitleCmd(nickname);
+    const prefix = titleCmd ? `${titleCmd} && ` : "";
+    const runCmd = `cd ${shellEscape(projectRoot)} && ${prefix}${modeEnv}${nickEnv}${ttyEnv}${envPrefix}${binary}${argText}`;
     const script = [
       'tell application "Terminal"',
-      `do script "${escapeCommand(`cd "${projectRoot}" && echo "=== ${displayName} (${subscriberId}) ===" && ${tailCmd}`)}"`,
+      `do script "${escapeCommand(runCmd)}"`,
       "activate",
       "end tell",
     ];
     await runAppleScript(script);
   }
 
-  return { child, subscriberId };
+  const subscriberId = await waitForNewSubscriber(projectRoot, agentType, existing, 15000);
+  return { child: null, subscriberId: subscriberId || null };
 }
 
 async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", processManager = null) {
   const runner = path.join(projectRoot, "bin", "ufoo.js");
-  const logDir = path.join(projectRoot, ".ufoo", "run");
+  const logDir = getUfooPaths(projectRoot).runDir;
   fs.mkdirSync(logDir, { recursive: true });
 
   const crypto = require("crypto");
+  const EventBus = require("../bus");
   const children = [];
   const subscriberIds = [];
+
+  // 初始化 bus
+  const bus = new EventBus(projectRoot);
+  await bus.init();
+
+  const originalPid = process.pid;
 
   for (let i = 0; i < count; i += 1) {
     const logFile = path.join(logDir, `agent-${agent}-${Date.now()}-${i}.log`);
     const errLog = fs.openSync(logFile, "a");
 
-    // 预生成 session ID，这样父进程就知道 subscriber_id 了
+    // 预生成 session ID
     const sessionId = crypto.randomBytes(4).toString("hex");
     const agentType = agent === "codex" ? "codex" : "claude-code";
     const subscriberId = `${agentType}:${sessionId}`;
     subscriberIds.push(subscriberId);
 
-    const child = spawn(process.execPath, [runner, "agent-runner", agent], {
+    // Daemon 预先在 bus 中注册
+    bus.loadBusData();
+    process.env.UFOO_PARENT_PID = String(originalPid);
+
+    const finalNickname = count > 1 ? `${nickname || agent}-${i + 1}` : (nickname || "");
+    const usePty = process.env.UFOO_INTERNAL_PTY !== "0";
+    const launchMode = usePty ? "internal-pty" : "internal";
+
+    // 传递 launch_mode 和 parent PID 到 join
+    await bus.subscriberManager.join(sessionId, agentType, finalNickname, {
+      launchMode,
+      parentPid: originalPid,
+    });
+    bus.saveBusData();
+
+    const runnerCmd = usePty ? "agent-pty-runner" : "agent-runner";
+    const child = spawn(process.execPath, [runner, runnerCmd, agent], {
       // 关键改动：不使用 detached，daemon 作为父进程
       detached: false,
       stdio: ["ignore", errLog, errLog],
@@ -157,11 +187,11 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
       env: {
         ...process.env,
         UFOO_INTERNAL_AGENT: "1",
-        UFOO_NICKNAME: nickname || "",
-        UFOO_LAUNCH_MODE: "internal",
-        // 传递预生成的 session ID
-        CLAUDE_SESSION_ID: sessionId,
-        CODEX_SESSION_ID: sessionId
+        UFOO_INTERNAL_PTY: usePty ? "1" : "0",
+        UFOO_SUBSCRIBER_ID: subscriberId,  // 直接传递 subscriber ID
+        UFOO_NICKNAME: finalNickname,
+        UFOO_LAUNCH_MODE: usePty ? "internal-pty" : "internal",
+        UFOO_PARENT_PID: String(originalPid),
       },
     });
 
@@ -200,16 +230,20 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
   return { children, subscriberIds };
 }
 
-function spawnTmuxWindow(projectRoot, agent, nickname = "") {
+function spawnTmuxWindow(projectRoot, agent, nickname = "", extraArgs = [], extraEnv = "") {
   return new Promise((resolve, reject) => {
     const binary = agent === "codex" ? "ucodex" : "uclaude";
     const nickEnv = nickname ? `UFOO_NICKNAME=${shellEscape(nickname)} ` : "";
     const modeEnv = "UFOO_LAUNCH_MODE=tmux ";
+    const ttyEnv = "UFOO_TTY_OVERRIDE=$(tty) ";
+    const args = Array.isArray(extraArgs) ? extraArgs : [];
+    const envPrefix = extraEnv ? `${String(extraEnv).trim()} ` : "";
+    const argText = args.length > 0 ? ` ${args.map(shellEscape).join(" ")}` : "";
 
     // IMPORTANT: Set TMUX_PANE inside the new window using tmux display-message
     // This ensures the agent gets the correct pane ID for command injection
     const setPaneEnv = `export TMUX_PANE=$(tmux display-message -p '#{pane_id}'); `;
-    const runCmd = `cd ${shellEscape(projectRoot)} && ${setPaneEnv}${modeEnv}${nickEnv}${binary}`;
+    const runCmd = `cd ${shellEscape(projectRoot)} && ${setPaneEnv}${modeEnv}${nickEnv}${ttyEnv}${envPrefix}${binary}${argText}`;
     const windowName = nickname || `${agent}-${Date.now()}`;
 
     // Use detached mode (-d) to avoid stealing focus
@@ -281,10 +315,110 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
     const nick = count > 1 ? `${nickname || agent}-${i + 1}` : (nickname || "");
     // eslint-disable-next-line no-await-in-loop
     const result = await spawnManagedTerminalAgent(projectRoot, agent, nick, processManager);
-    subscriberIds.push(result.subscriberId);
+    if (result.subscriberId) subscriberIds.push(result.subscriberId);
   }
 
   return { mode: "terminal", subscriberIds };
+}
+
+function normalizeAgentType(agentType) {
+  if (agentType === "claude-code") return "claude";
+  if (agentType === "codex") return "codex";
+  return agentType;
+}
+
+function buildResumeArgs(agent, sessionId) {
+  if (!sessionId) return [];
+  if (agent === "codex") return ["resume", sessionId];
+  if (agent === "claude") return ["--session-id", sessionId];
+  return [];
+}
+
+function isActiveAgent(meta) {
+  if (!meta || meta.status !== "active") return false;
+  if (meta.pid && !isAgentPidAlive(meta.pid)) return false;
+  return true;
+}
+
+async function resumeAgents(projectRoot, target = "", processManager = null) {
+  const config = loadConfig(projectRoot);
+  const mode = config.launchMode || "terminal";
+  const filePath = getUfooPaths(projectRoot).agentsFile;
+  const data = loadAgentsData(filePath);
+  const entries = Object.entries(data.agents || {});
+
+  let targets = entries;
+  if (target) {
+    if (target.includes(":")) {
+      targets = entries.filter(([id]) => id === target);
+    } else {
+      targets = entries.filter(([, meta]) => meta && meta.nickname === target);
+    }
+  }
+
+  const resumable = [];
+  const skipped = [];
+
+  for (const [id, meta] of targets) {
+    if (!meta || !meta.provider_session_id) {
+      skipped.push({ id, reason: "no provider session" });
+      continue;
+    }
+    if (isActiveAgent(meta)) {
+      skipped.push({ id, reason: "already active" });
+      continue;
+    }
+    const agent = normalizeAgentType(meta.agent_type);
+    if (agent !== "codex" && agent !== "claude") {
+      skipped.push({ id, reason: "unsupported agent type" });
+      continue;
+    }
+    resumable.push({ id, meta, agent });
+  }
+
+  if (resumable.length === 0) {
+    return { ok: true, resumed: [], skipped };
+  }
+
+  // Clear old nicknames to allow reuse
+  let updated = false;
+  for (const item of resumable) {
+    if (item.meta && item.meta.nickname) {
+      data.agents[item.id] = { ...item.meta, nickname: "" };
+      updated = true;
+    }
+  }
+  if (updated) {
+    saveAgentsData(filePath, data);
+  }
+
+  const resumed = [];
+  if (mode === "internal") {
+    for (const item of resumable) {
+      skipped.push({ id: item.id, reason: "internal mode not supported for resume" });
+    }
+    return { ok: true, resumed, skipped };
+  }
+
+  for (const item of resumable) {
+    const nickname = item.meta.nickname || "";
+    const sessionId = item.meta.provider_session_id;
+    const reused = await tryReuseTerminal(projectRoot, item.id, item.meta, item.agent, sessionId);
+    if (!reused) {
+      const args = buildResumeArgs(item.agent, sessionId);
+      const envPrefix = "UFOO_SKIP_SESSION_PROBE=1";
+      if (mode === "tmux") {
+        // eslint-disable-next-line no-await-in-loop
+        await spawnTmuxWindow(projectRoot, item.agent, nickname, args, envPrefix);
+      } else {
+        // eslint-disable-next-line no-await-in-loop
+        await spawnManagedTerminalAgent(projectRoot, item.agent, nickname, processManager, args, envPrefix);
+      }
+    }
+    resumed.push({ id: item.id, nickname, agent: item.agent, sessionId, reused });
+  }
+
+  return { ok: true, resumed, skipped };
 }
 
 async function closeAgent(projectRoot, agentId) {
@@ -292,11 +426,11 @@ async function closeAgent(projectRoot, agentId) {
     return false;
   }
   const resolvedId = resolveAgentId(projectRoot, agentId);
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   let pid = null;
   try {
     const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-    const entry = bus.subscribers?.[resolvedId];
+    const entry = bus.agents?.[resolvedId];
     if (entry && entry.pid) pid = entry.pid;
   } catch {
     pid = null;
@@ -310,4 +444,4 @@ async function closeAgent(projectRoot, agentId) {
   }
 }
 
-module.exports = { launchAgent, closeAgent };
+module.exports = { launchAgent, closeAgent, resumeAgents };
