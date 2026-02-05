@@ -164,21 +164,30 @@ describe('OnlineServer (Phase 1)', () => {
     ws2.send(JSON.stringify({ type: 'auth', method: 'token', token: 'token-b' }));
     await next2();
 
-    ws1.send(JSON.stringify({ type: 'join', channel: 'demo' }));
-    ws2.send(JSON.stringify({ type: 'join', channel: 'demo' }));
+    const channelId = 'channel_123456';
+    server.channels.set(channelId, {
+      name: 'demo',
+      type: 'public',
+      members: new Set(),
+      created_at: new Date().toISOString(),
+    });
+    server.channelNames.set('demo', channelId);
+
+    ws1.send(JSON.stringify({ type: 'join', channel: channelId }));
+    ws2.send(JSON.stringify({ type: 'join', channel: channelId }));
 
     await next1();
     await next2();
 
     ws1.send(JSON.stringify({
       type: 'event',
-      channel: 'demo',
+      channel: channelId,
       payload: { kind: 'message', message: 'hello' },
     }));
 
     const delivered = await next2();
     expect(delivered.type).toBe('event');
-    expect(delivered.channel).toBe('demo');
+    expect(delivered.channel).toBe(channelId);
     expect(delivered.payload).toEqual({ kind: 'message', message: 'hello' });
     expect(delivered.from).toBe('claude-code:one');
 

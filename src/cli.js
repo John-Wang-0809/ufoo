@@ -328,6 +328,50 @@ async function runCli(argv) {
         }
       });
 
+    online
+      .command("channel")
+      .description("Manage online channels (HTTP)")
+      .argument("<action>", "create|list")
+      .option("--server <url>", "Online server base URL (http://host:port)")
+      .option("--name <name>", "Channel name (unique)")
+      .option("--type <type>", "Channel type (world|public)")
+      .action(async (action, opts) => {
+        const base = opts.server || "http://127.0.0.1:8787";
+        const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
+        try {
+          if (action === "list") {
+            const res = await fetch(endpoint);
+            const data = await res.json();
+            console.log(JSON.stringify(data, null, 2));
+            return;
+          }
+          if (action === "create") {
+            const payload = {
+              name: opts.name,
+              type: opts.type,
+            };
+            if (!payload.name) {
+              console.error("online channel create requires --name");
+              process.exitCode = 1;
+              return;
+            }
+            const res = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            console.log(JSON.stringify(data, null, 2));
+            return;
+          }
+          console.error("online channel requires action create|list");
+          process.exitCode = 1;
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
+
     const bus = program.command("bus").description("Project bus commands");
     bus
       .command("alert")
@@ -644,6 +688,8 @@ async function runCli(argv) {
     console.log("  ufoo online token <subscriber> [--nickname <name>] [--server <url>] [--file <path>]");
     console.log("  ufoo online room create [--name <room>] --type public|private [--password <pwd>] [--server <url>]");
     console.log("  ufoo online room list [--server <url>]");
+    console.log("  ufoo online channel create --name <name> [--type world|public] [--server <url>]");
+    console.log("  ufoo online channel list [--server <url>]");
     console.log("  ufoo bus <args...>    (JS bus implementation)");
     console.log("  ufoo ctx <subcmd> ... (doctor|lint|decisions)");
     console.log("");
@@ -821,6 +867,11 @@ async function runCli(argv) {
               type: getOpt("--type"),
               password: getOpt("--password"),
             };
+            if (!payload.type) {
+              console.error("online room create requires --type");
+              process.exitCode = 1;
+              return;
+            }
             const res = await fetch(endpoint, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -831,6 +882,51 @@ async function runCli(argv) {
             return;
           }
           console.error("online room requires action create|list");
+          process.exitCode = 1;
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      })();
+      return;
+    }
+    if (sub === "channel") {
+      const action = rest[1] || "";
+      const getOpt = (name) => {
+        const i = rest.indexOf(name);
+        if (i === -1) return "";
+        return rest[i + 1] || "";
+      };
+      const base = getOpt("--server") || "http://127.0.0.1:8787";
+      const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
+      (async () => {
+        try {
+          if (action === "list") {
+            const res = await fetch(endpoint);
+            const data = await res.json();
+            console.log(JSON.stringify(data, null, 2));
+            return;
+          }
+          if (action === "create") {
+            const payload = {
+              name: getOpt("--name"),
+              type: getOpt("--type") || "public",
+            };
+            if (!payload.name) {
+              console.error("online channel create requires --name");
+              process.exitCode = 1;
+              return;
+            }
+            const res = await fetch(endpoint, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            const data = await res.json();
+            console.log(JSON.stringify(data, null, 2));
+            return;
+          }
+          console.error("online channel requires action create|list");
           process.exitCode = 1;
         } catch (err) {
           console.error(err.message || String(err));

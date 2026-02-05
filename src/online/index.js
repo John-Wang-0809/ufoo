@@ -22,6 +22,7 @@ class OnlineServer extends EventEmitter {
     this.clientsById = new Map();
     this.clientsByNickname = new Map();
     this.channels = new Map();
+    this.channelNames = new Map();
 
     this.nicknameScope = options.nicknameScope || "global"; // global | world
 
@@ -74,6 +75,11 @@ class OnlineServer extends EventEmitter {
 
       if (req.url.startsWith("/ufoo/online/rooms")) {
         this.handleRoomsRequest(req, res);
+        return;
+      }
+
+      if (req.url.startsWith("/ufoo/online/channels")) {
+        this.handleChannelsRequest(req, res);
         return;
       }
 
@@ -155,6 +161,16 @@ class OnlineServer extends EventEmitter {
     }));
   }
 
+  listChannels() {
+    return Array.from(this.channels.entries()).map(([channelId, channel]) => ({
+      channel_id: channelId,
+      name: channel.name || "",
+      type: channel.type || "public",
+      members: channel.members.size,
+      created_at: channel.created_at,
+    }));
+  }
+
   handleRoomsRequest(req, res) {
     if (req.method === "GET") {
       this.sendJson(res, 200, { ok: true, rooms: this.listRooms() });
@@ -198,6 +214,57 @@ class OnlineServer extends EventEmitter {
           created_at: new Date().toISOString(),
         });
         this.sendJson(res, 200, { ok: true, room: { room_id: roomId, name, type } });
+      });
+      return;
+    }
+
+    this.sendJson(res, 405, { ok: false, error: "Method not allowed" });
+  }
+
+  handleChannelsRequest(req, res) {
+    if (req.method === "GET") {
+      this.sendJson(res, 200, { ok: true, channels: this.listChannels() });
+      return;
+    }
+
+    if (req.method === "POST") {
+      this.readBody(req).then((body) => {
+        let payload = null;
+        try {
+          payload = JSON.parse(body || "{}");
+        } catch {
+          payload = null;
+        }
+        if (!payload || !payload.name) {
+          this.sendJson(res, 400, { ok: false, error: "Missing name" });
+          return;
+        }
+        const name = String(payload.name || "").trim();
+        const type = String(payload.type || "public").trim();
+        if (!name) {
+          this.sendJson(res, 400, { ok: false, error: "Invalid channel name" });
+          return;
+        }
+        if (!["world", "public"].includes(type)) {
+          this.sendJson(res, 400, { ok: false, error: "Invalid channel type" });
+          return;
+        }
+        if (this.channelNames.has(name)) {
+          this.sendJson(res, 409, { ok: false, error: "Channel name already exists" });
+          return;
+        }
+        let channelId = "";
+        do {
+          channelId = `channel_${Math.floor(Math.random() * 1000000).toString().padStart(6, "0")}`;
+        } while (this.channels.has(channelId));
+        this.channels.set(channelId, {
+          name,
+          type,
+          members: new Set(),
+          created_at: new Date().toISOString(),
+        });
+        this.channelNames.set(name, channelId);
+        this.sendJson(res, 200, { ok: true, channel: { channel_id: channelId, name, type } });
       });
       return;
     }
@@ -433,12 +500,13 @@ class OnlineServer extends EventEmitter {
       return;
     }
 
-    if (!this.channels.has(channel)) {
-      this.channels.set(channel, new Set());
+    const channelInfo = this.channels.get(channel);
+    if (!channelInfo) {
+      this.sendError(client.ws, "Channel not found", false, "CHANNEL_NOT_FOUND");
+      return;
     }
 
-    const members = this.channels.get(channel);
-    members.add(client);
+    channelInfo.members.add(client);
     client.channels.add(channel);
     this.send(client.ws, { type: "join_ack", ok: true, channel });
   }
@@ -458,10 +526,9 @@ class OnlineServer extends EventEmitter {
       return;
     }
 
-    const members = this.channels.get(channel);
-    if (members) {
-      members.delete(client);
-      if (members.size === 0) this.channels.delete(channel);
+    const channelInfo = this.channels.get(channel);
+    if (channelInfo) {
+      channelInfo.members.delete(client);
     }
     client.channels.delete(channel);
     this.send(client.ws, { type: "leave_ack", ok: true, channel });
@@ -534,7 +601,8 @@ class OnlineServer extends EventEmitter {
         this.sendError(client.ws, "Join channel first", false, "NOT_IN_CHANNEL");
         return;
       }
-      const members = this.channels.get(payload.channel);
+      const channel = this.channels.get(payload.channel);
+      const members = channel ? channel.members : null;
       if (!members || members.size === 0) return;
       members.forEach((member) => {
         if (member !== client) this.send(member.ws, payload);
@@ -599,10 +667,9 @@ class OnlineServer extends EventEmitter {
     }
 
     client.channels.forEach((channel) => {
-      const members = this.channels.get(channel);
-      if (members) {
-        members.delete(client);
-        if (members.size === 0) this.channels.delete(channel);
+      const channelInfo = this.channels.get(channel);
+      if (channelInfo) {
+        channelInfo.members.delete(client);
       }
     });
     client.channels.clear();
