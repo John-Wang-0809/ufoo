@@ -70,6 +70,8 @@ requirements for a secure first pass.
 }
 ```
 
+**Handshake order (Phase 1):** `hello` MUST precede `auth_required`. The server replies with `hello_ack`, then immediately issues `auth_required`.
+
 ### 3) Required: `auth` (Phase 1)
 Token auth is mandatory in Phase 1. The server replies:
 
