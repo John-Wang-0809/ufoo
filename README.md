@@ -7,6 +7,8 @@ Multi-agent AI collaboration toolkit for Claude Code and OpenAI Codex.
 - **Event Bus** - Real-time inter-agent messaging (`ufoo bus`)
 - **Context Sharing** - Shared decisions and project context (`ufoo ctx`)
 - **Agent Wrappers** - Auto-initialization for Claude Code (`uclaude`) and Codex (`ucodex`)
+  - **PTY Wrapper** - Intelligent terminal emulation with ready detection
+  - **Smart Probe Injection** - Waits for agent initialization before injecting commands
 - **Skills System** - Extensible agent capabilities (`ufoo skills`)
 
 ## Quick Start
@@ -45,6 +47,8 @@ ucodex    # instead of 'codex'
        └─────────────┘ └───────┘ └─────────────┘
 ```
 
+Bus state lives in `.ufoo/agent/all-agents.json` (metadata), `.ufoo/bus/*` (queues/events), and `.ufoo/daemon/*` (bus daemon runtime).
+
 ## Commands
 
 | Command | Description |
@@ -53,6 +57,7 @@ ucodex    # instead of 'codex'
 | `ufoo status` | Show banner, unread bus messages, open decisions |
 | `ufoo daemon --start|--stop|--status` | Manage ufoo daemon |
 | `ufoo chat` | Launch ufoo chat UI (also default when no args) |
+| `ufoo resume [nickname]` | Resume agent sessions (optional nickname) |
 | `ufoo bus join` | Join event bus (auto by uclaude/ucodex) |
 | `ufoo bus send <id> <msg>` | Send message to agent |
 | `ufoo bus check <id>` | Check pending messages |
@@ -164,6 +169,30 @@ ufoo --help
 UNLICENSED (Private)
 
 ## Recent Changes
+
+### 🚀 Smart Ready Detection & PTY Wrapper (2026-02-06)
+
+Added intelligent agent initialization detection for reliable probe injection:
+
+**Features:**
+- **ReadyDetector** - Monitors PTY output to detect when agents are ready
+- **Smart Probe Timing** - Injects session probe after agent initialization (not before)
+- **Multi-layer Fallback** - 10s ready detection + 8s fallback + 15 retries
+- **Performance Metrics** - Tracks detection time and buffer usage (`UFOO_DEBUG=1`)
+
+**Benefits:**
+- ✅ No more premature probe injection (was 2s, now waits for prompt)
+- ✅ Reliable session ID capture (39 tests, 100% pass)
+- ✅ Production-ready error handling and logging
+
+**Technical Details:**
+- `src/agent/readyDetector.js` - PTY output analysis
+- `src/agent/ptyWrapper.js` - Terminal emulation with monitoring
+- `src/daemon/providerSessions.js` - Early probe triggering support
+
+See `.ufoo/plans/ready-detection-production-checklist.md` for full details.
+
+---
 
 ### 🎉 Bash to JavaScript Migration (2026-02-04)
 

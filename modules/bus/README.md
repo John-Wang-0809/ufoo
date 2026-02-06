@@ -22,11 +22,17 @@ ufoo init --modules context,bus
 ## Directory Structure
 
 ```
-.bus/
-├── bus.json      # Bus metadata + subscriber status
-├── events/       # Event stream (JSONL, sharded by date)
-├── offsets/      # Each Agent's consumption progress
-└── queues/       # Targeted event queues
+.ufoo/
+├── agent/
+│   └── all-agents.json  # Agent metadata + agent status
+├── daemon/
+│   ├── daemon.pid
+│   ├── daemon.log
+│   └── counts/
+└── bus/
+    ├── events/          # Event stream (JSONL, sharded by date)
+    ├── offsets/         # Each Agent's consumption progress
+    └── queues/          # Targeted event queues
 ```
 
 ## Usage
@@ -99,7 +105,7 @@ ufoo bus daemon --interval 1 --daemon
 - Terminal.app (Accessibility): System Events (needs Accessibility), injection sequence is Escape + paste + Return (avoids IME issues)
 
 Tips:
-- Terminal.app backend depends on `tty` in `bus.json`. Execute `join` in the target terminal session (ensure `tty` is not `not a tty`).
+- Terminal.app backend depends on `tty` in `.ufoo/agent/all-agents.json`. Execute `join` in the target terminal session (ensure `tty` is not `not a tty`).
 - Pure Automation backend needs one-time authorization: System Preferences → Privacy & Security → Automation (allow script to control Terminal).
 - Accessibility backend needs one-time authorization: System Preferences → Privacy & Security → Accessibility (for Terminal / script host).
 

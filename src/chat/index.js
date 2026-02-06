@@ -7,7 +7,9 @@ const { loadConfig, saveConfig, normalizeLaunchMode, normalizeAgentProvider } = 
 const { socketPath, isRunning } = require("../daemon");
 const UfooInit = require("../init");
 const EventBus = require("../bus");
-const AgentLauncher = require("../agent/launcher");
+const AgentActivator = require("../bus/activate");
+const { getUfooPaths } = require("../ufoo/paths");
+const { subscriberToSafeName } = require("../bus/utils");
 
 function connectSocket(sockPath) {
   return new Promise((resolve, reject) => {
@@ -22,12 +24,16 @@ function resolveProjectFile(projectRoot, relativePath, fallbackRelativePath) {
   return path.join(__dirname, "..", "..", fallbackRelativePath);
 }
 
-function startDaemon(projectRoot) {
+function startDaemon(projectRoot, options = {}) {
   const daemonBin = resolveProjectFile(projectRoot, path.join("bin", "ufoo.js"), path.join("bin", "ufoo.js"));
+  const env = options.forceResume
+    ? { ...process.env, UFOO_FORCE_RESUME: "1" }
+    : process.env;
   const child = spawn(process.execPath, [daemonBin, "daemon", "--start"], {
     detached: true,
     stdio: "ignore",
     cwd: projectRoot,
+    env,
   });
   child.unref();
 }
@@ -55,16 +61,16 @@ async function connectWithRetry(sockPath, retries, delayMs) {
 }
 
 async function runChat(projectRoot) {
-  if (!fs.existsSync(path.join(projectRoot, ".ufoo"))) {
+  if (!fs.existsSync(getUfooPaths(projectRoot).ufooDir)) {
     const repoRoot = path.join(__dirname, "..", "..");
     const init = new UfooInit(repoRoot);
     await init.init({ modules: "context,bus", project: projectRoot });
   }
 
-  // Ensure session ID exists for chat (persistent across restarts)
-  if (!process.env.CLAUDE_SESSION_ID && !process.env.CODEX_SESSION_ID) {
+  // Ensure subscriber ID exists for chat (persistent across restarts)
+  if (!process.env.UFOO_SUBSCRIBER_ID) {
     const crypto = require("crypto");
-    const sessionFile = path.join(projectRoot, ".ufoo", "chat", "session-id.txt");
+    const sessionFile = path.join(getUfooPaths(projectRoot).ufooDir, "chat", "session-id.txt");
     const sessionDir = path.dirname(sessionFile);
     fs.mkdirSync(sessionDir, { recursive: true });
 
@@ -75,7 +81,8 @@ async function runChat(projectRoot) {
       sessionId = crypto.randomBytes(4).toString("hex");
       fs.writeFileSync(sessionFile, sessionId, "utf8");
     }
-    process.env.CLAUDE_SESSION_ID = sessionId;
+    // Chat 模式默认使用 claude-code 类型
+    process.env.UFOO_SUBSCRIBER_ID = `claude-code:${sessionId}`;
   }
 
   if (!isRunning(projectRoot)) {
@@ -137,6 +144,7 @@ async function runChat(projectRoot) {
       attachClient(newClient);
       connectionLostNotified = false;
       resolveStatusLine("{green-fg}✓{/green-fg} Daemon reconnected");
+      requestStatus();
       return true;
     })();
     try {
@@ -150,7 +158,7 @@ async function runChat(projectRoot) {
   if (!client) {
     // Check if daemon failed to start
     if (!isRunning(projectRoot)) {
-      const logFile = path.join(projectRoot, ".ufoo", "run", "ufoo-daemon.log");
+      const logFile = getUfooPaths(projectRoot).ufooDaemonLog;
       // eslint-disable-next-line no-console
       console.error("Failed to start ufoo daemon. Check logs at:", logFile);
       throw new Error("Daemon failed to start. Check the daemon log for details.");
@@ -162,17 +170,28 @@ async function runChat(projectRoot) {
     smartCSR: true,
     title: "ufoo chat",
     fullUnicode: true,
-    // Allow terminal native copy by not fully grabbing mouse
-    // Hold Option/Alt to use native selection in most terminals
+    // Toggle mouse at runtime to balance copy vs scroll
     sendFocus: true,
     mouse: false,
     // Allow Ctrl+C to exit even when input grabs keys
     ignoreLocked: ["C-c"],
   });
+  // Prefer normal buffer for reliable terminal selection/copy
+  if (screen.program && typeof screen.program.normalBuffer === "function") {
+    screen.program.normalBuffer();
+    if (screen.program.put && typeof screen.program.put.keypad_local === "function") {
+      screen.program.put.keypad_local();
+    }
+    if (typeof screen.program.clear === "function") {
+      screen.program.clear();
+      screen.program.cup(0, 0);
+    }
+  }
 
   const config = loadConfig(projectRoot);
   let launchMode = config.launchMode;
   let agentProvider = config.agentProvider;
+  let autoResume = config.autoResume !== false;
 
   // Dynamic input height settings
   // Layout: topLine(1) + content + bottomLine(1) + dashboard(1)
@@ -191,11 +210,11 @@ async function runChat(projectRoot) {
     scrollable: true,
     alwaysScroll: true,
     scrollback: 10000,
-    scrollbar: { ch: "│", style: { fg: "cyan" } },
+    scrollbar: null,
     keys: true,
     vi: true,
-    // Enable mouse wheel scrolling in log area (use Option/Alt for native selection)
-    mouse: true,
+    // Mouse handled globally (toggleable) to keep copy working
+    mouse: false,
   });
 
   // Status line just above input
@@ -213,7 +232,7 @@ async function runChat(projectRoot) {
   const bannerText = `{bold}UFOO{/bold} · Multi-Agent Manager{|}v${pkg.version}`;
   statusLine.setContent(bannerText);
 
-  const historyDir = path.join(projectRoot, ".ufoo", "chat");
+  const historyDir = path.join(getUfooPaths(projectRoot).ufooDir, "chat");
   const historyFile = path.join(historyDir, "history.jsonl");
   const inputHistoryFile = path.join(historyDir, "input-history.jsonl");
 
@@ -227,13 +246,19 @@ async function runChat(projectRoot) {
   let lastLogType = null;
   let hasLoggedAny = false;
 
-  function shouldSpace(type) {
-    return SPACED_TYPES.has(type);
+  function shouldSpace(type, text) {
+    if (SPACED_TYPES.has(type)) return true;
+    if (text && /daemon/i.test(text)) return true;
+    return false;
   }
 
   function writeSpacer(writeHistory) {
     if (lastLogWasSpacer || !hasLoggedAny) return;
-    logBox.log(" ");
+    try {
+      logBox.log(" ");
+    } catch {
+      // ignore rendering errors
+    }
     if (writeHistory) {
       appendHistory({
         ts: new Date().toISOString(),
@@ -248,15 +273,16 @@ async function runChat(projectRoot) {
   }
 
   function recordLog(type, text, meta = {}, writeHistory = true) {
-    if (type !== "spacer" && shouldSpace(type)) {
+    const lineText = text == null ? "" : String(text);
+    if (type !== "spacer" && shouldSpace(type, text)) {
       writeSpacer(writeHistory);
     }
-    logBox.log(text);
+    appendToLogBox(lineText);
     if (writeHistory) {
       appendHistory({
         ts: new Date().toISOString(),
         type,
-        text,
+        text: lineText,
         meta,
       });
     }
@@ -267,6 +293,39 @@ async function runChat(projectRoot) {
 
   function logMessage(type, text, meta = {}) {
     recordLog(type, text, meta, true);
+  }
+
+  // Prevent blessed tag parsing crashes from untrusted text.
+  // blessed parses `{...}` as style tags; certain inputs like `{foo,bar}` can
+  // trigger a blessed bug (Program._attr on unknown comma/semicolon parts).
+  //
+  // Workaround: blessed@0.1.81 has a bug where tags containing comma/semicolon
+  // (e.g. `{foo,bar}`) can crash when the log widget reparses cached lines.
+  // We proactively neutralize any such tag-like sequences so they don't match
+  // blessed's tag regex on subsequent reparses.
+  function neutralizeBlessedCommaTags(text) {
+    if (text == null) return "";
+    const raw = String(text);
+    if (!raw.includes("{")) return raw;
+    return raw.replace(/\{\/?[\w\-,;!#]*[;,][\w\-,;!#]*\}/g, (m) => {
+      // Insert a space after separators so `{foo,bar}` becomes `{foo, bar}`.
+      // This stops blessed from treating it as a tag on future reparses.
+      const inner = m.slice(1, -1).replace(/[,;]/g, (ch) => `${ch} `);
+      return `{${inner}}`;
+    });
+  }
+
+  function escapeBlessed(text) {
+    if (text == null) return "{escape}{/escape}";
+    const raw = neutralizeBlessedCommaTags(text);
+    // Avoid allowing payload to terminate escape mode.
+    const safe = raw.replace(/\{\/escape\}/g, "{open}/escape{close}");
+    return `{escape}${safe}{/escape}`;
+  }
+
+  function appendToLogBox(text) {
+    // Avoid a blessed render-time crash for `{foo,bar}`-like tag sequences.
+    logBox.log(neutralizeBlessedCommaTags(text));
   }
 
   function loadHistory(limit = 2000) {
@@ -282,7 +341,7 @@ async function runChat(projectRoot) {
         }
         if (!item.text) continue;
         if (hasSpacer) {
-          logBox.log(item.text);
+          appendToLogBox(item.text);
           lastLogWasSpacer = false;
           lastLogType = item.type || null;
           hasLoggedAny = true;
@@ -323,16 +382,69 @@ async function runChat(projectRoot) {
   const pendingStatusLines = [];
   const busStatusQueue = [];
   let primaryStatusText = bannerText;
+  let primaryStatusPending = false;
+  const shimmerStart = Date.now();
+  let statusAnimationTimer = null;
+  const STATUS_ANIM_FRAME_MS = 50;
+  const SHIMMER_PADDING = 10;
+  const SHIMMER_BAND_HALF_WIDTH = 5;
+  const SHIMMER_SWEEP_MS = 2000;
+  const SPINNER_PERIOD_MS = 600;
 
   function formatProcessingText(text) {
     if (!text) return text;
     if (text.includes("{")) return text;
     if (!/processing/i.test(text)) return text;
-    return `{yellow-fg}⏳{/yellow-fg} ${text}`;
+    return text;
   }
 
-  function renderStatusLine() {
+  function shimmerText(text, nowMs) {
+    if (!text) return "";
+    if (text.includes("{")) return text;
+    const chars = Array.from(text);
+    const period = chars.length + SHIMMER_PADDING * 2;
+    const pos =
+      Math.floor(((nowMs - shimmerStart) % SHIMMER_SWEEP_MS) / SHIMMER_SWEEP_MS * period);
+    let out = "";
+    for (let i = 0; i < chars.length; i += 1) {
+      const iPos = i + SHIMMER_PADDING;
+      const dist = Math.abs(iPos - pos);
+      let intensity = 0;
+      if (dist <= SHIMMER_BAND_HALF_WIDTH) {
+        const x = Math.PI * (dist / SHIMMER_BAND_HALF_WIDTH);
+        intensity = 0.5 * (1 + Math.cos(x));
+      }
+      const ch = chars[i];
+      if (intensity < 0.2) {
+        out += `{gray-fg}${ch}{/gray-fg}`;
+      } else if (intensity < 0.6) {
+        out += ch;
+      } else {
+        out += `{bold}{white-fg}${ch}{/white-fg}{/bold}`;
+      }
+    }
+    return out;
+  }
+
+  function spinnerFrame(nowMs) {
+    const on = Math.floor((nowMs - shimmerStart) / SPINNER_PERIOD_MS) % 2 === 0;
+    return on
+      ? "{white-fg}•{/white-fg}"
+      : "{gray-fg}◦{/gray-fg}";
+  }
+
+  function renderPendingStatus(text, nowMs) {
+    const spinner = spinnerFrame(nowMs);
+    const shimmer = shimmerText(text, nowMs);
+    if (!shimmer) return spinner;
+    return `${spinner} ${shimmer}`;
+  }
+
+  function renderStatusLine(nowMs = Date.now()) {
     let content = primaryStatusText || "";
+    if (primaryStatusPending) {
+      content = renderPendingStatus(primaryStatusText, nowMs);
+    }
     if (busStatusQueue.length > 0) {
       const extra = busStatusQueue.length > 1
         ? ` {gray-fg}(+${busStatusQueue.length - 1}){/gray-fg}`
@@ -345,16 +457,31 @@ async function runChat(projectRoot) {
     statusLine.setContent(content);
   }
 
-  function setPrimaryStatus(text) {
+  function updateStatusAnimation() {
+    if (primaryStatusPending && !statusAnimationTimer) {
+      statusAnimationTimer = setInterval(() => {
+        if (!primaryStatusPending) return;
+        renderStatusLine(Date.now());
+        screen.render();
+      }, STATUS_ANIM_FRAME_MS);
+    } else if (!primaryStatusPending && statusAnimationTimer) {
+      clearInterval(statusAnimationTimer);
+      statusAnimationTimer = null;
+    }
+  }
+
+  function setPrimaryStatus(text, options = {}) {
     primaryStatusText = text || "";
+    primaryStatusPending = Boolean(options.pending);
+    updateStatusAnimation();
     renderStatusLine();
   }
 
   function queueStatusLine(text) {
-    const formatted = formatProcessingText(text);
-    pendingStatusLines.push(formatted);
+    let raw = text || "";
+    pendingStatusLines.push(raw);
     if (pendingStatusLines.length === 1) {
-      setPrimaryStatus(formatted);
+      setPrimaryStatus(raw, { pending: true });
       screen.render();
     }
   }
@@ -364,17 +491,18 @@ async function runChat(projectRoot) {
       pendingStatusLines.shift();
     }
     if (pendingStatusLines.length > 0) {
-      setPrimaryStatus(pendingStatusLines[0]);
+      setPrimaryStatus(pendingStatusLines[0], { pending: true });
     } else {
-      setPrimaryStatus(text || "");
+      setPrimaryStatus(text || "", { pending: false });
     }
     screen.render();
   }
 
   function enqueueBusStatus(item) {
     if (!item || !item.text) return;
-    const key = item.key || item.text;
-    const formatted = formatProcessingText(item.text);
+    const rawText = item.text == null ? "" : String(item.text);
+    const key = item.key || rawText;
+    const formatted = escapeBlessed(formatProcessingText(rawText));
     const existing = busStatusQueue.find((entry) => entry.key === key);
     if (existing) {
       existing.text = formatted;
@@ -386,7 +514,8 @@ async function runChat(projectRoot) {
 
   function resolveBusStatus(item) {
     if (!item) return;
-    const key = item.key || item.text;
+    const rawText = item.text == null ? "" : String(item.text);
+    const key = item.key || rawText;
     let index = -1;
     if (key) {
       index = busStatusQueue.findIndex((entry) => entry.key === key);
@@ -407,6 +536,7 @@ async function runChat(projectRoot) {
     width: "100%",
     height: 0,
     hidden: true,
+    wrap: false,
     border: {
       type: "line",
       top: true,
@@ -438,6 +568,15 @@ async function runChat(projectRoot) {
     style: { fg: "gray" },
     tags: true,
   });
+
+  // Agent TTY view state
+  let currentView = "main";        // "main" | "agent"
+  let viewingAgent = null;          // subscriber ID of agent being viewed
+  let agentOutputClient = null;     // net.Socket connected to inject.sock
+  let agentOutputBuffer = "";       // partial line buffer for output parsing
+  let agentInputClient = null;      // net.Socket for sending raw input
+  let _detachedChildren = null;     // Screen children saved during agent view
+  let agentInputSuppressUntil = 0;  // Suppress input forwarding until this timestamp
 
   // Bottom border line for input area (above dashboard)
   const inputBottomLine = blessed.line({
@@ -486,6 +625,8 @@ async function runChat(projectRoot) {
   // Add cursor position tracking
   let cursorPos = 0;
   let preferredCol = null;
+  const unicode = blessed.unicode;
+  const wideRegex = new RegExp(unicode.chars.all.source);
 
   // Get inner width
   function getInnerWidth() {
@@ -506,13 +647,86 @@ async function runChat(projectRoot) {
     return 1;
   }
 
-  // Count lines considering both wrapping and newlines
+  function getWrapWidth() {
+    if (input._clines && typeof input._clines.width === "number") {
+      return Math.max(1, input._clines.width);
+    }
+    return getInnerWidth();
+  }
+
+  function isWideChar(ch) {
+    return wideRegex.test(ch);
+  }
+
+  function transformChar(ch) {
+    if (ch === "\n") return "\n";
+    if (ch === "\r") return "";
+    if (ch === "\t") return screen.tabc;
+
+    const code = ch.codePointAt(0);
+    if (
+      code <= 0x08
+      || code === 0x0b
+      || code === 0x0c
+      || (code >= 0x0e && code <= 0x1a)
+      || (code >= 0x1c && code <= 0x1f)
+      || code === 0x7f
+    ) {
+      return "";
+    }
+
+    if (ch === "\x1b") return "";
+
+    const isWide = isWideChar(ch);
+
+    if (screen.fullUnicode) {
+      if (screen.program && screen.program.isiTerm2 && unicode.isCombining(ch, 0)) {
+        return "";
+      }
+      if (isWide) return `${ch}\x03`;
+      return ch;
+    }
+
+    if (unicode.isCombining(ch, 0)) return "";
+    if (unicode.isSurrogate(ch, 0)) return "?";
+    if (isWide) return "??";
+    return ch;
+  }
+
+  function transformText(text) {
+    if (!text) return "";
+    const out = [];
+    for (const ch of text) {
+      out.push(transformChar(ch));
+    }
+    return out.join("");
+  }
+
+  function visualLength(text) {
+    return transformText(text).length;
+  }
+
+  function originalIndexForVisual(line, visualIndex) {
+    if (visualIndex <= 0) return 0;
+    let visual = 0;
+    let offset = 0;
+    for (const ch of line) {
+      const rep = transformChar(ch);
+      const repLen = rep.length;
+      if (visual + repLen > visualIndex) return offset;
+      visual += repLen;
+      offset += ch.length;
+    }
+    return line.length;
+  }
+
+  // Count lines considering both wrapping and newlines (matches blessed wrap)
   function countLines(text, width) {
     if (width <= 0) return 1;
-    const lines = text.split("\n");
+    const lines = (text || "").split("\n");
     let total = 0;
     for (const line of lines) {
-      const lineWidth = input.strWidth(line);
+      const lineWidth = visualLength(line);
       total += Math.max(1, Math.ceil(lineWidth / width));
     }
     return total;
@@ -520,50 +734,66 @@ async function runChat(projectRoot) {
 
   function getCursorRowCol(text, pos, width) {
     if (width <= 0) return { row: 0, col: 0 };
-    const before = text.slice(0, pos);
-    const lines = before.split("\n");
+    const before = (text || "").slice(0, pos);
+    const transformed = transformText(before);
+    const lines = transformed.split("\n");
     let row = 0;
     for (let i = 0; i < lines.length - 1; i++) {
-      const lineWidth = input.strWidth(lines[i]);
+      const lineWidth = lines[i].length;
       row += Math.max(1, Math.ceil(lineWidth / width));
     }
     const lastLine = lines[lines.length - 1] || "";
-    const lastWidth = input.strWidth(lastLine);
+    const lastWidth = lastLine.length;
     row += Math.floor(lastWidth / width);
     const col = lastWidth % width;
     return { row, col };
   }
 
-  function getLinePosForCol(line, targetCol) {
-    if (targetCol <= 0) return 0;
-    let col = 0;
-    let offset = 0;
-    for (const ch of Array.from(line)) {
-      const w = input.strWidth(ch);
-      if (col + w > targetCol) return offset;
-      col += w;
-      offset += ch.length;
-    }
-    return offset;
-  }
-
   function getCursorPosForRowCol(text, targetRow, targetCol, width) {
     if (width <= 0) return 0;
-    const lines = text.split("\n");
+    const lines = (text || "").split("\n");
     let row = 0;
     let pos = 0;
     for (const line of lines) {
-      const lineWidth = input.strWidth(line);
+      const lineWidth = visualLength(line);
       const wrappedRows = Math.max(1, Math.ceil(lineWidth / width));
       if (targetRow < row + wrappedRows) {
         const rowInLine = targetRow - row;
         const visualCol = rowInLine * width + Math.max(0, targetCol);
-        return pos + getLinePosForCol(line, visualCol);
+        return pos + originalIndexForVisual(line, Math.min(visualCol, lineWidth));
       }
       pos += line.length + 1;
       row += wrappedRows;
     }
     return text.length;
+  }
+
+  function ensureInputCursorVisible() {
+    const innerWidth = getWrapWidth();
+    if (innerWidth <= 0) return;
+    const totalRows = countLines(input.value, innerWidth);
+    const visibleRows = Math.max(1, input.height || 1);
+    const { row } = getCursorRowCol(input.value, cursorPos, innerWidth);
+    let base = input.childBase || 0;
+    const maxBase = Math.max(0, totalRows - visibleRows);
+    const bottomMargin = visibleRows > 1 ? 1 : 0;
+    const upperLimit = base;
+    const lowerLimit = base + visibleRows - bottomMargin - 1;
+
+    if (row < upperLimit) {
+      base = row;
+    } else if (row > lowerLimit) {
+      base = row - (visibleRows - bottomMargin - 1);
+    }
+
+    if (base > maxBase) base = maxBase;
+    if (base < 0) base = 0;
+    if (base !== input.childBase) {
+      input.childBase = base;
+      if (typeof input.scrollTo === "function") {
+        input.scrollTo(base);
+      }
+    }
   }
 
   function resetPreferredCol() {
@@ -615,6 +845,7 @@ async function runChat(projectRoot) {
     normalizeCommandPrefix();
     resetPreferredCol();
     resizeInput();
+    ensureInputCursorVisible();
     input._updateCursor();
     screen.render();
     updateDraftFromInput();
@@ -625,6 +856,7 @@ async function runChat(projectRoot) {
     cursorPos = input.value.length;
     resetPreferredCol();
     resizeInput();
+    ensureInputCursorVisible();
     input._updateCursor();
     screen.render();
   }
@@ -659,8 +891,15 @@ async function runChat(projectRoot) {
 
   function exitHandler() {
     exitRequested = true;
+    // Clean up agent view connections
+    disconnectAgentOutput();
+    disconnectAgentInput();
     if (screen && screen.program && typeof screen.program.decrst === "function") {
       screen.program.decrst(2004);
+    }
+    if (statusAnimationTimer) {
+      clearInterval(statusAnimationTimer);
+      statusAnimationTimer = null;
     }
     if (client) {
       client.end();
@@ -699,9 +938,12 @@ async function runChat(projectRoot) {
     const parts = filterText.split(/\s+/);
     let commands = [];
 
-    if ((parts.length > 1 || (endsWithSpace && parts.length === 1)) && parts[0].startsWith("/")) {
+    const mainCmd = parts[0];
+    const isLaunch = mainCmd && mainCmd.toLowerCase() === "/launch";
+    const wantsSubcommands = (parts.length > 1 || (endsWithSpace && parts.length === 1));
+
+    if ((wantsSubcommands || isLaunch) && mainCmd && mainCmd.startsWith("/")) {
       // Subcommand mode: "/bus rename"
-      const mainCmd = parts[0];
       const subFilter = parts[1] || "";
 
       // Find the main command
@@ -709,31 +951,41 @@ async function runChat(projectRoot) {
         item.cmd.toLowerCase() === mainCmd.toLowerCase()
       );
 
-      if (mainCmdObj && mainCmdObj.subcommands) {
-        // Filter subcommands
-        commands = mainCmdObj.subcommands
-          .filter(sub => sub.cmd.toLowerCase().startsWith(subFilter.toLowerCase()))
-          .map(sub => ({ ...sub, isSubcommand: true, parentCmd: mainCmd }));
+      const fallbackLaunchSubs = [
+        { cmd: "claude", desc: "Launch Claude agent" },
+        { cmd: "codex", desc: "Launch Codex agent" },
+      ];
+
+      if ((mainCmdObj && mainCmdObj.subcommands) || isLaunch) {
+        const baseSubs = mainCmdObj && mainCmdObj.subcommands ? mainCmdObj.subcommands : [];
+        let subs = baseSubs;
+        if (isLaunch) {
+          const merged = new Map();
+          for (const sub of [...baseSubs, ...fallbackLaunchSubs]) {
+            if (!sub || !sub.cmd) continue;
+            merged.set(sub.cmd, sub);
+          }
+          subs = Array.from(merged.values());
+        }
+        if (isLaunch) {
+          // Always show both launch targets for clarity
+          commands = subs
+            .map(sub => ({ ...sub, isSubcommand: true, parentCmd: mainCmd }))
+            .sort((a, b) => a.cmd.localeCompare(b.cmd));
+        } else {
+          // Filter subcommands
+          commands = subs
+            .filter(sub => sub.cmd.toLowerCase().startsWith(subFilter.toLowerCase()))
+            .map(sub => ({ ...sub, isSubcommand: true, parentCmd: mainCmd }))
+            .sort((a, b) => a.cmd.localeCompare(b.cmd));
+        }
       }
     } else {
       // Main command mode: "/bus"
-      const prefixMatches = COMMAND_REGISTRY.filter(item =>
-        item.cmd.toLowerCase().startsWith(filterText.toLowerCase())
-      );
-      // Also allow fuzzy matches on the command body (e.g. "/b" -> /bus + /ubus)
-      let fuzzyMatches = [];
-      if (filterText.startsWith("/") && parts.length === 1) {
-        const needle = filterText.slice(1).toLowerCase();
-        if (needle) {
-          fuzzyMatches = COMMAND_REGISTRY.filter(item =>
-            item.cmd.toLowerCase().includes(needle)
-          );
-        }
-      }
-      const merged = new Map();
-      for (const item of prefixMatches) merged.set(item.cmd, item);
-      for (const item of fuzzyMatches) merged.set(item.cmd, item);
-      commands = Array.from(merged.values());
+      const filterLower = filterText.toLowerCase();
+      commands = COMMAND_REGISTRY
+        .filter(item => item.cmd.toLowerCase().startsWith(filterLower))
+        .sort((a, b) => a.cmd.localeCompare(b.cmd, "en", { sensitivity: "base" }));
     }
 
     if (commands.length === 0) {
@@ -746,9 +998,12 @@ async function runChat(projectRoot) {
     completionIndex = 0;
     completionScrollOffset = 0;
 
-    // Calculate panel height (max 8 visible + 1 for top border)
-    const visibleItems = Math.min(8, completionCommands.length);
-    completionPanel.height = visibleItems + 1;
+    // Calculate panel height (visible items + 2 for blessed border overhead)
+    // blessed reserves 2 rows for border (iheight) even when only border.top is set
+    const availableHeight = screen.height - currentInputHeight - 1;
+    completionVisibleCount = Math.min(7, completionCommands.length);
+    completionVisibleCount = Math.min(completionVisibleCount, Math.max(1, availableHeight - 2));
+    completionPanel.height = completionVisibleCount + 2;
     completionPanel.bottom = currentInputHeight - 1;
     completionPanel.hidden = false;
 
@@ -760,6 +1015,7 @@ async function runChat(projectRoot) {
     completionCommands = [];
     completionIndex = 0;
     completionScrollOffset = 0;
+    completionVisibleCount = 0;
     completionPanel.hidden = true;
     screen.render();
   }
@@ -767,7 +1023,11 @@ async function runChat(projectRoot) {
   function renderCompletionPanel() {
     if (!completionActive || completionCommands.length === 0) return;
 
-    const maxVisible = 8;
+    // blessed reserves 2 rows for border (iheight=2) even with only border.top
+    const panelVisible = Math.max(1, (completionPanel.height || 2) - 2);
+    const maxVisible = completionVisibleCount
+      ? Math.max(1, Math.min(completionVisibleCount, panelVisible))
+      : panelVisible;
 
     // Adjust scroll offset to keep selected item visible
     if (completionIndex < completionScrollOffset) {
@@ -781,19 +1041,35 @@ async function runChat(projectRoot) {
     const visibleEnd = Math.min(completionScrollOffset + maxVisible, completionCommands.length);
     const visibleCommands = completionCommands.slice(visibleStart, visibleEnd);
 
+    const panelWidth = typeof completionPanel.width === "number"
+      ? completionPanel.width
+      : screen.width;
     const lines = visibleCommands.map((item, i) => {
       const actualIndex = visibleStart + i;
+      const cmdText = item.cmd;
+      const descText = item.desc || "";
       const cmdPart = actualIndex === completionIndex
-        ? `{inverse}${item.cmd}{/inverse}`
-        : `{cyan-fg}${item.cmd}{/cyan-fg}`;
-      const descPart = `{gray-fg}${item.desc}{/gray-fg}`;
-      // Use promptBox width (2) to align with input position
+        ? `{inverse}${cmdText}{/inverse}`
+        : `{cyan-fg}${cmdText}{/cyan-fg}`;
       const indent = " ".repeat(promptBox.width || 2);
-      return `${indent}${cmdPart}  ${descPart}`;
+      const maxDescWidth = Math.max(0, panelWidth - indent.length - cmdText.length - 2);
+      const trimmedDesc = truncateText(descText, maxDescWidth);
+      const descPart = trimmedDesc ? `{gray-fg}${trimmedDesc}{/gray-fg}` : "";
+      // Use promptBox width (2) to align with input position
+      return descPart
+        ? `${indent}${cmdPart}  ${descPart}`
+        : `${indent}${cmdPart}`;
     });
 
     completionPanel.setContent(lines.join("\n"));
     screen.render();
+  }
+
+  function completionPageSize() {
+    const panelVisible = Math.max(1, (completionPanel.height || 2) - 2);
+    return completionVisibleCount
+      ? Math.max(1, Math.min(completionVisibleCount, panelVisible))
+      : panelVisible;
   }
 
   function completionUp() {
@@ -810,6 +1086,55 @@ async function runChat(projectRoot) {
       ? 0
       : completionIndex + 1;
     renderCompletionPanel();
+  }
+
+  function completionPageUp() {
+    if (completionCommands.length === 0) return;
+    const step = completionPageSize();
+    completionIndex = Math.max(0, completionIndex - step);
+    renderCompletionPanel();
+  }
+
+  function completionPageDown() {
+    if (completionCommands.length === 0) return;
+    const step = completionPageSize();
+    completionIndex = Math.min(completionCommands.length - 1, completionIndex + step);
+    renderCompletionPanel();
+  }
+
+  function completionPreview(selected) {
+    const current = input.value || "";
+    const trimmed = current.trim();
+    const endsWithSpace = /\s$/.test(current);
+    if (selected.isSubcommand) {
+      const parts = trimmed.split(/\s+/);
+      const base = parts[0] || "";
+      const completedCore = base ? `${base} ${selected.cmd}` : selected.cmd;
+      const isComplete = trimmed === completedCore || trimmed.startsWith(`${completedCore} `);
+      return { text: `${completedCore} `, isComplete };
+    }
+    const completedCore = selected.cmd;
+    const hasChildren = selected.subcommands && selected.subcommands.length > 0;
+    const isComplete =
+      (trimmed === completedCore && (!hasChildren || endsWithSpace)) ||
+      trimmed.startsWith(`${completedCore} `);
+    return { text: `${completedCore} `, isComplete };
+  }
+
+  function applyCompletionPreview(preview) {
+    input.value = preview.text;
+    cursorPos = input.value.length;
+    resetPreferredCol();
+    input._updateCursor();
+    updateDraftFromInput();
+    screen.render();
+  }
+
+  function truncateText(text, maxWidth) {
+    if (maxWidth <= 0) return "";
+    if (text.length <= maxWidth) return text;
+    if (maxWidth <= 3) return text.slice(0, maxWidth);
+    return `${text.slice(0, maxWidth - 3)}...`;
   }
 
   function confirmCompletion() {
@@ -859,9 +1184,43 @@ async function runChat(projectRoot) {
       confirmCompletion();
       return true;
     }
+    if (key.name === "pageup") {
+      completionPageUp();
+      return true;
+    }
+    if (key.name === "pagedown") {
+      completionPageDown();
+      return true;
+    }
     if (key.name === "enter" || key.name === "return") {
-      // Enter submits input, doesn't confirm completion
+      if (completionEnterSuppressed) {
+        return true;
+      }
+      const selected = completionCommands[completionIndex];
+      if (selected) {
+        const preview = completionPreview(selected);
+        if (!preview.isComplete) {
+          applyCompletionPreview(preview);
+          if (!selected.isSubcommand && selected.subcommands && selected.subcommands.length > 0) {
+            showCompletion(input.value);
+          } else {
+            hideCompletion();
+          }
+          completionEnterSuppressed = true;
+          if (completionEnterReset) clearImmediate(completionEnterReset);
+          completionEnterReset = setImmediate(() => {
+            completionEnterSuppressed = false;
+          });
+          return true;
+        }
+      }
+      // Already complete; allow normal submit
       hideCompletion();
+      completionEnterSuppressed = true;
+      if (completionEnterReset) clearImmediate(completionEnterReset);
+      completionEnterReset = setImmediate(() => {
+        completionEnterSuppressed = false;
+      });
       return false;
     }
     if (key.name === "escape") {
@@ -885,7 +1244,7 @@ async function runChat(projectRoot) {
 
   // Resize input box based on content
   function resizeInput() {
-    const innerWidth = getInnerWidth();
+    const innerWidth = getWrapWidth();
     if (innerWidth <= 0) return;
 
     const numLines = countLines(input.value, innerWidth);
@@ -902,13 +1261,21 @@ async function runChat(projectRoot) {
     // Reposition completion panel if active
     if (completionActive) {
       completionPanel.bottom = currentInputHeight - 1;
+      // Re-clamp visible count for new available space
+      const availableHeight = screen.height - currentInputHeight - 1;
+      const maxVisible = Math.min(7, completionCommands.length);
+      completionVisibleCount = Math.min(maxVisible, Math.max(1, availableHeight - 2));
+      completionPanel.height = completionVisibleCount + 2;
+      renderCompletionPanel();
     }
     // dashboard and inputBottomLine stay fixed at bottom 0 and 1
     logBox.height = Math.max(1, screen.height - currentInputHeight - 1);
+    ensureInputCursorVisible();
   }
 
   // Override the internal listener to support cursor movement
   input._listener = function(ch, key) {
+    if (currentView === "agent") return; // Agent view handles keys at screen level
     if (key && key.ctrl && key.name === "c") {
       exitHandler();
       return;
@@ -917,19 +1284,26 @@ async function runChat(projectRoot) {
       return;
     }
     normalizeCommandPrefix();
-    if (key && (key.name === "pageup" || key.name === "pagedown")) {
-      const delta = Math.max(1, Math.floor(logBox.height / 2));
-      scrollLog(key.name === "pageup" ? -delta : delta);
-      return;
-    }
     if (focusMode === "dashboard") {
       if (handleDashboardKey(key)) return;
-      return;
+      // On agents view, printable char auto-exits dashboard keeping @target
+      if (dashboardView === "agents" && ch && ch.length === 1 && !key.ctrl && !key.meta
+          && !/^[\x00-\x1f\x7f]$/.test(ch)) {
+        exitDashboardMode(true);
+        // Fall through to normal input handling so the char is inserted
+      } else {
+        return;
+      }
     }
 
     // Command completion mode
     if (completionActive) {
       if (handleCompletionKey(ch, key)) return;
+    }
+    if (key && (key.name === "pageup" || key.name === "pagedown")) {
+      const delta = Math.max(1, Math.floor(logBox.height / 2));
+      scrollLog(key.name === "pageup" ? -delta : delta);
+      return;
     }
 
     // Treat multi-char input (paste) as insertion, including newlines.
@@ -957,6 +1331,7 @@ async function runChat(projectRoot) {
     if (key.name === "left") {
       if (cursorPos > 0) cursorPos--;
       resetPreferredCol();
+      ensureInputCursorVisible();
       this._updateCursor();
       this.screen.render();
       return;
@@ -965,6 +1340,7 @@ async function runChat(projectRoot) {
     if (key.name === "right") {
       if (cursorPos < this.value.length) cursorPos++;
       resetPreferredCol();
+      ensureInputCursorVisible();
       this._updateCursor();
       this.screen.render();
       return;
@@ -973,6 +1349,7 @@ async function runChat(projectRoot) {
     if (key.name === "home") {
       cursorPos = 0;
       resetPreferredCol();
+      ensureInputCursorVisible();
       this._updateCursor();
       this.screen.render();
       return;
@@ -981,6 +1358,7 @@ async function runChat(projectRoot) {
     if (key.name === "end") {
       cursorPos = this.value.length;
       resetPreferredCol();
+      ensureInputCursorVisible();
       this._updateCursor();
       this.screen.render();
       return;
@@ -1005,7 +1383,7 @@ async function runChat(projectRoot) {
       }
     }
     if (key.name === "up" || key.name === "down") {
-      const innerWidth = getInnerWidth();
+      const innerWidth = getWrapWidth();
       if (innerWidth > 0) {
         const { row, col } = getCursorRowCol(this.value, cursorPos, innerWidth);
         if (preferredCol === null) preferredCol = col;
@@ -1022,6 +1400,7 @@ async function runChat(projectRoot) {
           : Math.min(totalRows - 1, row + 1);
         cursorPos = getCursorPosForRowCol(this.value, targetRow, preferredCol, innerWidth);
       }
+      ensureInputCursorVisible();
       this._updateCursor();
       this.screen.render();
       return;
@@ -1038,6 +1417,7 @@ async function runChat(projectRoot) {
         cursorPos--;
         resetPreferredCol();
         resizeInput();
+        ensureInputCursorVisible();
         this._updateCursor();
         updateDraftFromInput();
 
@@ -1058,6 +1438,7 @@ async function runChat(projectRoot) {
         this.value = this.value.slice(0, cursorPos) + this.value.slice(cursorPos + 1);
         resetPreferredCol();
         resizeInput();
+        ensureInputCursorVisible();
         this._updateCursor();
         this.screen.render();
         updateDraftFromInput();
@@ -1094,27 +1475,16 @@ async function runChat(projectRoot) {
   input._updateCursor = function() {
     if (this.screen.focused !== this) return;
 
-    const lpos = this._getCoords();
+    let lpos;
+    try { lpos = this._getCoords(); } catch { return; }
     if (!lpos) return;
 
-    const innerWidth = getInnerWidth();
+    const innerWidth = getWrapWidth();
     if (innerWidth <= 0) return;
 
+    ensureInputCursorVisible();
     const { row, col } = getCursorRowCol(this.value, cursorPos, innerWidth);
-    const innerHeight = this.height || 1;
-
-    let scrollOffset = this.childBase || 0;
-    if (row < scrollOffset) {
-      scrollOffset = row;
-    } else if (row >= scrollOffset + innerHeight) {
-      scrollOffset = row - innerHeight + 1;
-    }
-    if (scrollOffset !== this.childBase) {
-      this.childBase = scrollOffset;
-      if (typeof this.scrollTo === "function") {
-        this.scrollTo(scrollOffset);
-      }
-    }
+    const scrollOffset = this.childBase || 0;
 
     const displayRow = row - scrollOffset;
     const safeCol = Math.min(Math.max(0, col), innerWidth - 1);
@@ -1150,58 +1520,77 @@ async function runChat(projectRoot) {
   let completionCommands = [];
   let completionIndex = 0;
   let completionScrollOffset = 0;
+  let completionVisibleCount = 0;
+  let completionEnterSuppressed = false;
+  let completionEnterReset = null;
 
-  const COMMAND_REGISTRY = [
-    { cmd: "/doctor", desc: "Health check diagnostics" },
-    { cmd: "/status", desc: "Status display" },
-    {
-      cmd: "/daemon",
-      desc: "Daemon management",
-      subcommands: [
-        { cmd: "start", desc: "Start daemon" },
-        { cmd: "stop", desc: "Stop daemon" },
-        { cmd: "restart", desc: "Restart daemon" },
-        { cmd: "status", desc: "Daemon status" },
-      ]
-    },
-    { cmd: "/init", desc: "Initialize modules" },
-    {
-      cmd: "/bus",
+  const COMMAND_TREE = {
+    "/bus": {
       desc: "Event bus operations",
-      subcommands: [
-        { cmd: "send", desc: "Send message to agent" },
-        { cmd: "rename", desc: "Rename agent nickname" },
-        { cmd: "list", desc: "List all agents" },
-        { cmd: "status", desc: "Bus status" },
-        { cmd: "activate", desc: "Activate agent terminal" },
-      ]
+      children: {
+        activate: { desc: "Activate agent terminal" },
+        list: { desc: "List all agents" },
+        rename: { desc: "Rename agent nickname" },
+        send: { desc: "Send message to agent" },
+        status: { desc: "Bus status" },
+      },
     },
-    {
-      cmd: "/ctx",
+    "/ctx": {
       desc: "Context management",
-      subcommands: [
-        { cmd: "status", desc: "Show context status (default)" },
-        { cmd: "doctor", desc: "Check context integrity" },
-        { cmd: "decisions", desc: "List all decisions" },
-      ]
+      children: {
+        decisions: { desc: "List all decisions" },
+        doctor: { desc: "Check context integrity" },
+        status: { desc: "Show context status (default)" },
+      },
     },
-    {
-      cmd: "/skills",
-      desc: "Skills management",
-      subcommands: [
-        { cmd: "list", desc: "List available skills" },
-        { cmd: "install", desc: "Install skills (use: all or name)" },
-      ]
+    "/daemon": {
+      desc: "Daemon management",
+      children: {
+        restart: { desc: "Restart daemon" },
+        start: { desc: "Start daemon" },
+        status: { desc: "Daemon status" },
+        stop: { desc: "Stop daemon" },
+      },
     },
-    {
-      cmd: "/launch",
+    "/doctor": { desc: "Health check diagnostics" },
+    "/init": { desc: "Initialize modules" },
+    "/launch": {
       desc: "Launch new agent",
-      subcommands: [
-        { cmd: "claude", desc: "Launch Claude agent" },
-        { cmd: "codex", desc: "Launch Codex agent" },
-      ]
+      children: {
+        claude: { desc: "Launch Claude agent" },
+        codex: { desc: "Launch Codex agent" },
+      },
     },
-  ];
+    "/resume": { desc: "Resume agents (optional nickname)" },
+    "/skills": {
+      desc: "Skills management",
+      children: {
+        install: { desc: "Install skills (use: all or name)" },
+        list: { desc: "List available skills" },
+      },
+    },
+    "/status": { desc: "Status display" },
+  };
+
+  function buildCommandRegistry(tree) {
+    return Object.keys(tree)
+      .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }))
+      .map((cmd) => {
+        const node = tree[cmd] || {};
+        const entry = { cmd, desc: node.desc || "" };
+        if (node.children) {
+          entry.subcommands = Object.keys(node.children)
+            .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }))
+            .map((sub) => ({
+              cmd: sub,
+              desc: (node.children[sub] && node.children[sub].desc) || "",
+            }));
+        }
+        return entry;
+      });
+  }
+
+  const COMMAND_REGISTRY = buildCommandRegistry(COMMAND_TREE);
 
   // Agent selection state
   let activeAgents = [];
@@ -1212,13 +1601,20 @@ async function runChat(projectRoot) {
   let selectedAgentIndex = -1;  // -1 = not in dashboard selection mode
   let targetAgent = null;       // Selected agent for direct messaging
   let focusMode = "input";      // "input" or "dashboard"
-  let dashboardView = "agents"; // "agents" or "mode"
-  let selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
+  let dashboardView = "agents"; // "agents" | "mode" | "provider" | "resume"
+  const launchModes = ["auto", "terminal", "tmux", "internal"];
+  function modeToIndex(m) { const i = launchModes.indexOf(m); return i >= 0 ? i : 0; }
+  let selectedModeIndex = modeToIndex(launchMode);
   const providerOptions = [
     { label: "codex", value: "codex-cli" },
     { label: "claude", value: "claude-cli" },
   ];
   let selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
+  const resumeOptions = [
+    { label: "Auto", value: true },
+    { label: "Off", value: false },
+  ];
+  let selectedResumeIndex = autoResume ? 0 : 1;
   let restartInProgress = false;
 
   function getAgentLabel(agentId) {
@@ -1287,8 +1683,13 @@ async function runChat(projectRoot) {
   function setLaunchMode(mode) {
     const next = normalizeLaunchMode(mode);
     if (next === launchMode) return;
+    // Check tmux availability before switching
+    if (next === "tmux" && !process.env.TMUX) {
+      logMessage("error", "{red-fg}✗{/red-fg} tmux mode requires running inside a tmux session");
+      return;
+    }
     launchMode = next;
-    selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
+    selectedModeIndex = modeToIndex(launchMode);
     saveConfig(projectRoot, { launchMode });
     logMessage("status", `{magenta-fg}⚙{/magenta-fg} Launch mode: ${launchMode}`);
     renderDashboard();
@@ -1296,12 +1697,13 @@ async function runChat(projectRoot) {
     void restartDaemon();
   }
 
+
   function providerLabel(value) {
     return value === "claude-cli" ? "claude" : "codex";
   }
 
   function clearUfooAgentIdentity() {
-    const agentDir = path.join(projectRoot, ".ufoo", "agent");
+    const agentDir = getUfooPaths(projectRoot).agentDir;
     const stateFile = path.join(agentDir, "ufoo-agent.json");
     const historyFile = path.join(agentDir, "ufoo-agent.history.jsonl");
     try {
@@ -1329,6 +1731,18 @@ async function runChat(projectRoot) {
     void restartDaemon();
   }
 
+  function setAutoResume(value) {
+    const next = value !== false;
+    if (next === autoResume) return;
+    autoResume = next;
+    selectedResumeIndex = autoResume ? 0 : 1;
+    saveConfig(projectRoot, { autoResume });
+    const label = autoResume ? "Auto" : "Off";
+    logMessage("status", `{magenta-fg}⚙{/magenta-fg} Resume: ${label}`);
+    renderDashboard();
+    screen.render();
+  }
+
   async function restartDaemon() {
     if (restartInProgress) return;
     restartInProgress = true;
@@ -1343,7 +1757,7 @@ async function runChat(projectRoot) {
         }
       }
       stopDaemon(projectRoot);
-      startDaemon(projectRoot);
+      startDaemon(projectRoot, { forceResume: true });
       const newClient = await connectClient();
       if (newClient) {
         attachClient(newClient);
@@ -1368,10 +1782,12 @@ async function runChat(projectRoot) {
     let content = " ";
     if (focusMode === "dashboard") {
       if (dashboardView === "mode") {
-        const modes = ["terminal", "tmux", "internal"];
-        const modeParts = modes.map((mode, i) => {
+        const modeParts = launchModes.map((mode, i) => {
           if (i === selectedModeIndex) {
             return `{inverse}${mode}{/inverse}`;
+          }
+          if (mode === launchMode) {
+            return `{bold}{cyan-fg}${mode}{/cyan-fg}{/bold}`;
           }
           return `{cyan-fg}${mode}{/cyan-fg}`;
         });
@@ -1382,9 +1798,24 @@ async function runChat(projectRoot) {
           if (i === selectedProviderIndex) {
             return `{inverse}${opt.label}{/inverse}`;
           }
+          if (opt.value === agentProvider) {
+            return `{bold}{cyan-fg}${opt.label}{/cyan-fg}{/bold}`;
+          }
           return `{cyan-fg}${opt.label}{/cyan-fg}`;
         });
         content += `{gray-fg}Agent:{/gray-fg} ${providerParts.join("  ")}`;
+        content += "  {gray-fg}│ ←/→ select, Enter confirm, ↓ resume, ↑ back{/gray-fg}";
+      } else if (dashboardView === "resume") {
+        const resumeParts = resumeOptions.map((opt, i) => {
+          if (i === selectedResumeIndex) {
+            return `{inverse}${opt.label}{/inverse}`;
+          }
+          if (opt.value === autoResume) {
+            return `{bold}{cyan-fg}${opt.label}{/cyan-fg}{/bold}`;
+          }
+          return `{cyan-fg}${opt.label}{/cyan-fg}`;
+        });
+        content += `{gray-fg}Resume:{/gray-fg} ${resumeParts.join("  ")}`;
         content += "  {gray-fg}│ ←/→ select, Enter confirm, ↑ back{/gray-fg}";
       } else {
         if (activeAgents.length > 0) {
@@ -1405,7 +1836,7 @@ async function runChat(projectRoot) {
           const rightMore = end < activeAgents.length ? " {gray-fg}»{/gray-fg}" : "";
           content += `{gray-fg}Agents:{/gray-fg} ${agentParts.join("  ")}`;
           content = `${content.replace("{gray-fg}Agents:{/gray-fg} ", `{gray-fg}Agents:{/gray-fg} ${leftMore}`)}${rightMore}`;
-          content += "  {gray-fg}│ ←/→ select, Enter confirm, ↓ mode, ↑ back{/gray-fg}";
+          content += "  {gray-fg}│ ←/→ select, Enter confirm, ^X close, ↓ mode, ↑ back{/gray-fg}";
         } else {
           content += "{gray-fg}Agents:{/gray-fg} {cyan-fg}none{/cyan-fg}";
           content += "  {gray-fg}│ ↓ mode, ↑ back{/gray-fg}";
@@ -1422,6 +1853,7 @@ async function runChat(projectRoot) {
       content += `{gray-fg}Agents:{/gray-fg} {cyan-fg}${agents}{/cyan-fg}`;
       content += `  {gray-fg}Mode:{/gray-fg} {cyan-fg}${launchMode}{/cyan-fg}`;
       content += `  {gray-fg}Agent:{/gray-fg} {cyan-fg}${providerLabel(agentProvider)}{/cyan-fg}`;
+      content += `  {gray-fg}Resume:{/gray-fg} {cyan-fg}${autoResume ? "auto" : "off"}{/cyan-fg}`;
     }
     dashboard.setContent(content);
   }
@@ -1434,10 +1866,10 @@ async function runChat(projectRoot) {
     let fallbackMap = null;
     if (metaList.length === 0 && activeAgents.length > 0) {
       try {
-        const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+        const busPath = getUfooPaths(projectRoot).agentsFile;
         const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
         fallbackMap = new Map();
-        for (const [id, meta] of Object.entries(bus.subscribers || {})) {
+        for (const [id, meta] of Object.entries(bus.agents || {})) {
           if (meta && meta.nickname) fallbackMap.set(id, meta.nickname);
         }
       } catch {
@@ -1455,6 +1887,26 @@ async function runChat(projectRoot) {
       }
     }
     clampAgentWindow();
+
+    // Check if viewed agent went offline
+    if (currentView === "agent" && viewingAgent && !activeAgents.includes(viewingAgent)) {
+      writeToAgentTerm("\r\n\x1b[1;31m[Agent went offline]\x1b[0m\r\n");
+      exitAgentView();
+      return;
+    }
+
+    // In agent view, only update the dashboard bar (via ANSI, blessed is frozen)
+    if (currentView === "agent") {
+      if (focusMode === "dashboard") {
+        const totalItems = 1 + activeAgents.length;
+        if (selectedAgentIndex < 0 || selectedAgentIndex >= totalItems) {
+          selectedAgentIndex = 0;
+        }
+      }
+      renderAgentDashboard();
+      return;
+    }
+
     if (focusMode === "dashboard") {
       if (dashboardView === "agents") {
         if (activeAgents.length === 0) {
@@ -1475,8 +1927,14 @@ async function runChat(projectRoot) {
     selectedAgentIndex = activeAgents.length > 0 ? 0 : -1;
     agentListWindowStart = 0;
     clampAgentWindow();
-    selectedModeIndex = launchMode === "internal" ? 1 : 0;
+    selectedModeIndex = modeToIndex(launchMode);
     selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
+    selectedResumeIndex = autoResume ? 0 : 1;
+    // Immediately set @target when first agent is selected
+    if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+      targetAgent = activeAgents[selectedAgentIndex];
+      updatePromptBox();
+    }
     screen.grabKeys = true;
     renderDashboard();
     screen.program.hideCursor();
@@ -1485,15 +1943,88 @@ async function runChat(projectRoot) {
 
   function handleDashboardKey(key) {
     if (!key || focusMode !== "dashboard") return false;
-    if (dashboardView === "mode") {
+
+    // Agent TTY view dashboard navigation
+    // Items: [ufoo(0), agent1(1), agent2(2), ...]
+    if (currentView === "agent") {
+      const totalItems = 1 + activeAgents.length; // ufoo + agents
       if (key.name === "left") {
-        selectedModeIndex = selectedModeIndex <= 0 ? 2 : selectedModeIndex - 1;
+        if (selectedAgentIndex > 0) {
+          selectedAgentIndex--;
+        }
+        renderAgentDashboard();
+        return true;
+      }
+      if (key.name === "right") {
+        if (selectedAgentIndex < totalItems - 1) {
+          selectedAgentIndex++;
+        }
+        renderAgentDashboard();
+        return true;
+      }
+      if (key.name === "enter" || key.name === "return") {
+        if (selectedAgentIndex === 0) {
+          // "ufoo" selected -> exit agent view back to main chat
+          exitAgentView();
+        } else {
+          // Another agent selected -> switch based on launch mode
+          const agentId = activeAgents[selectedAgentIndex - 1];
+          if (agentId && agentId !== viewingAgent) {
+            const meta = activeAgentMetaMap.get(agentId);
+            const agentLaunchMode = meta?.launch_mode || "";
+
+            if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+              // Exit PTY view, then activate agent's terminal/pane
+              exitAgentView();
+              try {
+                const activator = new AgentActivator(projectRoot);
+                activator.activate(agentId).catch(() => {});
+              } catch { /* ignore */ }
+            } else {
+              // Internal mode: switch PTY view
+              focusMode = "input";
+              enterAgentView(agentId);
+            }
+          } else {
+            // Same agent, just exit dashboard
+            focusMode = "input";
+            renderAgentDashboard();
+          }
+        }
+        return true;
+      }
+      if (key.name === "up") {
+        // Up exits dashboard back to agent PTY view
+        focusMode = "input";
+        renderAgentDashboard();
+        return true;
+      }
+      if (key.name === "x" && key.ctrl) {
+        // Ctrl+x: close selected agent (not ufoo)
+        if (selectedAgentIndex > 0 && selectedAgentIndex <= activeAgents.length) {
+          const agentId = activeAgents[selectedAgentIndex - 1];
+          const label = getAgentLabel(agentId);
+          // If closing the currently viewed agent, exit view first
+          if (agentId === viewingAgent) {
+            exitAgentView();
+          }
+          closeAgentViaDaemon(agentId, label);
+        }
+        return true;
+      }
+      return true;
+    }
+
+    if (dashboardView === "mode") {
+      const maxMode = launchModes.length - 1;
+      if (key.name === "left") {
+        selectedModeIndex = selectedModeIndex <= 0 ? maxMode : selectedModeIndex - 1;
         renderDashboard();
         screen.render();
         return true;
       }
       if (key.name === "right") {
-        selectedModeIndex = selectedModeIndex >= 2 ? 0 : selectedModeIndex + 1;
+        selectedModeIndex = selectedModeIndex >= maxMode ? 0 : selectedModeIndex + 1;
         renderDashboard();
         screen.render();
         return true;
@@ -1507,13 +2038,17 @@ async function runChat(projectRoot) {
       }
       if (key.name === "up") {
         dashboardView = "agents";
+        // Restore @target when returning to agents page
+        if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+          targetAgent = activeAgents[selectedAgentIndex];
+          updatePromptBox();
+        }
         renderDashboard();
         screen.render();
         return true;
       }
       if (key.name === "enter" || key.name === "return") {
-        const modes = ["terminal", "tmux", "internal"];
-        setLaunchMode(modes[selectedModeIndex]);
+        setLaunchMode(launchModes[selectedModeIndex]);
         exitDashboardMode(false);
         return true;
       }
@@ -1536,6 +2071,13 @@ async function runChat(projectRoot) {
         screen.render();
         return true;
       }
+      if (key.name === "down") {
+        dashboardView = "resume";
+        selectedResumeIndex = autoResume ? 0 : 1;
+        renderDashboard();
+        screen.render();
+        return true;
+      }
       if (key.name === "up") {
         dashboardView = "mode";
         renderDashboard();
@@ -1554,11 +2096,49 @@ async function runChat(projectRoot) {
       }
       return true;
     }
+    if (dashboardView === "resume") {
+      if (key.name === "left") {
+        selectedResumeIndex = selectedResumeIndex <= 0 ? resumeOptions.length - 1 : selectedResumeIndex - 1;
+        renderDashboard();
+        screen.render();
+        return true;
+      }
+      if (key.name === "right") {
+        selectedResumeIndex = selectedResumeIndex >= resumeOptions.length - 1 ? 0 : selectedResumeIndex + 1;
+        renderDashboard();
+        screen.render();
+        return true;
+      }
+      if (key.name === "up") {
+        dashboardView = "provider";
+        renderDashboard();
+        screen.render();
+        return true;
+      }
+      if (key.name === "enter" || key.name === "return") {
+        const selected = resumeOptions[selectedResumeIndex];
+        if (selected) {
+          setAutoResume(selected.value);
+          const label = selected.value ? "Auto" : "Off";
+          logMessage("status", `{magenta-fg}⚙{/magenta-fg} Resume: ${label}`);
+        }
+        exitDashboardMode(false);
+        return true;
+      }
+      if (key.name === "escape") {
+        exitDashboardMode(false);
+        return true;
+      }
+      return true;
+    }
 
     if (key.name === "left") {
       if (activeAgents.length > 0 && selectedAgentIndex > 0) {
         selectedAgentIndex--;
         clampAgentWindow();
+        // Update @target in real-time as user navigates
+        targetAgent = activeAgents[selectedAgentIndex];
+        updatePromptBox();
         renderDashboard();
         screen.render();
       }
@@ -1568,24 +2148,72 @@ async function runChat(projectRoot) {
       if (activeAgents.length > 0 && selectedAgentIndex < activeAgents.length - 1) {
         selectedAgentIndex++;
         clampAgentWindow();
+        // Update @target in real-time as user navigates
+        targetAgent = activeAgents[selectedAgentIndex];
+        updatePromptBox();
         renderDashboard();
         screen.render();
       }
       return true;
     }
     if (key.name === "down") {
+      // Leaving agents page: clear temporary @target
+      clearTargetAgent();
       dashboardView = "mode";
-      selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
+      selectedModeIndex = modeToIndex(launchMode);
       renderDashboard();
       screen.render();
       return true;
     }
     if (key.name === "up" || key.name === "escape") {
+      // Cancel: clear @target, back to normal chat
+      clearTargetAgent();
       exitDashboardMode(false);
       return true;
     }
+    if (key.name === "x" && key.ctrl) {
+      // Ctrl+x: close selected agent
+      if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+        const agentId = activeAgents[selectedAgentIndex];
+        const label = getAgentLabel(agentId);
+        closeAgentViaDaemon(agentId, label);
+        clearTargetAgent();
+        exitDashboardMode(false);
+      }
+      return true;
+    }
     if (key.name === "enter" || key.name === "return") {
-      exitDashboardMode(true);
+      // Enter: action depends on agent's launch mode
+      if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+        const agentId = activeAgents[selectedAgentIndex];
+        const meta = activeAgentMetaMap.get(agentId);
+        const agentLaunchMode = meta?.launch_mode || "";
+
+        if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+          // Tmux: select pane; Terminal: activate tab/window by tty
+          clearTargetAgent();
+          exitDashboardMode(false);
+          try {
+            const activator = new AgentActivator(projectRoot);
+            activator.activate(agentId).catch(() => {});
+          } catch { /* ignore */ }
+          return true;
+        }
+
+        // Internal / internal-pty mode: enter PTY view if inject.sock exists
+        const sockPath = getInjectSockPath(agentId);
+        if (fs.existsSync(sockPath)) {
+          clearTargetAgent();
+          focusMode = "input";
+          dashboardView = "agents";
+          selectedAgentIndex = -1;
+          screen.grabKeys = false;
+          enterAgentView(agentId);
+          return true;
+        }
+      }
+      // Fallback: just exit dashboard, keep @target for messaging
+      exitDashboardMode(false);
       return true;
     }
     return false;
@@ -1609,6 +2237,312 @@ async function runChat(projectRoot) {
     targetAgent = null;
     updatePromptBox();
     screen.render();
+  }
+
+  function getInjectSockPath(agentId) {
+    const safeName = subscriberToSafeName(agentId);
+    return path.join(getUfooPaths(projectRoot).busQueuesDir, safeName, "inject.sock");
+  }
+
+  function closeAgentViaDaemon(agentId, label) {
+    logMessage("system", `{yellow-fg}⚙{/yellow-fg} Closing ${label}...`);
+    const sockFile = socketPath(projectRoot);
+    try {
+      const conn = net.createConnection(sockFile, () => {
+        conn.write(JSON.stringify({ type: "close_agent", agentId }) + "\n");
+      });
+      let buffer = "";
+      conn.on("data", (data) => {
+        buffer += data.toString("utf8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const res = JSON.parse(line);
+            if (res.type === "close_agent_ok") {
+              if (res.ok) {
+                logMessage("system", `{green-fg}✓{/green-fg} Closed ${label}`);
+              } else {
+                logMessage("system", `{red-fg}✗{/red-fg} Agent ${label} not found or already stopped`);
+              }
+            }
+          } catch { /* ignore */ }
+        }
+      });
+      conn.on("error", () => {
+        logMessage("error", `{red-fg}✗{/red-fg} Failed to connect to daemon`);
+      });
+      setTimeout(() => { try { conn.destroy(); } catch {} }, 3000);
+    } catch {
+      logMessage("error", `{red-fg}✗{/red-fg} Failed to close ${label}`);
+    }
+  }
+
+  // Freeze blessed rendering during agent PTY view (direct stdout mode)
+  const _originalRender = screen.render.bind(screen);
+  let renderFrozen = false;
+  screen.render = function() {
+    if (renderFrozen) return;
+    return _originalRender();
+  };
+
+  // Render agent view dashboard bar via ANSI — matches blessed dashboard style
+  function renderAgentDashboard() {
+    const rows = process.stdout.rows || 24;
+    const cols = process.stdout.columns || 80;
+    let bar = " ";
+
+    if (focusMode === "dashboard") {
+      // Dashboard mode: \x1b[90;7m = gray+inverse, matches blessed {inverse} on gray fg widget
+      const ufooItem = selectedAgentIndex === 0
+        ? "\x1b[90;7mufoo\x1b[0m"
+        : "\x1b[36mufoo\x1b[0m";
+      const agentParts = activeAgents.map((agent, i) => {
+        const label = getAgentLabel(agent);
+        const idx = i + 1; // +1 for ufoo at index 0
+        if (idx === selectedAgentIndex) return `\x1b[90;7m${label}\x1b[0m`;
+        if (agent === viewingAgent) return `\x1b[1;36m${label}\x1b[0m`;
+        return `\x1b[36m${label}\x1b[0m`;
+      });
+      bar += `${ufooItem}  ${agentParts.join("  ")}`;
+      bar += `  \x1b[90m│ ←/→ select, Enter switch, ^X close, ↑ back\x1b[0m`;
+    } else {
+      // Normal PTY mode: bold current viewing agent
+      const agentParts = activeAgents.map((agent) => {
+        const label = getAgentLabel(agent);
+        if (agent === viewingAgent) return `\x1b[1;36m${label}\x1b[0m`;
+        return `\x1b[36m${label}\x1b[0m`;
+      });
+      bar += `\x1b[36mufoo\x1b[0m  ${agentParts.join("  ")}`;
+      bar += `  \x1b[90m│ ↓: agents\x1b[0m`;
+    }
+
+    // Pad to full width
+    const plainLen = bar.replace(/\x1b\[[0-9;]*m/g, "").length;
+    const pad = Math.max(0, cols - plainLen);
+    // Save cursor → move to last row → write bar → restore cursor
+    process.stdout.write(`\x1b7\x1b[${rows};1H${bar}${" ".repeat(pad)}\x1b8`);
+  }
+
+  function enterAgentView(agentId) {
+    if (currentView === "agent" && viewingAgent === agentId) return;
+    if (currentView === "agent") {
+      disconnectAgentOutput();
+      disconnectAgentInput();
+    }
+
+    currentView = "agent";
+    viewingAgent = agentId;
+    focusMode = "input";
+
+    // Detach all blessed widgets from screen — nothing left to render
+    _detachedChildren = [...screen.children];
+    for (const child of _detachedChildren) screen.remove(child);
+
+    // Freeze blessed — we take over the terminal with direct stdout
+    renderFrozen = true;
+
+    const rows = process.stdout.rows || 24;
+    const cols = process.stdout.columns || 80;
+    process.stdout.write("\x1b[2J\x1b[H");                // Clear + home
+    process.stdout.write(`\x1b[1;${rows - 1}r`);          // Scroll region
+    process.stdout.write("\x1b[H");                         // Cursor to top
+    process.stdout.write("\x1b[?25h");                      // Show cursor
+
+    // Render dashboard bar
+    renderAgentDashboard();
+
+    // Suppress input forwarding briefly — prevents the Enter that triggered
+    // view switch and any terminal query responses (CPR etc) from leaking
+    agentInputSuppressUntil = Date.now() + 300;
+
+    // Connect to agent's inject.sock for output streaming and input
+    const sockPath = getInjectSockPath(agentId);
+    connectAgentOutput(sockPath);
+    connectAgentInput(sockPath);
+
+    // Resize agent PTY to match our viewport (rows-1 for status bar)
+    setTimeout(() => sendResizeToAgent(cols, rows - 1), 100);
+  }
+
+  function exitAgentView() {
+    if (currentView !== "agent") return;
+
+    // Restore agent PTY to full terminal size before disconnecting
+    const rows = process.stdout.rows || 24;
+    const cols = process.stdout.columns || 80;
+    sendResizeToAgent(cols, rows);
+
+    disconnectAgentOutput();
+    disconnectAgentInput();
+
+    currentView = "main";
+    viewingAgent = null;
+
+    // Reset scroll region to full screen
+    process.stdout.write(`\x1b[1;${rows}r`);
+    process.stdout.write("\x1b[2J\x1b[H");
+
+    // Re-attach all blessed widgets to screen
+    if (_detachedChildren) {
+      for (const child of _detachedChildren) screen.append(child);
+      _detachedChildren = null;
+    }
+
+    // Unfreeze blessed and force full redraw
+    renderFrozen = false;
+    focusMode = "input";
+    dashboardView = "agents";
+    selectedAgentIndex = -1;
+    screen.grabKeys = false;
+    clearTargetAgent();
+    renderDashboard();
+    focusInput();
+    resizeInput();
+    screen.alloc();
+    screen.render();
+  }
+
+  function connectAgentOutput(sockPath) {
+    if (agentOutputClient) {
+      disconnectAgentOutput();
+    }
+    agentOutputBuffer = "";
+
+    if (!fs.existsSync(sockPath)) {
+      writeToAgentTerm("\x1b[1;31m[Error]\x1b[0m inject.sock not found\r\n");
+      writeToAgentTerm("\x1b[33m[Hint]\x1b[0m Agent may not be running in terminal mode\r\n");
+      writeToAgentTerm("Press Esc to return\r\n");
+      return;
+    }
+
+    try {
+      agentOutputClient = net.createConnection(sockPath, () => {
+        agentOutputClient.write(JSON.stringify({ type: "subscribe" }) + "\n");
+      });
+
+      // Connection timeout
+      const connectTimeout = setTimeout(() => {
+        if (agentOutputClient && !agentOutputClient.connecting) return;
+        writeToAgentTerm("\x1b[1;31m[Timeout]\x1b[0m Could not connect\r\nPress Esc to return\r\n");
+        disconnectAgentOutput();
+      }, 5000);
+
+      agentOutputClient.on("connect", () => {
+        clearTimeout(connectTimeout);
+      });
+
+      agentOutputClient.on("data", (data) => {
+        agentOutputBuffer += data.toString("utf8");
+        const lines = agentOutputBuffer.split("\n");
+        agentOutputBuffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (msg.type === "output" || msg.type === "replay") {
+              if (msg.data) {
+                writeToAgentTerm(msg.data);
+              }
+            }
+          } catch {
+            // ignore malformed messages
+          }
+        }
+      });
+
+      agentOutputClient.on("error", (err) => {
+        if (currentView === "agent") {
+          writeToAgentTerm(`\r\n\x1b[1;31m[Connection error]\x1b[0m ${err.message}\r\nPress Esc to return\r\n`);
+        }
+      });
+
+      agentOutputClient.on("close", () => {
+        agentOutputClient = null;
+        if (currentView === "agent") {
+          writeToAgentTerm("\r\n\x1b[1;33m[Agent disconnected]\x1b[0m\r\nPress Esc to return\r\n");
+        }
+      });
+    } catch (err) {
+      writeToAgentTerm(`\x1b[1;31m[Error]\x1b[0m ${err.message}\r\nPress Esc to return\r\n`);
+    }
+  }
+
+  function disconnectAgentOutput() {
+    if (agentOutputClient) {
+      try {
+        agentOutputClient.removeAllListeners();
+        agentOutputClient.destroy();
+      } catch { /* ignore */ }
+      agentOutputClient = null;
+    }
+    agentOutputBuffer = "";
+  }
+
+  function connectAgentInput(sockPath) {
+    if (agentInputClient) {
+      disconnectAgentInput();
+    }
+    try {
+      agentInputClient = net.createConnection(sockPath);
+      agentInputClient.on("error", () => {
+        agentInputClient = null;
+      });
+      agentInputClient.on("close", () => {
+        agentInputClient = null;
+      });
+    } catch {
+      agentInputClient = null;
+    }
+  }
+
+  function disconnectAgentInput() {
+    if (agentInputClient) {
+      try {
+        agentInputClient.removeAllListeners();
+        agentInputClient.destroy();
+      } catch { /* ignore */ }
+      agentInputClient = null;
+    }
+  }
+
+  function sendRawToAgent(data) {
+    if (!agentInputClient || agentInputClient.destroyed) return;
+    try {
+      agentInputClient.write(JSON.stringify({ type: "raw", data }) + "\n");
+    } catch {
+      // ignore write errors
+    }
+  }
+
+  function sendResizeToAgent(cols, rows) {
+    if (!agentInputClient || agentInputClient.destroyed) return;
+    try {
+      agentInputClient.write(JSON.stringify({ type: "resize", cols, rows }) + "\n");
+    } catch {
+      // ignore write errors
+    }
+  }
+
+  function writeToAgentTerm(text) {
+    if (!text) return;
+    if (currentView === "agent") {
+      // Strip sequences that cause the real terminal to respond, feeding
+      // garbage back into the agent's input:
+      // - OSC queries: \x1b]10;?\x07 etc (color queries)
+      // - CSI DSR: \x1b[6n / \x1b[?6n (cursor position query → CPR response)
+      // - CSI DSR: \x1b[5n (device status query)
+      // - CSI DA:  \x1b[c / \x1b[>c / \x1b[=c (device attributes query)
+      const cleaned = text
+        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+        .replace(/\x1b\[(?:[?>=]?[0-9]*c|[?]?6n|5n)/g, "");
+      if (cleaned) process.stdout.write(cleaned);
+      // Always re-render dashboard bar — PTY output may overwrite it
+      // via absolute cursor positioning before the resize takes effect
+      renderAgentDashboard();
+    }
   }
 
   function requestStatus() {
@@ -1640,71 +2574,84 @@ async function runChat(projectRoot) {
       for (const line of lines.filter((l) => l.trim())) {
         try {
         const msg = JSON.parse(line);
-        if (msg.type === "status") {
-          const data = msg.data || {};
-          if (typeof data.phase === "string") {
-            const text = data.text || "";
-            const item = { key: data.key, text };
-            if (data.phase === "start") {
-              enqueueBusStatus(item);
-            } else if (data.phase === "done" || data.phase === "error") {
-              resolveBusStatus(item);
-              if (text) {
-                const prefix = data.phase === "error"
-                  ? "{red-fg}✗{/red-fg}"
-                  : "{green-fg}✓{/green-fg}";
-                logMessage("status", `${prefix} ${text}`, data);
-              }
-            } else {
-              enqueueBusStatus(item);
+            if (msg.type === "status") {
+              const data = msg.data || {};
+              if (typeof data.phase === "string") {
+            const rawText = data.text == null ? "" : String(data.text);
+            const item = { key: data.key, text: rawText };
+                if (data.phase === "start") {
+                  enqueueBusStatus(item);
+                } else if (data.phase === "done" || data.phase === "error") {
+                  resolveBusStatus(item);
+                  if (rawText) {
+                    const prefix = data.phase === "error"
+                      ? "{red-fg}✗{/red-fg}"
+                      : "{green-fg}✓{/green-fg}";
+                    logMessage("status", `${prefix} ${escapeBlessed(rawText)}`, data);
+                  }
+                } else {
+                  enqueueBusStatus(item);
+                }
+                screen.render();
+              } else {
+            // 收到 dashboard 状态更新
+            if (process.env.UFOO_DEBUG) {
+              logMessage("debug", `[status] active: ${(data.active || []).length}`);
             }
-            screen.render();
-          } else {
             updateDashboard(data);
           }
-        } else if (msg.type === "response") {
-          const payload = msg.data || {};
-          if (payload.reply) {
-            resolveStatusLine(`{green-fg}←{/green-fg} ${payload.reply}`);
-            logMessage("reply", `{green-fg}←{/green-fg} ${payload.reply}`);
-          }
-          if (payload.dispatch && payload.dispatch.length > 0) {
-            logMessage("dispatch", `{blue-fg}→{/blue-fg} Dispatched to: ${payload.dispatch.map(d => d.target || d).join(", ")}`);
-          }
-          if (payload.disambiguate && Array.isArray(payload.disambiguate.candidates) && payload.disambiguate.candidates.length > 0) {
-            pending = { disambiguate: payload.disambiguate, original: pending?.original };
-            resolveStatusLine(`{yellow-fg}?{/yellow-fg} ${payload.disambiguate.prompt || "Choose target:"}`);
-            logMessage("disambiguate", `{yellow-fg}?{/yellow-fg} ${payload.disambiguate.prompt || "Choose target:"}`);
-            payload.disambiguate.candidates.forEach((c, i) => {
-              logMessage("disambiguate", `   {cyan-fg}${i + 1}){/cyan-fg} ${c.agent_id} {gray-fg}— ${c.reason || ""}{/gray-fg}`);
-            });
-          } else {
-            pending = null;
-          }
+            } else if (msg.type === "response") {
+              const payload = msg.data || {};
+              if (payload.reply) {
+                resolveStatusLine(`{green-fg}←{/green-fg} ${escapeBlessed(payload.reply)}`);
+                logMessage("reply", `{green-fg}←{/green-fg} ${escapeBlessed(payload.reply)}`);
+              }
+              if (payload.dispatch && payload.dispatch.length > 0) {
+                const targets = payload.dispatch.map((d) => d.target || d).join(", ");
+                logMessage("dispatch", `{blue-fg}→{/blue-fg} Dispatched to: ${escapeBlessed(targets)}`);
+              }
+              if (payload.disambiguate && Array.isArray(payload.disambiguate.candidates) && payload.disambiguate.candidates.length > 0) {
+                pending = { disambiguate: payload.disambiguate, original: pending?.original };
+                const prompt = payload.disambiguate.prompt || "Choose target:";
+                resolveStatusLine(`{yellow-fg}?{/yellow-fg} ${escapeBlessed(prompt)}`);
+                logMessage("disambiguate", `{yellow-fg}?{/yellow-fg} ${escapeBlessed(prompt)}`);
+                payload.disambiguate.candidates.forEach((c, i) => {
+                  const agentId = c.agent_id || "";
+                  const reason = c.reason || "";
+                  logMessage(
+                    "disambiguate",
+                    `   {cyan-fg}${i + 1}){/cyan-fg} ${escapeBlessed(agentId)} {gray-fg}— ${escapeBlessed(reason)}{/gray-fg}`
+                  );
+                });
+              } else {
+                pending = null;
+              }
           if (!payload.reply && !payload.disambiguate) {
             resolveStatusLine("{gray-fg}✓{/gray-fg} Done");
           }
-          if (msg.opsResults && msg.opsResults.length > 0) {
-            logMessage("ops", `{magenta-fg}⚡{/magenta-fg} ${JSON.stringify(msg.opsResults)}`);
-          }
+          // opsResults are noisy JSON; keep them out of the log UI
           screen.render();
-        } else if (msg.type === "bus") {
-          const data = msg.data || {};
-          const prefix = data.event === "broadcast" ? "{magenta-fg}⇢{/magenta-fg}" : "{blue-fg}↔{/blue-fg}";
-          let publisher = data.publisher && data.publisher !== "unknown"
-            ? data.publisher
-            : (data.event === "broadcast" ? "broadcast" : "bus");
+            } else if (msg.type === "bus") {
+              const data = msg.data || {};
+              const prefix = data.event === "broadcast" ? "{magenta-fg}⇢{/magenta-fg}" : "{blue-fg}↔{/blue-fg}";
+              let publisher = data.publisher && data.publisher !== "unknown"
+                ? data.publisher
+                : (data.event === "broadcast" ? "broadcast" : "bus");
 
           // Try to parse message as JSON (from internal agents)
-          let displayMessage = data.message || "";
-          try {
-            const parsed = JSON.parse(data.message);
-            if (parsed && typeof parsed === "object" && parsed.reply) {
-              displayMessage = parsed.reply;
-            }
-          } catch {
-            // Not JSON, use as-is
-          }
+              let displayMessage = data.message == null ? "" : String(data.message);
+              let isStream = false;
+              try {
+                const parsed = JSON.parse(data.message);
+                if (parsed && typeof parsed === "object" && parsed.reply) {
+                  displayMessage = parsed.reply == null ? "" : String(parsed.reply);
+                } else if (parsed && typeof parsed === "object" && parsed.stream) {
+                  displayMessage = typeof parsed.delta === "string" ? parsed.delta : "";
+                  isStream = true;
+                }
+              } catch {
+                // Not JSON, use as-is
+              }
 
           // Convert literal \n to actual newlines for better display
           if (typeof displayMessage === "string") {
@@ -1712,17 +2659,17 @@ async function runChat(projectRoot) {
           }
 
           // Extract nickname if publisher is in subscriber:id format
-          let displayName = publisher;
-          if (publisher.includes(":")) {
-            // Try to get nickname from activeAgentLabelMap or bus.json
+              let displayName = publisher;
+              if (publisher.includes(":")) {
+            // Try to get nickname from activeAgentLabelMap or all-agents.json
             if (activeAgentLabelMap && activeAgentLabelMap.has(publisher)) {
               displayName = activeAgentLabelMap.get(publisher);
             } else {
-              // Fallback: read directly from bus.json
+              // Fallback: read directly from all-agents.json
               try {
-                const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+                const busPath = getUfooPaths(projectRoot).agentsFile;
                 const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-                const meta = bus.subscribers && bus.subscribers[publisher];
+                const meta = bus.agents && bus.agents[publisher];
                 if (meta && meta.nickname) {
                   displayName = meta.nickname;
                 }
@@ -1730,19 +2677,24 @@ async function runChat(projectRoot) {
                 // Keep original publisher ID
               }
             }
-          }
+              }
 
-          const line = `${prefix} {gray-fg}${displayName}{/gray-fg}: ${displayMessage}`;
-          logMessage("bus", line, data);
-          if (data.event === "agent_renamed") {
+              const line = `${prefix} {gray-fg}${escapeBlessed(displayName)}{/gray-fg}: ${escapeBlessed(displayMessage)}`;
+              if (isStream) {
+                recordLog("bus_stream", line, data, true);
+              } else {
+                logMessage("bus", line, data);
+              }
+          if (data.event === "agent_renamed" || data.event === "message") {
+            // 收到消息时刷新 status，更新在线 agent 列表
             requestStatus();
           }
           screen.render();
-        } else if (msg.type === "error") {
-          resolveStatusLine(`{red-fg}✗{/red-fg} Error: ${msg.error}`);
-          logMessage("error", `{red-fg}✗{/red-fg} Error: ${msg.error}`);
-          screen.render();
-        }
+            } else if (msg.type === "error") {
+              resolveStatusLine(`{red-fg}✗{/red-fg} Error: ${escapeBlessed(msg.error)}`);
+              logMessage("error", `{red-fg}✗{/red-fg} Error: ${escapeBlessed(msg.error)}`);
+              screen.render();
+            }
       } catch {
         // ignore
       }
@@ -1930,7 +2882,7 @@ async function runChat(projectRoot) {
       } else if (subcommand === "list") {
         bus.ensureBus();
         bus.loadBusData();
-        const subscribers = Object.entries(bus.busData.subscribers || {});
+        const subscribers = Object.entries(bus.busData.agents || {});
         if (subscribers.length === 0) {
           logMessage("system", "{gray-fg}No active agents{/gray-fg}");
         } else {
@@ -1944,7 +2896,7 @@ async function runChat(projectRoot) {
       } else if (subcommand === "status") {
         bus.ensureBus();
         bus.loadBusData();
-        const count = Object.keys(bus.busData.subscribers || {}).length;
+        const count = Object.keys(bus.busData.agents || {}).length;
         logMessage("system", `{cyan-fg}Bus status:{/cyan-fg} ${count} agent(s) registered`);
       } else if (subcommand === "activate") {
         if (args.length < 2) {
@@ -2059,21 +3011,32 @@ async function runChat(projectRoot) {
 
     const nickname = options.nickname || "";
     const count = parseInt(options.count || "1", 10);
+    if (nickname && count > 1) {
+      logMessage("error", "{red-fg}✗{/red-fg} nickname requires count=1");
+      return;
+    }
 
     try {
-      const launcher = new AgentLauncher(projectRoot, launchMode);
-
-      for (let i = 0; i < count; i++) {
-        const finalNickname = count > 1 && nickname ? `${nickname}-${i + 1}` : nickname;
-        logMessage("system", `{yellow-fg}⚙{/yellow-fg} Launching ${agentType}${finalNickname ? ` (${finalNickname})` : ""}...`);
-        await launcher.launch(agentType, finalNickname);
-      }
-
-      logMessage("system", `{green-fg}✓{/green-fg} Launched ${count} ${agentType} agent(s)`);
+      const label = nickname ? ` (${nickname})` : "";
+      logMessage("system", `{yellow-fg}⚙{/yellow-fg} Launching ${agentType}${label}...`);
+      send({
+        type: "launch_agent",
+        agent: agentType,
+        count: Number.isFinite(count) ? count : 1,
+        nickname,
+      });
       setTimeout(requestStatus, 1000);
     } catch (err) {
       logMessage("error", `{red-fg}✗{/red-fg} Launch failed: ${err.message}`);
     }
+  }
+
+  async function handleResumeCommand(args) {
+    const target = args[0] || "";
+    const label = target ? ` (${target})` : "";
+    logMessage("system", `{yellow-fg}⚙{/yellow-fg} Resuming agents${label}...`);
+    send({ type: "resume_agents", target });
+    setTimeout(requestStatus, 1000);
   }
 
   function parseCommand(text) {
@@ -2120,6 +3083,9 @@ async function runChat(projectRoot) {
       case "launch":
         await handleLaunchCommand(args);
         return true;
+      case "resume":
+        await handleResumeCommand(args);
+        return true;
       default:
         logMessage("error", `{red-fg}✗{/red-fg} Unknown command: /${command}`);
         return true;
@@ -2131,6 +3097,16 @@ async function runChat(projectRoot) {
     input.clearValue();
     screen.render();
     if (!text) {
+      // Empty Enter with @target → enter TTY view
+      if (targetAgent) {
+        const agentId = targetAgent;
+        const sockPath = getInjectSockPath(agentId);
+        if (fs.existsSync(sockPath)) {
+          clearTargetAgent();
+          enterAgentView(agentId);
+          return;
+        }
+      }
       input.focus();
       return;
     }
@@ -2139,13 +3115,40 @@ async function runChat(projectRoot) {
     historyIndex = inputHistory.length;
     historyDraft = "";
 
-    // If target agent is selected, send via daemon
+    // If target agent is selected, inject directly into agent's PTY
     if (targetAgent) {
       const label = getAgentLabel(targetAgent);
-      logMessage("user", `{cyan-fg}→{/cyan-fg} {magenta-fg}@${label}{/magenta-fg} ${text}`);
+      logMessage("user", `{magenta-fg}${escapeBlessed(label)}{/magenta-fg}: ${escapeBlessed(text)}`);
 
-      // Send via daemon socket to ensure proper publisher ID
-      send({ type: "bus_send", target: targetAgent, message: text });
+      const meta = activeAgentMetaMap.get(targetAgent);
+      const agentMode = meta?.launch_mode || "";
+
+      if (agentMode === "tmux" && meta?.tmux_pane) {
+        // Tmux mode: use tmux send-keys
+        // Send text first, then Enter after a delay (Claude Code needs time to process)
+        const pane = meta.tmux_pane;
+        const textProc = spawn("tmux", ["send-keys", "-t", pane, text]);
+        textProc.on("close", () => {
+          setTimeout(() => {
+            spawn("tmux", ["send-keys", "-t", pane, "Enter"]);
+          }, 150);
+        });
+      } else {
+        // Terminal / internal mode: inject via inject.sock
+        const sockPath = getInjectSockPath(targetAgent);
+        try {
+          const conn = net.createConnection(sockPath, () => {
+            conn.write(JSON.stringify({ type: "raw", data: text }) + "\n");
+            setTimeout(() => {
+              conn.write(JSON.stringify({ type: "raw", data: "\r" }) + "\n");
+              setTimeout(() => conn.destroy(), 500);
+            }, 100);
+          });
+          conn.on("error", () => {});
+        } catch {
+          // ignore connection errors
+        }
+      }
 
       clearTargetAgent();
       input.focus();
@@ -2154,11 +3157,11 @@ async function runChat(projectRoot) {
 
     // Check if it's a command
     if (text.startsWith("/")) {
-      logMessage("user", `{cyan-fg}→{/cyan-fg} ${text}`);
+      logMessage("user", `{cyan-fg}→{/cyan-fg} ${escapeBlessed(text)}`);
       try {
         await executeCommand(text);
       } catch (err) {
-        logMessage("error", `{red-fg}✗{/red-fg} Command error: ${err.message}`);
+        logMessage("error", `{red-fg}✗{/red-fg} Command error: ${escapeBlessed(err.message)}`);
       }
       input.focus();
       return;
@@ -2175,25 +3178,87 @@ async function runChat(projectRoot) {
         });
         pending = null;
       } else {
-        logMessage("error", "Invalid selection.");
+        logMessage("error", escapeBlessed("Invalid selection."));
       }
     } else {
       pending = { original: text };
       queueStatusLine("ufoo-agent processing");
       send({ type: "prompt", text });
-      logMessage("user", `{cyan-fg}→{/cyan-fg} ${text}`);
+      logMessage("user", `{cyan-fg}→{/cyan-fg} ${escapeBlessed(text)}`);
     }
     input.focus();
   });
 
   screen.key(["C-c"], exitHandler);
 
+  // Agent TTY view: enter dashboard mode
+  function enterAgentDashboardMode() {
+    focusMode = "dashboard";
+    dashboardView = "agents";
+    // Find the current viewing agent's index in the [ufoo, ...agents] list
+    selectedAgentIndex = 0; // Default to ufoo for quick exit
+    renderAgentDashboard();
+  }
+
+  // Map key names to ANSI escape sequences for raw PTY passthrough
+  function keyToRaw(ch, key) {
+    if (ch && ch.length === 1) return ch;
+    if (!key) return null;
+    switch (key.name) {
+      case "return": case "enter": return "\r";
+      case "backspace": return "\x7f";
+      case "tab": return "\t";
+      case "escape": return "\x1b";
+      case "up": return "\x1b[A";
+      case "down": return "\x1b[B";
+      case "right": return "\x1b[C";
+      case "left": return "\x1b[D";
+      case "home": return "\x1b[H";
+      case "end": return "\x1b[F";
+      case "pageup": return "\x1b[5~";
+      case "pagedown": return "\x1b[6~";
+      case "delete": return "\x1b[3~";
+      case "insert": return "\x1b[2~";
+      default: return ch || null;
+    }
+  }
+
   // Dashboard navigation - use screen.on to capture even when input is focused
   screen.on("keypress", (ch, key) => {
+    // Agent TTY view: handle keystrokes
+    if (currentView === "agent") {
+      if (focusMode === "dashboard") {
+        handleDashboardKey(key);
+        return;
+      }
+      // Suppress input briefly after entering agent view (prevents Enter
+      // leak from dashboard selection and terminal query responses like CPR)
+      if (Date.now() < agentInputSuppressUntil) {
+        return;
+      }
+      // Ctrl+C exits entire app
+      if (key && key.ctrl && key.name === "c") {
+        return; // handled by screen.key(["C-c"])
+      }
+      // Down arrow: enter agents bar (same pattern as normal chat dashboard)
+      if (key && key.name === "down") {
+        enterAgentDashboardMode();
+        return;
+      }
+      // All other keys (including Esc) go to agent PTY
+      const raw = keyToRaw(ch, key);
+      if (raw) {
+        sendRawToAgent(raw);
+      }
+      return;
+    }
+
+    // Normal mode: dashboard key handling
     handleDashboardKey(key);
   });
 
   screen.key(["tab"], () => {
+    if (currentView === "agent") return; // Tab goes to PTY via keypress handler
     if (focusMode === "dashboard") {
       exitDashboardMode(false);
     } else {
@@ -2202,10 +3267,13 @@ async function runChat(projectRoot) {
   });
 
   screen.key(["C-k", "M-k"], () => {
+    if (currentView === "agent") return;
     clearLog();
   });
 
+
   screen.key(["i", "enter"], () => {
+    if (currentView === "agent") return;
     if (focusMode === "dashboard") return;
     if (screen.focused === input) return;
     focusInput();
@@ -2268,8 +3336,24 @@ async function runChat(projectRoot) {
   renderDashboard();
   resizeInput();
   requestStatus();
-  setInterval(requestStatus, 2000);
+
+  // 定期刷新 dashboard 状态（兜底，daemon 会主动推送变化）
+  setInterval(() => {
+    if (client && !client.destroyed) {
+      requestStatus();
+    }
+  }, 30000);
+
   screen.on("resize", () => {
+    if (currentView === "agent") {
+      // Update scroll region and agent PTY size for new terminal dimensions
+      const rows = process.stdout.rows || 24;
+      const cols = process.stdout.columns || 80;
+      process.stdout.write(`\x1b[1;${rows - 1}r`);
+      sendResizeToAgent(cols, rows - 1);
+      renderAgentDashboard();
+      return;
+    }
     resizeInput();
     if (completionActive) hideCompletion();
     input._updateCursor();

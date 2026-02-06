@@ -1,14 +1,20 @@
 const fs = require("fs");
-const path = require("path");
-const { spawn } = require("child_process");
+const { getUfooPaths } = require("../ufoo/paths");
+const { spawn, spawnSync } = require("child_process");
 
 /**
  * 激活指定 agent 的终端
+ *
+ * 支持的方式：
+ * - tmux: 使用 tmux select-pane 激活
+ * - terminal: 使用 AppleScript 通过 tty 定位并激活 Terminal.app 的 tab/window
+ * - internal: 不支持自动激活（由 chat PTY view 处理）
  */
 class AgentActivator {
   constructor(projectRoot) {
     this.projectRoot = projectRoot;
-    this.busFile = path.join(projectRoot, ".ufoo/bus/bus.json");
+    const paths = getUfooPaths(projectRoot);
+    this.agentsFile = paths.agentsFile;
   }
 
   /**
@@ -16,12 +22,12 @@ class AgentActivator {
    */
   getAgentInfo(agentId) {
     try {
-      if (!fs.existsSync(this.busFile)) {
+      if (!fs.existsSync(this.agentsFile)) {
         throw new Error("Bus not initialized");
       }
 
-      const busData = JSON.parse(fs.readFileSync(this.busFile, "utf8"));
-      const meta = busData.subscribers?.[agentId];
+      const busData = JSON.parse(fs.readFileSync(this.agentsFile, "utf8"));
+      const meta = busData.agents?.[agentId];
 
       if (!meta) {
         throw new Error(`Agent not found: ${agentId}`);
@@ -37,59 +43,6 @@ class AgentActivator {
     } catch (err) {
       throw new Error(`Failed to get agent info: ${err.message}`);
     }
-  }
-
-  /**
-   * 激活 Terminal.app 的 tab
-   */
-  activateTerminalTab(tty) {
-    return new Promise((resolve, reject) => {
-      const script = `
-tell application "Terminal"
-  set targetWindow to missing value
-  set targetTab to missing value
-
-  repeat with w in windows
-    repeat with t in tabs of w
-      try
-        if tty of t is "${tty}" then
-          set targetWindow to w
-          set targetTab to t
-          exit repeat
-        end if
-      end try
-    end repeat
-    if targetTab is not missing value then exit repeat
-  end repeat
-
-  if targetTab is missing value then
-    error "Terminal tab not found with tty: ${tty}"
-  end if
-
-  -- Activate and bring to front
-  activate
-  set selected tab of targetWindow to targetTab
-  set index of targetWindow to 1
-end tell
-      `.trim();
-
-      const proc = spawn("osascript", ["-e", script]);
-      let stderr = "";
-
-      proc.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(stderr || "Failed to activate Terminal tab"));
-        }
-      });
-
-      proc.on("error", reject);
-    });
   }
 
   /**
@@ -136,30 +89,67 @@ end tell
   }
 
   /**
+   * 通过 tty 激活 Terminal.app 中对应的 tab/window
+   */
+  activateTerminalByTty(ttyPath) {
+    if (process.platform !== "darwin") {
+      throw new Error("Terminal activation is only supported on macOS");
+    }
+    if (!ttyPath) {
+      throw new Error("Cannot activate: tty path required");
+    }
+
+    const script = `
+tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if tty of t is "${ttyPath.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}" then
+        set selected tab of w to t
+        set index of w to 1
+        activate
+        return "ok"
+      end if
+    end repeat
+  end repeat
+  return "not found"
+end tell`;
+
+    const result = spawnSync("osascript", ["-e", script], {
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    if (result.status !== 0) {
+      throw new Error(`AppleScript failed: ${(result.stderr || "").trim()}`);
+    }
+
+    const output = (result.stdout || "").trim();
+    if (output === "not found") {
+      throw new Error(`Terminal tab not found for tty: ${ttyPath}`);
+    }
+  }
+
+  /**
    * 激活 agent 的终端
    */
   async activate(agentId) {
     const info = this.getAgentInfo(agentId);
 
-    if (info.launch_mode === "internal") {
-      throw new Error("Internal mode agents cannot be activated (no terminal)");
+    if (info.launch_mode === "internal" || info.launch_mode === "internal-pty") {
+      throw new Error("Internal mode agents cannot be activated (no terminal window)");
     }
 
     if (info.launch_mode === "tmux" && info.tmux_pane) {
-      console.log(`[activate] Activating tmux pane: ${info.tmux_pane}`);
       await this.activateTmuxPane(info.tmux_pane);
-      console.log("[activate] ✓ Activated");
       return;
     }
 
     if (info.launch_mode === "terminal" && info.tty) {
-      console.log(`[activate] Activating Terminal.app tab: ${info.tty}`);
-      await this.activateTerminalTab(info.tty);
-      console.log("[activate] ✓ Activated");
+      this.activateTerminalByTty(info.tty);
       return;
     }
 
-    throw new Error("Cannot activate: missing tty or tmux_pane information");
+    throw new Error("Cannot activate: missing tty or tmux_pane for agent");
   }
 }
 

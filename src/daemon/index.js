@@ -1,11 +1,16 @@
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const { spawnSync } = require("child_process");
 const { runUfooAgent } = require("../agent/ufooAgent");
-const { launchAgent, closeAgent } = require("./ops");
+const { launchAgent, closeAgent, resumeAgents } = require("./ops");
 const { buildStatus } = require("./status");
 const EventBus = require("../bus");
+const NicknameManager = require("../bus/nickname");
 const { generateInstanceId, subscriberToSafeName } = require("../bus/utils");
+const { getUfooPaths } = require("../ufoo/paths");
+const { scheduleProviderSessionProbe, loadProviderSessionCache } = require("./providerSessions");
+const { loadConfig } = require("../config");
 
 /**
  * Agent 进程管理器 - daemon 作为父进程监控所有 internal agents
@@ -31,9 +36,9 @@ class AgentProcessManager {
       try {
         const eventBus = new EventBus(this.projectRoot);
         eventBus.loadBusData();
-        if (eventBus.busData.subscribers?.[subscriberId]) {
-          eventBus.busData.subscribers[subscriberId].status = "inactive";
-          eventBus.busData.subscribers[subscriberId].last_seen = new Date().toISOString();
+        if (eventBus.busData.agents?.[subscriberId]) {
+          eventBus.busData.agents[subscriberId].status = "inactive";
+          eventBus.busData.agents[subscriberId].last_seen = new Date().toISOString();
           eventBus.saveBusData();
           console.log(`[daemon] Agent ${subscriberId} exited (code=${code}, signal=${signal}), marked inactive`);
         }
@@ -84,7 +89,7 @@ function sleep(ms) {
 
 async function renameSpawnedAgent(projectRoot, agentType, nickname, startIso) {
   if (!nickname) return null;
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   const targetType = agentType === "codex" ? "codex" : "claude-code";
   const deadline = Date.now() + 10000;
   const eventBus = new EventBus(projectRoot);
@@ -92,7 +97,7 @@ async function renameSpawnedAgent(projectRoot, agentType, nickname, startIso) {
   while (Date.now() < deadline) {
     try {
       const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-      let entries = Object.entries(bus.subscribers || {})
+      let entries = Object.entries(bus.agents || {})
         .filter(([, meta]) => meta && meta.agent_type === targetType && meta.status === "active");
       if (startIso) {
         entries = entries.filter(([, meta]) => (meta.joined_at || "") >= startIso);
@@ -105,7 +110,7 @@ async function renameSpawnedAgent(projectRoot, agentType, nickname, startIso) {
       if (candidates.length === 0) candidates = entries;
       candidates.sort((a, b) => (a[1].joined_at || "").localeCompare(b[1].joined_at || ""));
       const [agentId] = candidates[candidates.length - 1];
-      await eventBus.rename(agentId, nickname);
+      await eventBus.rename(agentId, nickname, "ufoo-agent");
       return { ok: true, agent_id: agentId, nickname };
     } catch (err) {
       lastError = err && err.message ? err.message : String(err || "rename failed");
@@ -121,15 +126,15 @@ function ensureDir(dir) {
 }
 
 function socketPath(projectRoot) {
-  return path.join(projectRoot, ".ufoo", "run", "ufoo.sock");
+  return getUfooPaths(projectRoot).ufooSock;
 }
 
 function pidPath(projectRoot) {
-  return path.join(projectRoot, ".ufoo", "run", "ufoo-daemon.pid");
+  return getUfooPaths(projectRoot).ufooDaemonPid;
 }
 
 function logPath(projectRoot) {
-  return path.join(projectRoot, ".ufoo", "run", "ufoo-daemon.log");
+  return getUfooPaths(projectRoot).ufooDaemonLog;
 }
 
 function writePid(projectRoot) {
@@ -149,14 +154,12 @@ function isRunning(projectRoot) {
   if (!pid) return false;
   try {
     process.kill(pid, 0);
+    // PID 存活即认为 daemon 正在运行
+    // 不调用 isDaemonProcess() — ps 命令可能有瞬态失败导致误判
+    // 不删除 PID/socket — 破坏性操作会导致竞争条件
     return true;
   } catch {
-    try {
-      fs.unlinkSync(pidPath(projectRoot));
-    } catch {
-      // ignore
-    }
-    removeSocket(projectRoot);
+    // 进程已死
     return false;
   }
 }
@@ -180,7 +183,7 @@ function parseJsonLines(buffer) {
 }
 
 function readBus(projectRoot) {
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   try {
     return JSON.parse(fs.readFileSync(busPath, "utf8"));
   } catch {
@@ -191,7 +194,7 @@ function readBus(projectRoot) {
 function listSubscribers(projectRoot, agentType) {
   const bus = readBus(projectRoot);
   if (!bus) return [];
-  return Object.entries(bus.subscribers || {})
+  return Object.entries(bus.agents || {})
     .filter(([, meta]) => meta && meta.agent_type === agentType)
     .map(([id]) => id);
 }
@@ -210,10 +213,10 @@ async function waitForNewSubscriber(projectRoot, agentType, existing, timeoutMs 
 
 function checkAndCleanupNickname(projectRoot, nickname) {
   if (!nickname) return { existing: null, cleaned: false };
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   try {
     const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-    const entries = Object.entries(bus.subscribers || {})
+    const entries = Object.entries(bus.agents || {})
       .filter(([, meta]) => meta && meta.nickname === nickname);
 
     if (entries.length === 0) {
@@ -228,7 +231,7 @@ function checkAndCleanupNickname(projectRoot, nickname) {
 
     // Clean up offline agents with same nickname
     for (const [agentId] of entries) {
-      delete bus.subscribers[agentId];
+      delete bus.agents[agentId];
     }
     fs.writeFileSync(busPath, JSON.stringify(bus, null, 2));
     return { existing: null, cleaned: true };
@@ -296,6 +299,56 @@ async function handleOps(projectRoot, ops = [], processManager = null) {
     } else if (op.action === "close") {
       const ok = await closeAgent(projectRoot, op.agent_id);
       results.push({ action: "close", ok, agent_id: op.agent_id });
+    } else if (op.action === "rename") {
+      const agentId = op.agent_id || "";
+      const nickname = op.nickname || "";
+      if (!agentId || !nickname) {
+        results.push({
+          action: "rename",
+          ok: false,
+          agent_id: agentId,
+          nickname,
+          error: "rename requires agent_id and nickname",
+        });
+        continue;
+      }
+      try {
+        const eventBus = new EventBus(projectRoot);
+        eventBus.ensureBus();
+        eventBus.loadBusData();
+        let targetId = agentId;
+        if (!eventBus.busData?.agents?.[targetId]) {
+          const nicknameManager = new NicknameManager(eventBus.busData || { agents: {} });
+          const resolved = nicknameManager.resolveNickname(agentId);
+          if (resolved) targetId = resolved;
+        }
+        if (!eventBus.busData?.agents?.[targetId]) {
+          results.push({
+            action: "rename",
+            ok: false,
+            agent_id: agentId,
+            nickname,
+            error: `agent not found: ${agentId}`,
+          });
+          continue;
+        }
+        const result = await eventBus.rename(targetId, nickname, "ufoo-agent");
+        results.push({
+          action: "rename",
+          ok: true,
+          agent_id: result.subscriber,
+          nickname: result.newNickname,
+          old_nickname: result.oldNickname,
+        });
+      } catch (err) {
+        results.push({
+          action: "rename",
+          ok: false,
+          agent_id: agentId,
+          nickname,
+          error: err && err.message ? err.message : String(err || "rename failed"),
+        });
+      }
     }
   }
   return results;
@@ -320,7 +373,7 @@ async function dispatchMessages(projectRoot, dispatch = []) {
   }
 }
 
-function startBusBridge(projectRoot, provider, onEvent, onStatus) {
+function startBusBridge(projectRoot, provider, onEvent, onStatus, shouldDrain) {
   const state = {
     subscriber: null,
     queueFile: null,
@@ -332,9 +385,9 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
   function getAgentNickname(agentId) {
     if (!agentId) return agentId;
     try {
-      const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+      const busPath = getUfooPaths(projectRoot).agentsFile;
       const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-      const meta = bus.subscribers && bus.subscribers[agentId];
+      const meta = bus.agents && bus.agents[agentId];
       if (meta && meta.nickname) {
         return meta.nickname;
       }
@@ -346,7 +399,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
 
   function ensureSubscriber() {
     if (state.subscriber || joinInProgress) return;
-    const debugFile = path.join(projectRoot, ".ufoo", "run", "bus-join-debug.txt");
+    const debugFile = path.join(getUfooPaths(projectRoot).runDir, "bus-join-debug.txt");
     joinInProgress = true;
     (async () => {
       try {
@@ -361,7 +414,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
         }
         state.subscriber = sub;
         const safe = subscriberToSafeName(sub);
-        state.queueFile = path.join(projectRoot, ".ufoo", "bus", "queues", safe, "pending.jsonl");
+        state.queueFile = path.join(getUfooPaths(projectRoot).busQueuesDir, safe, "pending.jsonl");
         fs.writeFileSync(debugFile, `Successfully joined as ${sub} (type: ${agentType})\n`, { flag: "a" });
       } catch (err) {
         fs.writeFileSync(debugFile, `Exception: ${err.message || err}\n`, { flag: "a" });
@@ -373,14 +426,37 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
 
   function poll() {
     ensureSubscriber();
+    if (typeof shouldDrain === "function" && !shouldDrain()) return;
     if (!state.queueFile) return;
     if (!fs.existsSync(state.queueFile)) return;
-    let content;
+    let content = "";
+    let readOk = false;
+    const processingFile = `${state.queueFile}.processing.${process.pid}.${Date.now()}`;
     try {
-      content = fs.readFileSync(state.queueFile, "utf8");
+      fs.renameSync(state.queueFile, processingFile);
+      content = fs.readFileSync(processingFile, "utf8");
+      readOk = true;
     } catch {
+      try {
+        if (fs.existsSync(processingFile)) {
+          fs.renameSync(processingFile, state.queueFile);
+        }
+      } catch {
+        // ignore rollback errors
+      }
       return;
+    } finally {
+      if (readOk) {
+        try {
+          if (fs.existsSync(processingFile)) {
+            fs.rmSync(processingFile, { force: true });
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }
     }
+
     const lines = content.split(/\r?\n/).filter(Boolean);
     if (!lines.length) return;
     for (const line of lines) {
@@ -397,7 +473,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
           publisher: evt.publisher,
           target: evt.target,
           message: evt.data?.message || "",
-          ts: evt.ts,
+          ts: evt.timestamp || evt.ts,
         });
       }
       if (evt.publisher && state.pending.has(evt.publisher)) {
@@ -407,11 +483,6 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
           onStatus({ phase: "done", text: `${displayName} done`, key: evt.publisher });
         }
       }
-    }
-    try {
-      fs.truncateSync(state.queueFile, 0);
-    } catch {
-      // ignore
     }
   }
 
@@ -428,7 +499,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
     getSubscriber() {
       ensureSubscriber();
       try {
-        fs.writeFileSync(path.join(projectRoot, ".ufoo", "run", "bridge-debug.txt"),
+        fs.writeFileSync(path.join(getUfooPaths(projectRoot).runDir, "bridge-debug.txt"),
           `subscriber: ${state.subscriber || "NULL"}\nqueue: ${state.queueFile || "NULL"}\n`);
       } catch {}
       return state.subscriber;
@@ -439,39 +510,46 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus) {
   };
 }
 
-function startDaemon({ projectRoot, provider, model }) {
-  if (!fs.existsSync(path.join(projectRoot, ".ufoo"))) {
+function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
+  const paths = getUfooPaths(projectRoot);
+  if (!fs.existsSync(paths.ufooDir)) {
     throw new Error("Missing .ufoo. Run: ufoo init");
   }
 
-  const runDir = path.join(projectRoot, ".ufoo", "run");
+  const runDir = paths.runDir;
   ensureDir(runDir);
 
   // 文件锁机制：防止多个 daemon 同时启动
   const lockFile = path.join(runDir, "daemon.lock");
   let lockFd;
   try {
-    // 尝试独占方式打开锁文件（如果已存在且被锁定则失败）
     lockFd = fs.openSync(lockFile, "wx");
     fs.writeSync(lockFd, `${process.pid}\n`);
   } catch (err) {
     if (err.code === "EEXIST") {
-      // 锁文件已存在，检查是否仍有效
+      // 锁文件已存在，检查持有者是否还活着
+      let existingPid;
       try {
-        const existingPid = parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
-        // 检查该进程是否还活着
+        existingPid = parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
+      } catch {
+        existingPid = NaN;
+      }
+      if (existingPid && Number.isFinite(existingPid)) {
+        let alive = false;
         try {
           process.kill(existingPid, 0);
-          throw new Error(`Daemon already running with PID ${existingPid}`);
+          alive = true;
         } catch {
-          // 进程已死，清理旧锁
-          fs.unlinkSync(lockFile);
-          lockFd = fs.openSync(lockFile, "wx");
-          fs.writeSync(lockFd, `${process.pid}\n`);
+          // 进程已死
         }
-      } catch (readErr) {
-        throw new Error(`Failed to acquire daemon lock: ${readErr.message}`);
+        if (alive) {
+          throw new Error(`Daemon already running with PID ${existingPid}`);
+        }
       }
+      // 持有者已死，接管锁
+      try { fs.unlinkSync(lockFile); } catch { /* ignore */ }
+      lockFd = fs.openSync(lockFile, "wx");
+      fs.writeSync(lockFd, `${process.pid}\n`);
     } else {
       throw err;
     }
@@ -488,6 +566,12 @@ function startDaemon({ projectRoot, provider, model }) {
   // 创建进程管理器 - daemon 作为父进程监控所有 internal agents
   const processManager = new AgentProcessManager(projectRoot);
   log(`Process manager initialized`);
+
+  // Provider session cache (in-memory)
+  const providerSessions = loadProviderSessionCache(projectRoot);
+
+  // Probe handles (用于agent_ready时提前触发probe)
+  const probeHandles = new Map(); // subscriberId -> { triggerNow }
 
   const sockets = new Set();
   const sendToSockets = (payload) => {
@@ -506,7 +590,34 @@ function startDaemon({ projectRoot, provider, model }) {
     sendToSockets({ type: "bus", data: evt });
   }, (status) => {
     sendToSockets({ type: "status", data: status });
-  });
+  }, () => sockets.size > 0);
+
+  // 定期检测状态变化并推送（仅当有变化时）
+  let lastActiveJson = "";
+  const statusSyncInterval = setInterval(() => {
+    if (sockets.size === 0) return; // 没有客户端连接时跳过
+    try {
+      // 先清理不活跃的订阅者，确保状态准确
+      const syncBus = new EventBus(projectRoot);
+      syncBus.ensureBus();
+      syncBus.loadBusData();
+      syncBus.subscriberManager.cleanupInactive();
+      syncBus.saveBusData();
+    } catch {
+      // ignore cleanup errors
+    }
+    try {
+      const status = buildStatus(projectRoot);
+      const currentActiveJson = JSON.stringify(status.active);
+      if (currentActiveJson !== lastActiveJson) {
+        lastActiveJson = currentActiveJson;
+        sendToSockets({ type: "status", data: status });
+        log(`status sync: active agents changed to ${status.active.length}`);
+      }
+    } catch {
+      // ignore status check errors
+    }
+  }, 3000); // 每3秒检测一次
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -613,6 +724,245 @@ function startDaemon({ projectRoot, provider, model }) {
             }
             continue;
           }
+          if (req.type === "launch_agent") {
+            const { agent, count, nickname } = req;
+            if (!agent || (agent !== "codex" && agent !== "claude")) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: "launch_agent requires agent=codex|claude",
+                })}\n`,
+              );
+              continue;
+            }
+            const parsedCount = parseInt(count, 10);
+            const finalCount = Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : 1;
+            const op = {
+              action: "launch",
+              agent,
+              count: finalCount,
+              nickname: nickname || "",
+            };
+            try {
+              const opsResults = await handleOps(projectRoot, [op], processManager);
+              const launchResult = opsResults.find((r) => r.action === "launch");
+              const ok = launchResult ? launchResult.ok !== false : true;
+              const reply = ok
+                ? `Launched ${op.count} ${agent} agent(s)`
+                : `Launch failed: ${launchResult?.error || "unknown error"}`;
+              socket.write(
+                `${JSON.stringify({
+                  type: "response",
+                  data: {
+                    reply,
+                    dispatch: [],
+                    ops: [op],
+                  },
+                  opsResults,
+                })}\n`,
+              );
+            } catch (err) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "launch_agent failed",
+                })}\n`,
+              );
+            }
+            continue;
+          }
+          if (req.type === "close_agent") {
+            const { agentId } = req;
+            if (!agentId) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: "close_agent requires agentId",
+                })}\n`,
+              );
+              continue;
+            }
+            try {
+              const ok = await closeAgent(projectRoot, agentId);
+              // Always cleanup inactive and broadcast — removes dead agents from list
+              try {
+                const cleanupBus = new EventBus(projectRoot);
+                cleanupBus.ensureBus();
+                cleanupBus.loadBusData();
+                cleanupBus.subscriberManager.cleanupInactive();
+                cleanupBus.saveBusData();
+              } catch { /* ignore */ }
+              log(`close_agent id=${agentId} ok=${ok}`);
+              const status = buildStatus(projectRoot);
+              socket.write(
+                `${JSON.stringify({ type: "close_agent_ok", ok: true, agentId })}\n`,
+              );
+              sendToSockets({ type: "status", data: status });
+            } catch (err) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "close_agent failed",
+                })}\n`,
+              );
+            }
+            continue;
+          }
+          if (req.type === "resume_agents") {
+            const target = req.target || "";
+            try {
+              const result = await resumeAgents(projectRoot, target, processManager);
+              const resumedCount = result.resumed.length;
+              const skippedCount = result.skipped.length;
+              const reply = resumedCount > 0
+                ? `Resumed ${resumedCount} agent(s)` + (skippedCount ? `, skipped ${skippedCount}` : "")
+                : (skippedCount ? `No agents resumed (skipped ${skippedCount})` : "No agents resumed");
+              socket.write(
+                `${JSON.stringify({
+                  type: "response",
+                  data: {
+                    reply,
+                    resume: result,
+                  },
+                })}\n`,
+              );
+            } catch (err) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "resume_agents failed",
+                })}\n`,
+              );
+            }
+            continue;
+          }
+          if (req.type === "register_agent") {
+            // Manual agent launch requests daemon to register it
+            const { agentType, nickname, parentPid, launchMode, tmuxPane, tty, skipProbe, reuseSession } = req;
+            if (!agentType) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: "register_agent requires agentType",
+                })}\n`,
+              );
+              continue;
+            }
+            try {
+              const crypto = require("crypto");
+
+              // 检查是否复用旧 session
+              let sessionId;
+              let subscriberId;
+              let isReusing = false;
+
+              if (reuseSession && reuseSession.sessionId && reuseSession.subscriberId) {
+                // 验证旧 session 是否可以复用
+                sessionId = reuseSession.sessionId;
+                subscriberId = reuseSession.subscriberId;
+                isReusing = true;
+                log(`register_agent reusing session: ${subscriberId}`);
+              } else {
+                // 生成新的 session
+                sessionId = crypto.randomBytes(4).toString("hex");
+                subscriberId = `${agentType}:${sessionId}`;
+              }
+
+              // Daemon registers the agent in bus
+              const eventBus = new EventBus(projectRoot);
+              await eventBus.init();
+              eventBus.loadBusData();
+              const parsedParentPid = Number.parseInt(parentPid, 10);
+              if (!Number.isFinite(parsedParentPid) || parsedParentPid <= 0) {
+                throw new Error("register_agent requires valid parentPid");
+              }
+              const joinOptions = {
+                parentPid: Number.isFinite(parsedParentPid) ? parsedParentPid : undefined,
+                launchMode: launchMode || "",
+                tmuxPane: tmuxPane || "",
+                // 如果复用旧 session，保留 provider session ID
+                providerSessionId: isReusing ? reuseSession.providerSessionId : undefined,
+              };
+              if (Object.prototype.hasOwnProperty.call(req, "tty")) {
+                const ttyValue = typeof tty === "string" ? tty.trim() : "";
+                joinOptions.tty = ttyValue;
+                if (!ttyValue) {
+                  log(`register_agent warning: missing tty for ${subscriberId}`);
+                }
+              }
+              await eventBus.subscriberManager.join(sessionId, agentType, nickname || "", joinOptions);
+              eventBus.saveBusData();
+
+              const finalNickname = eventBus.busData?.agents?.[subscriberId]?.nickname || "";
+              const reusedLabel = isReusing ? " (reused)" : "";
+              log(`register_agent type=${agentType} nickname=${finalNickname || "(none)"} id=${subscriberId}${reusedLabel}`);
+
+              // 如果复用 session 且已有 provider session ID，跳过 probe
+              const hasProviderSession = isReusing && reuseSession.providerSessionId;
+              if (!skipProbe && !hasProviderSession && finalNickname) {
+                const probeHandle = scheduleProviderSessionProbe({
+                  projectRoot,
+                  subscriberId,
+                  agentType,
+                  nickname: finalNickname,
+                  onResolved: (id, resolved) => {
+                    providerSessions.set(id, {
+                      sessionId: resolved.sessionId,
+                      source: resolved.source || "",
+                      updated_at: new Date().toISOString(),
+                    });
+                    // 清理handle
+                    probeHandles.delete(id);
+                  },
+                });
+                // 保存handle，用于agent_ready时提前触发
+                if (probeHandle) {
+                  probeHandles.set(subscriberId, probeHandle);
+                }
+              }
+              socket.write(
+                `${JSON.stringify({
+                  type: "register_ok",
+                  subscriberId,
+                  nickname: finalNickname || "",
+                })}\n`,
+              );
+              // 广播状态更新给所有连接的客户端
+              const status = buildStatus(projectRoot);
+              sendToSockets({ type: "status", data: status });
+            } catch (err) {
+              log(`register_agent failed: ${err.message}`);
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "register_agent failed",
+                })}\n`,
+              );
+            }
+            continue;
+          }
+          if (req.type === "agent_ready") {
+            // Agent has completed initialization and is ready to receive commands
+            const { subscriberId } = req;
+            if (!subscriberId) {
+              continue; // Silently ignore invalid requests
+            }
+
+            log(`agent_ready id=${subscriberId} - triggering probe immediately`);
+
+            // 提前触发probe（不再等待8秒延迟）
+            const probeHandle = probeHandles.get(subscriberId);
+            if (probeHandle && typeof probeHandle.triggerNow === "function") {
+              // 异步触发，不阻塞消息处理
+              probeHandle.triggerNow().catch((err) => {
+                log(`agent_ready probe trigger failed for ${subscriberId}: ${err.message}`);
+              });
+            } else {
+              log(`agent_ready no probe handle found for ${subscriberId}`);
+            }
+
+            continue;
+          }
         }
       }
     });
@@ -621,12 +971,111 @@ function startDaemon({ projectRoot, provider, model }) {
   server.listen(socketPath(projectRoot));
   log(`Started pid=${process.pid}`);
 
+  // 清理旧 daemon 留下的孤儿 internal agent 进程
+  const EventBus = require("../bus");
+  const eventBus = new EventBus(projectRoot);
+  try {
+    eventBus.ensureBus();
+    eventBus.loadBusData();
+    const agents = eventBus.busData.agents || {};
+
+    // 查找所有 agent-runner 进程
+    const psResult = spawnSync("ps", ["aux"], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
+    const lines = psResult.stdout ? psResult.stdout.split("\n") : [];
+    const runnerProcesses = [];
+
+    for (const line of lines) {
+      if (line.includes("agent-pty-runner") || line.includes("agent-runner")) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length >= 2) {
+          const pid = parseInt(parts[1], 10);
+          if (Number.isFinite(pid)) {
+            runnerProcesses.push({ pid, line });
+          }
+        }
+      }
+    }
+
+    // 检查每个 runner 的父进程
+    for (const runner of runnerProcesses) {
+      try {
+        const ppidResult = spawnSync("ps", ["-p", String(runner.pid), "-o", "ppid="], { encoding: "utf8" });
+        const ppid = parseInt(ppidResult.stdout.trim(), 10);
+
+        if (Number.isFinite(ppid)) {
+          // 检查父进程是否存在
+          try {
+            process.kill(ppid, 0);
+            // 父进程还活着，检查是否是 daemon
+            const ppidCmd = spawnSync("ps", ["-p", String(ppid), "-o", "command="], { encoding: "utf8" });
+            const cmd = ppidCmd.stdout.trim();
+
+            if (!cmd.includes("daemon start")) {
+              // 父进程不是 daemon，这是孤儿进程
+              log(`Found orphan agent-runner process ${runner.pid} (parent ${ppid} is not a daemon)`);
+              try {
+                process.kill(runner.pid, "SIGTERM");
+                log(`Killed orphan agent-runner ${runner.pid}`);
+              } catch {
+                // ignore
+              }
+            }
+          } catch {
+            // 父进程已死，杀掉孤儿进程
+            log(`Found orphan agent-runner process ${runner.pid} (parent ${ppid} is dead)`);
+            try {
+              process.kill(runner.pid, "SIGTERM");
+              log(`Killed orphan agent-runner ${runner.pid}`);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 标记对应的 agents 为 inactive
+    for (const [subscriberId, meta] of Object.entries(agents)) {
+      if (meta.launch_mode && meta.launch_mode.startsWith("internal")) {
+        if (meta.pid) {
+          try {
+            process.kill(meta.pid, 0);
+            // 父 daemon 还活着，跳过
+          } catch {
+            // 父 daemon 已死，标记为 inactive
+            // 设置 last_seen 为很久以前，强制立即超时
+            meta.status = "inactive";
+            meta.last_seen = "2020-01-01T00:00:00.000Z";
+            log(`Marked orphan internal agent ${subscriberId} as inactive (parent daemon ${meta.pid} is dead)`);
+          }
+        }
+      }
+    }
+    eventBus.saveBusData();
+  } catch (err) {
+    log(`Failed to cleanup orphan agents: ${err.message}`);
+  }
+
+  const config = loadConfig(projectRoot);
+  const autoResumeEnabled = config.autoResume !== false;
+  const shouldResume = resumeMode === "force" || (resumeMode === "auto" && autoResumeEnabled);
+  if (shouldResume) {
+    setTimeout(() => {
+      resumeAgents(projectRoot, "", processManager).catch((err) => {
+        log(`auto resume failed: ${err.message || String(err)}`);
+      });
+    }, 1500);
+  }
+
   const cleanup = () => {
     log(`Shutting down daemon (managed agents: ${processManager.count()})`);
 
     // 清理所有子进程
     processManager.cleanup();
 
+    clearInterval(statusSyncInterval);
     busBridge.stop();
     removeSocket(projectRoot);
 
@@ -635,7 +1084,7 @@ function startDaemon({ projectRoot, provider, model }) {
       if (lockFd !== undefined) {
         fs.closeSync(lockFd);
       }
-      const lockFile = path.join(projectRoot, ".ufoo", "run", "daemon.lock");
+      const lockFile = path.join(getUfooPaths(projectRoot).runDir, "daemon.lock");
       if (fs.existsSync(lockFile)) {
         fs.unlinkSync(lockFile);
       }
@@ -693,7 +1142,7 @@ function stopDaemon(projectRoot) {
 
   // 清理锁文件
   try {
-    const lockFile = path.join(projectRoot, ".ufoo", "run", "daemon.lock");
+    const lockFile = path.join(getUfooPaths(projectRoot).runDir, "daemon.lock");
     if (fs.existsSync(lockFile)) {
       fs.unlinkSync(lockFile);
     }

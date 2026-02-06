@@ -82,7 +82,7 @@ const DEFAULT_CLAUDE = {
     "--dangerously-skip-permissions",
     "--no-session-persistence",
     "--json-schema",
-    '{"type":"object","properties":{"reply":{"type":"string"},"dispatch":{"type":"array","items":{"type":"object","properties":{"target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"]}},"ops":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string"},"agent":{"type":"string"},"count":{"type":"integer"},"agent_id":{"type":"string"},"nickname":{"type":"string"}},"required":["action"]}},"disambiguate":{"type":"object","properties":{"prompt":{"type":"string"},"candidates":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["agent_id"]}}}}},"required":["reply","dispatch","ops"]}',
+    '{"type":"object","properties":{"reply":{"type":"string"},"dispatch":{"type":"array","items":{"type":"object","properties":{"target":{"type":"string"},"message":{"type":"string"}},"required":["target","message"]}},"ops":{"type":"array","items":{"type":"object","properties":{"action":{"type":"string","enum":["launch","close","rename"]},"agent":{"type":"string"},"count":{"type":"integer"},"agent_id":{"type":"string"},"nickname":{"type":"string"}},"required":["action"]}},"disambiguate":{"type":"object","properties":{"prompt":{"type":"string"},"candidates":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"reason":{"type":"string"}},"required":["agent_id"]}}}}},"required":["reply","dispatch","ops"]}',
   ],
   output: "json",
   input: "arg",
@@ -119,6 +119,20 @@ function buildArgs(backend, prompt, opts) {
   return { args, stdin: prompt };
 }
 
+function applySandboxOverride(args, sandbox) {
+  if (!sandbox) return;
+  const idx = args.indexOf("--sandbox");
+  if (idx >= 0) {
+    if (idx + 1 < args.length) {
+      args[idx + 1] = sandbox;
+    } else {
+      args.push(sandbox);
+    }
+  } else {
+    args.push("--sandbox", sandbox);
+  }
+}
+
 function isUnsupportedArgError(errText) {
   const text = (errText || "").toLowerCase();
   return text.includes("unknown option")
@@ -140,11 +154,14 @@ async function runCliAgent(params) {
     systemPrompt: params.systemPrompt,
     disableSession: params.disableSession,
   });
+  if (backend === DEFAULT_CODEX && params.sandbox) {
+    applySandboxOverride(args, params.sandbox);
+  }
 
   let res;
   const env = { ...process.env, ...(params.env || {}) };
-  delete env.CLAUDE_SESSION_ID;
-  delete env.CODEX_SESSION_ID;
+  // Clean up ufoo-specific env vars to avoid interference with CLI agents
+  delete env.UFOO_SUBSCRIBER_ID;
   try {
     res = await runCommand(backend.command, args, {
       cwd: params.cwd,
@@ -169,6 +186,9 @@ async function runCliAgent(params) {
           disableSession: params.disableSession,
         },
       );
+      if (params.sandbox) {
+        applySandboxOverride(retry.args, params.sandbox);
+      }
       try {
         res = await runCommand(backend.command, retry.args, {
           cwd: params.cwd,

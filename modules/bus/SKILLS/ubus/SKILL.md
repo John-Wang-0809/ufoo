@@ -29,17 +29,27 @@ if [[ ! -d ".ufoo/bus" ]]; then
 fi
 ```
 
-### 2. Check if already joined bus
+### 2. Get or create subscriber ID
 
-Read `.ufoo/bus/bus.json`, check if current session is registered.
-
-If not, auto-join (will auto-generate a friendly nickname like "codex-1", "claude-1"):
+**IMPORTANT**: Always check for existing subscriber ID first to avoid creating duplicates.
 
 ```bash
-SUBSCRIBER=$(ufoo bus join | tail -n 1)
-echo "Joined event bus: $SUBSCRIBER"
-# Example output: codex:0e293156 (nickname: codex-1)
+# Check environment variable first (set by launcher/daemon)
+if [ -n "$UFOO_SUBSCRIBER_ID" ]; then
+  SUBSCRIBER="$UFOO_SUBSCRIBER_ID"
+  echo "Using existing subscriber ID: $SUBSCRIBER"
+else
+  # Not launched via uclaude/ucodex, need to join manually
+  SUBSCRIBER=$(ufoo bus join | tail -n 1)
+  echo "Joined event bus: $SUBSCRIBER"
+  # Example output: codex:0e293156 (nickname: codex-1)
+fi
 ```
+
+**Why this matters**:
+- `uclaude`/`ucodex` automatically set `UFOO_SUBSCRIBER_ID` during launch
+- Re-joining creates a new ID, causing message loss
+- Always reuse existing ID when available
 
 To join with a custom nickname:
 
@@ -127,7 +137,7 @@ Output (now includes nicknames):
 ```
 === Event Bus Status ===
 My identity: claude-code:xyz789
-Online subscribers: 2
+Online agents: 2
   - claude-code:abc123 (architect)
   - claude-code:xyz789 (dev-lead)
 Recent events: 5

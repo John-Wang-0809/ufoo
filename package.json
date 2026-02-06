@@ -1,6 +1,6 @@
 {
   "name": "u-foo",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "description": "Multi-Agent Workspace Protocol. Just add u. claude → uclaude, codex → ucodex.",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://ufoo.dev",
@@ -24,6 +24,7 @@
     "bin/",
     "src/",
     "scripts/",
+    "SKILLS/",
     "modules/",
     "LICENSE",
     "README.md"
@@ -33,6 +34,7 @@
     "node": ">=18"
   },
   "scripts": {
+    "postinstall": "node scripts/postinstall.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
@@ -41,7 +43,8 @@
     "blessed": "^0.1.81",
     "chalk": "^4.1.2",
     "commander": "^13.1.0",
-    "gray-matter": "^4.0.3"
+    "gray-matter": "^4.0.3",
+    "node-pty": "^1.1.0"
   },
   "devDependencies": {
     "jest": "^30.2.0"

@@ -145,7 +145,7 @@ ufoo skills list   # ← 相同命令
 ### 数据格式兼容
 
 所有文件格式保持不变：
-- `.ufoo/bus/bus.json` - JSON 格式
+- `.ufoo/agent/all-agents.json` - JSON 格式
 - `.ufoo/bus/events/*.jsonl` - JSONL 格式
 - `.ufoo/bus/queues/*/pending.jsonl` - JSONL 格式
 - `.ufoo/bus/offsets/*.offset` - 纯文本
@@ -204,7 +204,7 @@ ufoo skills list   # ← 相同命令
 - 重复昵称
 
 **错误恢复测试：** 4/4 通过 ✅
-- bus.json 损坏
+- all-agents.json 损坏
 - 磁盘空间不足
 - 权限不足
 - 进程中断
@@ -249,7 +249,7 @@ program
 **查看日志：**
 ```bash
 # Daemon 日志
-tail -f .ufoo/bus/logs/daemon.log
+tail -f .ufoo/daemon/daemon.log
 
 # 事件日志
 cat .ufoo/bus/events/$(date +%Y-%m-%d).jsonl

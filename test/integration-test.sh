@@ -54,16 +54,16 @@ else
 fi
 
 info "验证目录结构"
-if [[ -d ".ufoo/bus" && -d ".ufoo/context" ]]; then
+if [[ -d ".ufoo/bus" && -d ".ufoo/context" && -d ".ufoo/agent" ]]; then
   pass "目录结构正确"
 else
   fail "目录结构不正确"
 fi
 
-if [[ -f ".ufoo/bus/bus.json" ]]; then
-  pass "bus.json 创建成功"
+if [[ -f ".ufoo/agent/all-agents.json" ]]; then
+  pass "all-agents.json 创建成功"
 else
-  fail "bus.json 未创建"
+  fail "all-agents.json 未创建"
 fi
 
 # 测试 2: EventBus 核心功能
@@ -78,7 +78,7 @@ fi
 
 info "验证订阅者注册"
 SUBSCRIBER="claude-code:$TEST_SESSION"
-if grep -q "$SUBSCRIBER" ".ufoo/bus/bus.json"; then
+if grep -q "$SUBSCRIBER" ".ufoo/agent/all-agents.json"; then
   pass "订阅者已注册"
 else
   fail "订阅者未注册"
@@ -130,7 +130,7 @@ else
 fi
 
 info "验证昵称已更新"
-if grep -q '"test-agent"' ".ufoo/bus/bus.json"; then
+if grep -q '"test-agent"' ".ufoo/agent/all-agents.json"; then
   pass "昵称已更新"
 else
   fail "昵称未更新"

@@ -17,18 +17,20 @@ describe('MessageManager', () => {
     fs.mkdirSync(eventsDir, { recursive: true });
 
     busData = {
-      subscribers: {
+      agents: {
         'claude-code:abc123': {
           agent_type: 'claude-code',
           nickname: 'architect',
           status: 'active',
-          last_seen: '2026-01-01T00:00:00.000Z',
+          pid: process.pid,
+          last_seen: new Date().toISOString(),
         },
         'codex:xyz789': {
           agent_type: 'codex',
           nickname: 'dev-lead',
           status: 'active',
-          last_seen: '2026-01-01T00:00:00.000Z',
+          pid: process.pid,
+          last_seen: new Date().toISOString(),
         },
         'codex:def456': {
           agent_type: 'codex',
@@ -135,7 +137,7 @@ describe('MessageManager', () => {
     });
 
     it('should handle multiple subscribers of same type', () => {
-      busData.subscribers['codex:new123'] = {
+      busData.agents['codex:new123'] = {
         agent_type: 'codex',
         nickname: 'codex-2',
         status: 'active',
@@ -189,7 +191,7 @@ describe('MessageManager', () => {
     });
 
     it('should send to multiple targets via agent type', async () => {
-      busData.subscribers['codex:new123'] = {
+      busData.agents['codex:new123'] = {
         agent_type: 'codex',
         nickname: 'codex-2',
         status: 'active',
@@ -405,7 +407,7 @@ describe('MessageManager', () => {
     });
 
     it('should return multiple candidates', async () => {
-      busData.subscribers['codex:new123'] = {
+      busData.agents['codex:new123'] = {
         agent_type: 'codex',
         nickname: 'codex-2',
         status: 'active',
@@ -485,7 +487,7 @@ describe('MessageManager', () => {
     });
 
     it('should handle subscribers with no nickname', async () => {
-      busData.subscribers['test:123'] = {
+      busData.agents['test:123'] = {
         agent_type: 'test',
         status: 'active',
       };

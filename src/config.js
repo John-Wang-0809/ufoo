@@ -2,15 +2,18 @@ const fs = require("fs");
 const path = require("path");
 
 const DEFAULT_CONFIG = {
-  launchMode: "terminal",
+  launchMode: "auto",
   agentProvider: "codex-cli",
   agentModel: "",
+  autoResume: false,
 };
 
 function normalizeLaunchMode(value) {
+  if (value === "auto") return "auto";
   if (value === "internal") return "internal";
   if (value === "tmux") return "tmux";
-  return "terminal";
+  if (value === "terminal") return "terminal";
+  return "auto";
 }
 
 function normalizeAgentProvider(value) {
@@ -29,6 +32,7 @@ function loadConfig(projectRoot) {
       ...raw,
       launchMode: normalizeLaunchMode(raw.launchMode),
       agentProvider: normalizeAgentProvider(raw.agentProvider),
+      autoResume: raw.autoResume !== false,
     };
   } catch {
     return { ...DEFAULT_CONFIG };
@@ -44,6 +48,7 @@ function saveConfig(projectRoot, config) {
   };
   merged.launchMode = normalizeLaunchMode(merged.launchMode);
   merged.agentProvider = normalizeAgentProvider(merged.agentProvider);
+  merged.autoResume = merged.autoResume !== false;
   fs.writeFileSync(target, JSON.stringify(merged, null, 2));
   return merged;
 }

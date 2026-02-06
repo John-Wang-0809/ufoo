@@ -12,7 +12,7 @@ class NicknameManager {
    * @returns {string|null} - 订阅者 ID 或 null
    */
   resolveNickname(nickname) {
-    const subscribers = this.busData.subscribers || {};
+    const subscribers = this.busData.agents || {};
     for (const [id, meta] of Object.entries(subscribers)) {
       if (meta.nickname === nickname) {
         return id;
@@ -28,7 +28,7 @@ class NicknameManager {
    * @returns {boolean} - 是否已存在
    */
   nicknameExists(nickname, excludeSubscriber = null) {
-    const subscribers = this.busData.subscribers || {};
+    const subscribers = this.busData.agents || {};
     for (const [id, meta] of Object.entries(subscribers)) {
       if (id !== excludeSubscriber && meta.nickname === nickname) {
         return true;
@@ -43,7 +43,7 @@ class NicknameManager {
    * @returns {string} - 自动生成的昵称（如 codex-1, claude-1）
    */
   generateAutoNickname(agentType) {
-    const subscribers = this.busData.subscribers || {};
+    const subscribers = this.busData.agents || {};
     const prefix = agentType === "claude-code" ? "claude" : agentType;
 
     // 找出所有相同前缀的昵称
@@ -65,7 +65,7 @@ class NicknameManager {
    * 获取订阅者的昵称
    */
   getNickname(subscriber) {
-    const meta = this.busData.subscribers?.[subscriber];
+    const meta = this.busData.agents?.[subscriber];
     return meta?.nickname || null;
   }
 
@@ -73,13 +73,13 @@ class NicknameManager {
    * 设置订阅者的昵称
    */
   setNickname(subscriber, nickname) {
-    if (!this.busData.subscribers) {
-      this.busData.subscribers = {};
+    if (!this.busData.agents) {
+      this.busData.agents = {};
     }
-    if (!this.busData.subscribers[subscriber]) {
-      this.busData.subscribers[subscriber] = {};
+    if (!this.busData.agents[subscriber]) {
+      this.busData.agents[subscriber] = {};
     }
-    this.busData.subscribers[subscriber].nickname = nickname;
+    this.busData.agents[subscriber].nickname = nickname;
   }
 }
 

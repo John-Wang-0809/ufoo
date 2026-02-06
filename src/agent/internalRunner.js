@@ -1,7 +1,7 @@
 const fs = require("fs");
 const path = require("path");
+const { getUfooPaths } = require("../ufoo/paths");
 const { spawnSync } = require("child_process");
-const { randomBytes } = require("crypto");
 const { runCliAgent } = require("./cliRunner");
 const { normalizeCliOutput } = require("./normalizeOutput");
 
@@ -9,76 +9,79 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function generateSessionId() {
-  return randomBytes(4).toString("hex");
-}
-
 function buildEnv(agentType, sessionId, publisher, nickname) {
   const env = { ...process.env };
-  if (agentType === "codex") {
-    env.CODEX_SESSION_ID = sessionId;
-    env.CLAUDE_SESSION_ID = "";
-  } else {
-    env.CLAUDE_SESSION_ID = sessionId;
-    env.CODEX_SESSION_ID = "";
-  }
   env.AI_BUS_PUBLISHER = publisher || env.AI_BUS_PUBLISHER || "";
   env.UFOO_NICKNAME = nickname || env.UFOO_NICKNAME || "";
   env.UFOO_PARENT_PID = String(process.pid);
   return env;
 }
 
-function joinBus(projectRoot, agentType, sessionId, nickname) {
-  const env = buildEnv(agentType, sessionId, "", nickname);
-  const args = ["bus", "join", sessionId, agentType === "codex" ? "codex" : "claude-code"];
-  if (nickname) args.push(nickname);
-  const res = spawnSync("ufoo", args, {
-    cwd: projectRoot,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  if (res.status !== 0) {
-    const err = (res.stderr || res.stdout || "").toString("utf8").trim();
-    throw new Error(err || "bus join failed");
+function parseSubscriberId() {
+  // Daemon 已经注册，直接使用
+  if (process.env.UFOO_SUBSCRIBER_ID) {
+    const parts = process.env.UFOO_SUBSCRIBER_ID.split(":");
+    if (parts.length === 2) {
+      return {
+        subscriber: process.env.UFOO_SUBSCRIBER_ID,
+        agentType: parts[0],
+        sessionId: parts[1],
+      };
+    }
   }
-  const out = (res.stdout || "").toString("utf8").trim().split(/\r?\n/);
-  const subscriber = out[out.length - 1];
-  return { subscriber, env };
+
+  throw new Error("Internal runner requires UFOO_SUBSCRIBER_ID set by daemon");
 }
 
 function safeSubscriber(subscriber) {
   return subscriber.replace(/:/g, "_");
 }
 
-function readQueue(queueFile) {
+function drainQueue(queueFile) {
   if (!fs.existsSync(queueFile)) return [];
+  const processingFile = `${queueFile}.processing.${process.pid}.${Date.now()}`;
+  let content = "";
+  let readOk = false;
   try {
-    const content = fs.readFileSync(queueFile, "utf8");
-    if (!content.trim()) return [];
-    return content.split(/\r?\n/).filter(Boolean);
+    fs.renameSync(queueFile, processingFile);
+    content = fs.readFileSync(processingFile, "utf8");
+    readOk = true;
   } catch {
+    try {
+      if (fs.existsSync(processingFile)) {
+        fs.renameSync(processingFile, queueFile);
+      }
+    } catch {
+      // ignore rollback errors
+    }
     return [];
+  } finally {
+    if (readOk) {
+      try {
+        if (fs.existsSync(processingFile)) {
+          fs.rmSync(processingFile, { force: true });
+        }
+      } catch {
+        // ignore cleanup errors
+      }
+    }
   }
+  if (!content.trim()) return [];
+  return content.split(/\r?\n/).filter(Boolean);
 }
 
-function truncateQueue(queueFile) {
-  try {
-    fs.truncateSync(queueFile, 0);
-  } catch {
-    // ignore
-  }
-}
-
-async function handleEvent(projectRoot, agentType, provider, model, subscriber, sessionId, nickname, evt, cliSessionState) {
+async function handleEvent(projectRoot, agentType, provider, model, subscriber, nickname, evt, cliSessionState) {
   if (!evt || !evt.data || !evt.data.message) return;
   const prompt = evt.data.message;
   const publisher = evt.publisher || "unknown";
+  const sandbox = "workspace-write";
 
   let res = await runCliAgent({
     provider,
     model,
     prompt,
     sessionId: cliSessionState.cliSessionId,
+    sandbox,
     cwd: projectRoot,
   });
 
@@ -95,6 +98,7 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
         model,
         prompt,
         sessionId: null, // Let runCliAgent generate new session
+        sandbox,
         cwd: projectRoot,
       });
     }
@@ -117,25 +121,17 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
 
   spawnSync("ufoo", ["bus", "send", publisher, reply], {
     cwd: projectRoot,
-    env: buildEnv(agentType, sessionId, subscriber, nickname),
+    env: { ...process.env, AI_BUS_PUBLISHER: subscriber },
     stdio: "ignore",
   });
 }
 
 async function runInternalRunner({ projectRoot, agentType = "codex" }) {
-  // 优先使用环境变量中预生成的 sessionId（daemon 父子进程监控模式）
-  const envSessionId = agentType === "codex"
-    ? process.env.CODEX_SESSION_ID
-    : process.env.CLAUDE_SESSION_ID;
-  const sessionId = envSessionId || generateSessionId();
-
+  // Internal runner 必须由 daemon 启动，UFOO_SUBSCRIBER_ID 应该已经设置
+  const { subscriber, agentType: parsedAgentType, sessionId } = parseSubscriberId();
   const nickname = process.env.UFOO_NICKNAME || "";
-  const { subscriber } = joinBus(projectRoot, agentType, sessionId, nickname);
-  if (!subscriber) {
-    throw new Error("Failed to join bus for internal runner");
-  }
 
-  const queueDir = path.join(projectRoot, ".ufoo", "bus", "queues", safeSubscriber(subscriber));
+  const queueDir = path.join(getUfooPaths(projectRoot).busQueuesDir, safeSubscriber(subscriber));
   const queueFile = path.join(queueDir, "pending.jsonl");
   const provider = agentType === "codex" ? "codex-cli" : "claude-cli";
   const model = process.env.UFOO_AGENT_MODEL || "";
@@ -143,7 +139,7 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
   // Session state management for CLI continuity
   // Use stable path based on nickname (if exists) or agent type, NOT subscriber ID
   const stableKey = nickname || `${agentType}-default`;
-  const sessionDir = path.join(projectRoot, ".ufoo", "agent", "sessions");
+  const sessionDir = path.join(getUfooPaths(projectRoot).agentDir, "sessions");
   fs.mkdirSync(sessionDir, { recursive: true });
   const stateFile = path.join(sessionDir, `${stableKey}.json`);
 
@@ -160,6 +156,8 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
 
   let running = true;
   let processing = false;
+  let lastHeartbeat = 0;
+  const HEARTBEAT_INTERVAL = 30000; // 30秒心跳间隔
 
   const stop = () => {
     running = false;
@@ -170,11 +168,32 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
 
   const cliSessionState = { cliSessionId, needsSave: false };
 
+  // 心跳更新函数
+  const updateHeartbeat = () => {
+    try {
+      spawnSync("ufoo", ["bus", "check", subscriber], {
+        cwd: projectRoot,
+        env: { ...process.env, UFOO_SUBSCRIBER_ID: subscriber },
+        stdio: "ignore",
+        timeout: 5000,
+      });
+    } catch {
+      // ignore heartbeat errors
+    }
+  };
+
   while (running) {
+    // 定期心跳更新
+    const now = Date.now();
+    if (now - lastHeartbeat > HEARTBEAT_INTERVAL) {
+      updateHeartbeat();
+      lastHeartbeat = now;
+    }
+
     if (!processing) {
       processing = true;
       try {
-        const lines = readQueue(queueFile);
+        const lines = drainQueue(queueFile);
         if (lines.length > 0) {
           const events = [];
           for (const line of lines) {
@@ -184,11 +203,10 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
               // ignore malformed line
             }
           }
-          truncateQueue(queueFile);
 
           for (const evt of events) {
             // eslint-disable-next-line no-await-in-loop
-            await handleEvent(projectRoot, agentType, provider, model, subscriber, sessionId, nickname, evt, cliSessionState);
+            await handleEvent(projectRoot, parsedAgentType, provider, model, subscriber, nickname, evt, cliSessionState);
           }
 
           // Persist CLI session state after processing (only if changed and for claude)
@@ -204,6 +222,10 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
               // ignore save errors
             }
           }
+
+          // 处理消息后更新心跳
+          updateHeartbeat();
+          lastHeartbeat = now;
         }
       } finally {
         processing = false;

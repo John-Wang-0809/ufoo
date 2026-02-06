@@ -45,6 +45,8 @@ ucodex    # 代替 'codex'
        └─────────────┘ └───────┘ └─────────────┘
 ```
 
+Bus 状态存放于 `.ufoo/agent/all-agents.json`（元数据）、`.ufoo/bus/*`（队列/事件）以及 `.ufoo/daemon/*`（bus daemon 运行态）。
+
 ## 命令列表
 
 | 命令 | 说明 |
@@ -53,6 +55,7 @@ ucodex    # 代替 'codex'
 | `ufoo status` | 显示 banner、未读消息和未处理决策 |
 | `ufoo daemon --start|--stop|--status` | 管理 ufoo 守护进程 |
 | `ufoo chat` | 启动 ufoo 交互界面（无参数默认进入） |
+| `ufoo resume [nickname]` | 恢复 agent 会话（可选昵称） |
 | `ufoo bus join` | 加入事件总线（uclaude/ucodex 自动完成）|
 | `ufoo bus send <id> <msg>` | 发送消息给Agent |
 | `ufoo bus check <id>` | 检查待处理消息 |

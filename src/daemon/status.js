@@ -1,9 +1,10 @@
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { getUfooPaths } = require("../ufoo/paths");
+const { isMetaActive } = require("../bus/utils");
 
 function readBus(projectRoot) {
-  const busPath = path.join(projectRoot, ".ufoo", "bus", "bus.json");
+  const busPath = getUfooPaths(projectRoot).agentsFile;
   try {
     return JSON.parse(fs.readFileSync(busPath, "utf8"));
   } catch {
@@ -31,7 +32,7 @@ function readDecisions(projectRoot) {
 }
 
 function readUnread(projectRoot) {
-  const queuesDir = path.join(projectRoot, ".ufoo", "bus", "queues");
+  const queuesDir = getUfooPaths(projectRoot).busQueuesDir;
   let total = 0;
   const perSubscriber = {};
   try {
@@ -59,55 +60,15 @@ function isHiddenSubscriber(id, meta) {
   return false;
 }
 
-function isPidAlive(pid) {
-  if (!pid || pid === 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getPidCommand(pid) {
-  if (!pid || pid === 0) return "";
-  try {
-    const res = spawnSync("ps", ["-p", String(pid), "-o", "comm="], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    if (res.status === 0) {
-      return (res.stdout || "").trim();
-    }
-  } catch {
-    // ignore
-  }
-  return "";
-}
-
-function isAgentPidAlive(pid) {
-  if (!isPidAlive(pid)) return false;
-  const cmd = getPidCommand(pid);
-  if (!cmd) return false;
-  return /(claude|codex|node)/i.test(cmd);
-}
-
 function buildStatus(projectRoot) {
   const bus = readBus(projectRoot);
   const decisions = readDecisions(projectRoot);
   const unread = readUnread(projectRoot);
-  const subscribers = bus ? Object.keys(bus.subscribers || {}) : [];
+  const subscribers = bus ? Object.keys(bus.agents || {}) : [];
 
-  // 过滤活跃的 subscribers（必须同时满足 status 和 pid 检查）
   const activeEntries = bus
-    ? Object.entries(bus.subscribers || {})
-        .filter(([, meta]) => {
-          // 必须是 active 状态
-          if (meta.status !== "active") return false;
-          // 如果有 pid，必须进程存活
-          if (meta.pid && !isAgentPidAlive(meta.pid)) return false;
-          return true;
-        })
+    ? Object.entries(bus.agents || {})
+        .filter(([, meta]) => isMetaActive(meta))
         .filter(([id, meta]) => !isHiddenSubscriber(id, meta))
         .map(([id, meta]) => ({ id, meta }))
     : [];
@@ -116,7 +77,9 @@ function buildStatus(projectRoot) {
     const nickname = meta?.nickname || "";
     const display = nickname ? nickname : id;
     const launch_mode = meta?.launch_mode || "unknown";
-    return { id, nickname, display, launch_mode };
+    const tmux_pane = meta?.tmux_pane || "";
+    const tty = meta?.tty || "";
+    return { id, nickname, display, launch_mode, tmux_pane, tty };
   });
 
   return {

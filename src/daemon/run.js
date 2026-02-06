@@ -9,6 +9,8 @@ function runDaemonCli(argv) {
   const provider = process.env.UFOO_AGENT_PROVIDER || config.agentProvider || "codex-cli";
   const model =
     process.env.UFOO_AGENT_MODEL || config.agentModel || (provider === "claude-cli" ? "opus" : "");
+  const resumeMode = process.env.UFOO_FORCE_RESUME === "1" ? "force" : "auto";
+  const launchMode = config.launchMode || "terminal";
 
   if (cmd === "start" || cmd === "--start") {
     if (isRunning(projectRoot)) return;
@@ -23,7 +25,7 @@ function runDaemonCli(argv) {
       child.unref();
       return;
     }
-    startDaemon({ projectRoot, provider, model });
+    startDaemon({ projectRoot, provider, model, resumeMode });
     return;
   }
   if (cmd === "stop" || cmd === "--stop") {
@@ -44,16 +46,21 @@ function runDaemonCli(argv) {
     // Start fresh daemon
     if (!process.env.UFOO_DAEMON_CHILD) {
       const { spawn } = require("child_process");
+      const forceResume = launchMode !== "terminal";
+      const childEnv = { ...process.env, UFOO_DAEMON_CHILD: "1" };
+      if (forceResume) childEnv.UFOO_FORCE_RESUME = "1";
       const child = spawn(process.execPath, [path.join(__dirname, "..", "..", "bin", "ufoo.js"), "daemon", "start"], {
         detached: true,
         stdio: "ignore",
-        env: { ...process.env, UFOO_DAEMON_CHILD: "1" },
+        env: childEnv,
         cwd: projectRoot,
       });
       child.unref();
       return;
     }
-    startDaemon({ projectRoot, provider, model });
+    // Skip auto-resume on restart in terminal mode to avoid reopening stale terminals.
+    const forceResume = launchMode !== "terminal";
+    startDaemon({ projectRoot, provider, model, resumeMode: forceResume ? "force" : "none" });
     return;
   }
   if (cmd === "status" || cmd === "--status") {

@@ -24,7 +24,7 @@ Use AskUserQuestion tool, provide multi-select, default all selected:
 Please select modules to enable:
 
 ☑ context - Shared context protocol (.ufoo/context/)
-☑ bus - Agent event bus (.ufoo/bus/)
+☑ bus - Agent event bus (.ufoo/bus/ + .ufoo/agent/)
 ☐ resources - UI/Icons resources (optional)
 ```
 
@@ -57,7 +57,7 @@ echo "Joined event bus: $SUBSCRIBER"
 
 Enabled modules:
   ✓ context → .ufoo/context/
-  ✓ bus → .ufoo/bus/
+  ✓ bus → .ufoo/bus/ + .ufoo/agent/
 
 My identity: claude-code:<session-id>
 
@@ -68,6 +68,6 @@ Next steps:
 
 ## Notes
 
-- If .ufoo/context or .ufoo/bus already exists, skip creation
+- If .ufoo/context, .ufoo/bus, or .ufoo/agent already exists, skip creation
 - After initialization, auto-join event bus (if bus enabled)
 - AGENTS.md will have protocol description block injected

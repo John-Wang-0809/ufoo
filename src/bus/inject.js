@@ -1,14 +1,27 @@
-const { spawn, spawnSync } = require("child_process");
+const { spawn } = require("child_process");
 const fs = require("fs");
+const net = require("net");
 const path = require("path");
-const { subscriberToSafeName, isValidTty, logError } = require("./utils");
+const { subscriberToSafeName, isValidTty } = require("./utils");
+
+const SHOULD_LOG_INJECT = process.env.UFOO_INJECT_DEBUG === "1";
+const logInject = (message) => {
+  if (SHOULD_LOG_INJECT) {
+    console.log(message);
+  }
+};
 
 /**
  * 命令注入器 - 将命令注入到终端
+ *
+ * 支持的方式：
+ * 1. PTY socket（直接写入，无需macOS权限）
+ * 2. tmux send-keys（无需权限）
  */
 class Injector {
-  constructor(busDir) {
+  constructor(busDir, agentsFile) {
     this.busDir = busDir;
+    this.agentsFile = agentsFile;
   }
 
   /**
@@ -20,15 +33,15 @@ class Injector {
   }
 
   /**
-   * 获取订阅者的 tmux pane ID（从 bus.json）
+   * 获取订阅者的 tmux pane ID（从 all-agents.json）
    */
   getTmuxPane(subscriber) {
-    const busFile = path.join(this.busDir, "bus.json");
-    if (!fs.existsSync(busFile)) return null;
+    const agentsFile = this.agentsFile;
+    if (!agentsFile || !fs.existsSync(agentsFile)) return null;
 
     try {
-      const busData = JSON.parse(fs.readFileSync(busFile, "utf8"));
-      return busData.subscribers?.[subscriber]?.tmux_pane || null;
+      const busData = JSON.parse(fs.readFileSync(agentsFile, "utf8"));
+      return busData.agents?.[subscriber]?.tmux_pane || null;
     } catch {
       return null;
     }
@@ -120,211 +133,152 @@ class Injector {
   }
 
   /**
-   * 发送 tmux 按键
+   * 发送 tmux 按键（先发文本，延迟后发 Enter）
    */
   sendTmuxKeys(paneId, command, resolve, reject) {
-    const proc = spawn("tmux", ["send-keys", "-t", paneId, command, "Enter"]);
+    const textProc = spawn("tmux", ["send-keys", "-t", paneId, command]);
     let stderr = "";
 
-    proc.stderr.on("data", (data) => {
+    textProc.stderr.on("data", (data) => {
       stderr += data.toString();
     });
 
-    proc.on("close", (code) => {
-      if (code === 0) {
-        resolve();
-      } else {
+    textProc.on("close", (code) => {
+      if (code !== 0) {
         reject(new Error(stderr || "tmux send-keys failed"));
+        return;
       }
+      // Delay before sending Enter — gives the target app time to process input
+      setTimeout(() => {
+        const enterProc = spawn("tmux", ["send-keys", "-t", paneId, "Enter"]);
+        enterProc.on("close", (enterCode) => {
+          if (enterCode === 0) resolve();
+          else reject(new Error("tmux send-keys Enter failed"));
+        });
+        enterProc.on("error", reject);
+      }, 150);
     });
 
-    proc.on("error", reject);
+    textProc.on("error", reject);
   }
 
   /**
-   * 使用 AppleScript 注入命令到 Terminal.app
+   * 获取订阅者的 inject socket 路径
    */
-  async injectTerminal(tty, command) {
-    const script = `
-tell application "Terminal"
-    set targetWindow to missing value
-    set targetTab to missing value
-
-    repeat with w in windows
-        repeat with t in tabs of w
-            try
-                if tty of t is "${tty}" then
-                    set targetWindow to w
-                    set targetTab to t
-                    exit repeat
-                end if
-            end try
-        end repeat
-        if targetTab is not missing value then exit repeat
-    end repeat
-
-    if targetTab is missing value then
-        error "No Terminal tab found with tty: ${tty}"
-    end if
-
-    -- Activate and bring to front
-    activate
-    set selected tab of targetWindow to targetTab
-    set index of targetWindow to 1
-end tell
-
--- Save current clipboard, set command, paste, restore
-set oldClipboard to the clipboard
-
-set the clipboard to "${command}"
-delay 0.1
-
-tell application "System Events"
-    tell process "Terminal"
-        -- Escape to ensure input mode
-        key code 53
-        delay 0.1
-        -- Cmd+V to paste
-        keystroke "v" using command down
-        delay 0.2
-        -- Enter (Return key)
-        keystroke return
-    end tell
-end tell
-
-delay 0.2
-set the clipboard to oldClipboard
-    `.trim();
-
-    return new Promise((resolve, reject) => {
-      const proc = spawn("osascript", ["-e", script]);
-      let stderr = "";
-
-      proc.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
-
-      proc.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(stderr || "AppleScript failed"));
-        }
-      });
-
-      proc.on("error", reject);
-    });
+  getInjectSockPath(subscriber) {
+    const safeName = subscriberToSafeName(subscriber);
+    return path.join(this.busDir, "queues", safeName, "inject.sock");
   }
 
   /**
-   * 检查 iTerm2 是否在运行
+   * 使用 PTY socket 直接注入命令（无需macOS权限）
    */
-  isItermRunning() {
-    try {
-      const res = spawnSync("osascript", ["-e", 'application "iTerm2" is running'], {
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      return res.status === 0 && String(res.stdout || "").trim() === "true";
-    } catch {
-      return false;
+  async injectPty(subscriber, command) {
+    const sockPath = this.getInjectSockPath(subscriber);
+
+    if (!fs.existsSync(sockPath)) {
+      throw new Error(`Inject socket not found: ${sockPath}`);
     }
-  }
-
-  /**
-   * 使用 iTerm2 注入命令
-   */
-  async injectIterm(tty, command) {
-    const script = `
-tell application "iTerm2"
-    activate
-    repeat with w in windows
-        repeat with t in tabs of w
-            repeat with s in sessions of t
-                try
-                    if tty of s is "${tty}" then
-                        select s
-                        write text "${command}" to s
-                        return
-                    end if
-                end try
-            end repeat
-        end repeat
-    end repeat
-    error "No iTerm2 session found with tty: ${tty}"
-end tell
-    `.trim();
 
     return new Promise((resolve, reject) => {
-      const proc = spawn("osascript", ["-e", script]);
-      let stderr = "";
-
-      proc.stderr.on("data", (data) => {
-        stderr += data.toString();
+      const client = net.createConnection(sockPath, () => {
+        // 发送inject请求
+        client.write(JSON.stringify({ type: "inject", command }) + "\n");
       });
 
-      proc.on("close", (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(stderr || "iTerm2 AppleScript failed"));
+      let buffer = "";
+      const timeout = setTimeout(() => {
+        client.destroy();
+        reject(new Error("PTY inject timeout"));
+      }, 5000);
+
+      client.on("data", (data) => {
+        buffer += data.toString("utf8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          clearTimeout(timeout);
+          try {
+            const res = JSON.parse(line);
+            client.end();
+            if (res.ok) {
+              resolve();
+            } else {
+              reject(new Error(res.error || "PTY inject failed"));
+            }
+          } catch (err) {
+            client.end();
+            reject(err);
+          }
+          return;
         }
       });
 
-      proc.on("error", reject);
+      client.on("error", (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      client.on("close", () => {
+        clearTimeout(timeout);
+      });
     });
   }
 
   /**
    * 注入命令到订阅者的终端
+   *
+   * 优先级：
+   * 1. PTY socket（直接写入，无需macOS权限）
+   * 2. tmux send-keys（无需权限）
    */
-  async inject(subscriber) {
+  async inject(subscriber, commandOverride = "") {
     // 确定注入命令（codex 用 "ubus"，claude-code 用 "/ubus"）
-    const command = subscriber.startsWith("codex:") ? "ubus" : "/ubus";
+    const command = commandOverride
+      ? String(commandOverride)
+      : (subscriber.startsWith("codex:") ? "ubus" : "/ubus");
 
-    // 读取 tty
-    const tty = this.readTty(subscriber);
-    if (!tty || !isValidTty(tty)) {
-      throw new Error(`No tty recorded for ${subscriber}`);
+    // 1. 优先尝试 PTY socket（无需任何macOS权限）
+    const injectSockPath = this.getInjectSockPath(subscriber);
+    if (fs.existsSync(injectSockPath)) {
+      try {
+        logInject(`[inject] Using PTY socket: ${injectSockPath}`);
+        await this.injectPty(subscriber, command);
+        logInject("[inject] PTY inject success");
+        return;
+      } catch (err) {
+        logInject(`[inject] PTY socket failed: ${err.message}, trying tmux`);
+      }
     }
 
-    console.log(`[inject] Looking for terminal with tty: ${tty}`);
+    // 读取 tty（tmux 需要）
+    const tty = this.readTty(subscriber);
 
-    // 优先尝试 tmux
+    // 2. 尝试 tmux（无需权限）
     const tmuxPane = this.getTmuxPane(subscriber);
     if (tmuxPane) {
       const paneExists = await this.checkTmuxPane(tmuxPane);
       if (paneExists) {
-        console.log(`[inject] Using tmux send-keys for pane: ${tmuxPane}`);
+        logInject(`[inject] Using tmux send-keys for pane: ${tmuxPane}`);
         await this.injectTmux(tmuxPane, command);
-        console.log("[inject] Done");
         return;
       }
+    }
+
+    // 尝试通过 tty 查找 tmux pane
+    if (tty && isValidTty(tty)) {
       const fallbackPane = await this.findTmuxPaneByTty(tty);
       if (fallbackPane) {
-        console.log(`[inject] Using tmux send-keys for pane: ${fallbackPane}`);
+        logInject(`[inject] Using tmux send-keys for pane: ${fallbackPane}`);
         await this.injectTmux(fallbackPane, command);
-        console.log("[inject] Done");
         return;
       }
     }
 
-    // iTerm2 fallback (if running)
-    if (this.isItermRunning()) {
-      try {
-        console.log("[inject] Using iTerm2 write text method");
-        await this.injectIterm(tty, command);
-        console.log("[inject] Done");
-        return;
-      } catch (err) {
-        console.log(`[inject] iTerm2 failed, falling back to Terminal.app: ${err.message}`);
-      }
-    }
-
-    // 回退到 Terminal.app
-    console.log("[inject] Using Terminal.app keystroke method");
-    await this.injectTerminal(tty, command);
-    console.log("[inject] Done");
+    // 没有可用的注入方式
+    throw new Error(`No inject method available for ${subscriber}. PTY socket or tmux required.`);
   }
 }
 

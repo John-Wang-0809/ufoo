@@ -6,7 +6,7 @@ describe('NicknameManager', () => {
 
   beforeEach(() => {
     busData = {
-      subscribers: {
+      agents: {
         'claude-code:abc123': { nickname: 'architect', status: 'active' },
         'claude-code:xyz789': { nickname: 'dev-lead', status: 'active' },
         'codex:def456': { nickname: 'codex-1', status: 'active' },
@@ -77,23 +77,23 @@ describe('NicknameManager', () => {
     });
 
     it('should start from 1 for empty list', () => {
-      const emptyManager = new NicknameManager({ subscribers: {} });
+      const emptyManager = new NicknameManager({ agents: {} });
       expect(emptyManager.generateAutoNickname('claude-code')).toBe('claude-1');
       expect(emptyManager.generateAutoNickname('codex')).toBe('codex-1');
     });
 
     it('should find next available number', () => {
       // Add more codex agents
-      busData.subscribers['codex:new1'] = { nickname: 'codex-3' };
-      busData.subscribers['codex:new2'] = { nickname: 'codex-5' };
-      busData.subscribers['codex:new3'] = { nickname: 'codex-10' };
+      busData.agents['codex:new1'] = { nickname: 'codex-3' };
+      busData.agents['codex:new2'] = { nickname: 'codex-5' };
+      busData.agents['codex:new3'] = { nickname: 'codex-10' };
 
       // Should generate codex-11 (max + 1)
       expect(manager.generateAutoNickname('codex')).toBe('codex-11');
     });
 
     it('should handle non-sequential nicknames', () => {
-      busData.subscribers['claude-code:new'] = { nickname: 'random-name' };
+      busData.agents['claude-code:new'] = { nickname: 'random-name' };
       // Should still generate claude-1 (ignores non-sequential)
       expect(manager.generateAutoNickname('claude-code')).toBe('claude-1');
     });
@@ -110,7 +110,7 @@ describe('NicknameManager', () => {
     });
 
     it('should return null for subscriber without nickname', () => {
-      busData.subscribers['test:123'] = { status: 'active' };
+      busData.agents['test:123'] = { status: 'active' };
       expect(manager.getNickname('test:123')).toBeNull();
     });
   });
@@ -118,18 +118,18 @@ describe('NicknameManager', () => {
   describe('setNickname', () => {
     it('should set nickname for existing subscriber', () => {
       manager.setNickname('claude-code:abc123', 'new-name');
-      expect(busData.subscribers['claude-code:abc123'].nickname).toBe('new-name');
+      expect(busData.agents['claude-code:abc123'].nickname).toBe('new-name');
     });
 
     it('should create subscriber entry if not exists', () => {
       manager.setNickname('new:123', 'test-name');
-      expect(busData.subscribers['new:123'].nickname).toBe('test-name');
+      expect(busData.agents['new:123'].nickname).toBe('test-name');
     });
 
     it('should initialize subscribers object if undefined', () => {
       const emptyManager = new NicknameManager({});
       emptyManager.setNickname('test:123', 'name');
-      expect(emptyManager.busData.subscribers['test:123'].nickname).toBe('name');
+      expect(emptyManager.busData.agents['test:123'].nickname).toBe('name');
     });
 
     it('should overwrite existing nickname', () => {
@@ -153,13 +153,13 @@ describe('NicknameManager', () => {
     });
 
     it('should handle special characters in nicknames', () => {
-      busData.subscribers['test:123'] = { nickname: 'name-with-dash' };
+      busData.agents['test:123'] = { nickname: 'name-with-dash' };
       expect(manager.resolveNickname('name-with-dash')).toBe('test:123');
       expect(manager.nicknameExists('name-with-dash')).toBe(true);
     });
 
     it('should handle numeric nicknames', () => {
-      busData.subscribers['test:123'] = { nickname: '12345' };
+      busData.agents['test:123'] = { nickname: '12345' };
       expect(manager.resolveNickname('12345')).toBe('test:123');
     });
   });

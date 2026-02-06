@@ -54,11 +54,12 @@ src/bus/
 
 ## 数据结构
 
-### bus.json
+### .ufoo/agent/all-agents.json
 ```json
 {
+  "schema_version": 1,
   "created_at": "2026-01-29T...",
-  "subscribers": {
+  "agents": {
     "claude-code:abc123": {
       "agent_type": "claude-code",
       "nickname": "architect",
@@ -127,7 +128,7 @@ async getNextSeq() {
 
 ```javascript
 async ensureUniqueNickname(nickname, excludeSubscriber) {
-  // 检查 bus.json 中是否已存在该昵称
+  // 检查 all-agents.json 中是否已存在该昵称
   // 返回是否唯一
 }
 ```

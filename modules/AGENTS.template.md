@@ -46,9 +46,19 @@ ufoo ctx decisions -n 1
 Key files in `.ufoo/context/`:
 - `decisions/` - Decision log (append-only)
 
-**Decision recording policy:**
-- **Must record**: evaluations, architecture, naming, trade-offs
-- Write decision **before replying** when applicable
+**Decision recording policy — "If it has information value, write it down":**
+
+Record a decision whenever your work produces knowledge that would be useful to your future self, other agents, or the user. The threshold is LOW — when in doubt, record it.
+
+- **Always record**: architectural choices, trade-off analysis, research findings, non-obvious gotchas, naming/convention changes, external API behavior discovered, performance observations, bug root causes
+- **Also record**: open questions you couldn't resolve, assumptions you made, approaches you considered and rejected (with reasons), edge cases noticed but not handled
+- **Write the decision BEFORE acting on it** — if your session dies, the knowledge survives
+- **Granularity**: A decision can be one sentence ("X doesn't support Y, use Z instead") or a multi-page analysis. Match the depth to the information value.
+
+```bash
+ufoo ctx decisions new "Short descriptive title"
+# Then edit the created file with Context/Decision/Implications
+```
 
 ---
 

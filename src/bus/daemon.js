@@ -8,18 +8,20 @@ const QueueManager = require("./queue");
  * Bus Daemon - 监控消息并自动注入命令
  */
 class BusDaemon {
-  constructor(busDir, interval = 2000) {
+  constructor(busDir, agentsFile, daemonDir, interval = 2000) {
     this.busDir = busDir;
+    this.agentsFile = agentsFile;
     this.interval = interval;
-    this.pidFile = path.join(busDir, ".daemon.pid");
-    this.logFile = path.join(busDir, "logs", "daemon.log");
-    this.countsDir = path.join(busDir, ".daemon-counts", `${process.pid}`);
+    this.daemonDir = daemonDir;
+    this.pidFile = path.join(this.daemonDir, "daemon.pid");
+    this.logFile = path.join(this.daemonDir, "daemon.log");
+    this.countsDir = path.join(this.daemonDir, "counts", `${process.pid}`);
     this.running = false;
     this.cleanupCounter = 0;
     this.cleanupInterval = 5; // 每 5 个周期清理一次
 
     this.queueManager = new QueueManager(busDir);
-    this.injector = new Injector(busDir);
+    this.injector = new Injector(busDir, agentsFile);
   }
 
   /**
@@ -56,6 +58,8 @@ class BusDaemon {
       console.log(`[daemon] Already running (pid=${pid})`);
       return;
     }
+    ensureDir(this.daemonDir);
+    ensureDir(path.join(this.daemonDir, "counts"));
 
     if (background) {
       // 后台模式：spawn 独立进程
@@ -256,19 +260,19 @@ class BusDaemon {
    * 清理死掉的 agent
    */
   async cleanupDeadAgents() {
-    const busFile = path.join(this.busDir, "bus.json");
-    if (!fs.existsSync(busFile)) {
+    const agentsFile = this.agentsFile;
+    if (!fs.existsSync(agentsFile)) {
       return;
     }
 
-    const busData = readJSON(busFile);
-    if (!busData || !busData.subscribers) {
+    const busData = readJSON(agentsFile);
+    if (!busData || !busData.agents) {
       return;
     }
 
     let changed = false;
 
-    for (const [subscriber, meta] of Object.entries(busData.subscribers)) {
+    for (const [subscriber, meta] of Object.entries(busData.agents)) {
       if (meta.status !== "active") {
         continue;
       }
@@ -296,7 +300,7 @@ class BusDaemon {
     }
 
     if (changed) {
-      writeJSON(busFile, busData);
+      writeJSON(agentsFile, busData);
     }
   }
 }

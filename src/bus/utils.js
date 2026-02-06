@@ -53,7 +53,9 @@ function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (err) {
+    // Sandbox can return EPERM for other processes even if they are alive.
+    if (err && err.code === "EPERM") return true;
     return false;
   }
 }
@@ -83,7 +85,7 @@ function getPidCommand(pid) {
 function isAgentPidAlive(pid) {
   if (!isPidAlive(pid)) return false;
   const cmd = getPidCommand(pid);
-  if (!cmd) return false;
+  if (!cmd) return true;
   return /(claude|codex|node)/i.test(cmd);
 }
 
@@ -95,6 +97,67 @@ function isValidTty(ttyPath) {
   if (ttyPath === "/dev/tty") return false;
   if (!ttyPath.startsWith("/dev/")) return false;
   return true;
+}
+
+function normalizeTty(ttyPath) {
+  if (!ttyPath) return "";
+  const trimmed = String(ttyPath).trim();
+  if (!trimmed || trimmed === "not a tty") return "";
+  if (trimmed === "/dev/tty") return "";
+  return trimmed;
+}
+
+function getCurrentTty() {
+  try {
+    const res = spawnSync("tty", {
+      stdio: [0, "pipe", "ignore"],
+      encoding: "utf8",
+    });
+    if (res && res.status === 0) {
+      const tty = normalizeTty(res.stdout || "");
+      return isValidTty(tty) ? tty : "";
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function parsePsLines(raw) {
+  const lines = String(raw || "").trim().split(/\r?\n/).filter(Boolean);
+  return lines.map((line) => {
+    const match = line.trim().match(/^(\d+)\s+(.+)$/);
+    if (!match) return null;
+    return { pid: parseInt(match[1], 10), comm: match[2].trim() };
+  }).filter(Boolean);
+}
+
+function getTtyProcessInfo(ttyPath) {
+  if (!isValidTty(ttyPath)) {
+    return { alive: false, idle: false, hasAgent: false, shellPid: 0, processes: [] };
+  }
+  const ttyName = ttyPath.replace("/dev/", "");
+  try {
+    const res = spawnSync("ps", ["-t", ttyName, "-o", "pid=,comm="], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    if (res.status !== 0) {
+      return { alive: false, idle: false, hasAgent: false, shellPid: 0, processes: [] };
+    }
+    const processes = parsePsLines(res.stdout || "");
+    if (processes.length === 0) {
+      return { alive: false, idle: false, hasAgent: false, shellPid: 0, processes: [] };
+    }
+    const shellNames = new Set(["zsh", "bash", "fish", "sh", "login"]);
+    const hasAgent = processes.some((p) => /(codex|claude|node)/i.test(p.comm));
+    const nonShell = processes.filter((p) => !shellNames.has(p.comm));
+    const idle = !hasAgent && nonShell.length === 0;
+    const shell = processes.find((p) => shellNames.has(p.comm));
+    return { alive: true, idle, hasAgent, shellPid: shell ? shell.pid : 0, processes };
+  } catch {
+    return { alive: false, idle: false, hasAgent: false, shellPid: 0, processes: [] };
+  }
 }
 
 /**
@@ -219,6 +282,50 @@ function logError(message) {
   console.error(`${colors.red}[bus]${colors.reset} ${message}`);
 }
 
+/**
+ * 统一的 agent 存活检测逻辑
+ * buildStatus() 和 getActiveSubscribers() 共用此函数
+ *
+ * 检测顺序：
+ * 1. status=inactive → 离线
+ * 2. PID 存活 → 在线
+ * 3. TTY 上有 agent 进程 → 在线
+ * 4. PID 存在但 dead（且 TTY 也没有 agent）→ 离线
+ * 5. 无 PID 时，last_seen 在 30s 内 → 在线（心跳兜底）
+ * 6. 其余 → 离线
+ */
+const HEARTBEAT_TIMEOUT_MS = 30 * 1000; // notifier 每 2s 心跳，15 次余量
+
+function isMetaActive(meta) {
+  if (!meta) return false;
+
+  // 1. 显式标记为 inactive
+  if (meta.status === "inactive") return false;
+
+  // 2. PID 存活（最可靠）
+  if (meta.pid && isAgentPidAlive(meta.pid)) return true;
+
+  // 3. TTY 上有 agent 进程
+  if (meta.tty) {
+    const ttyInfo = getTtyProcessInfo(meta.tty);
+    if (ttyInfo && ttyInfo.hasAgent) return true;
+  }
+
+  // 4. PID 存在但 dead（且 TTY 也没有 agent）→ 离线
+  if (meta.pid) return false;
+
+  // 5. 无 PID，用 last_seen 心跳超时兜底
+  if (meta.status === "active" && meta.last_seen) {
+    const age = Date.now() - new Date(meta.last_seen).getTime();
+    return age <= HEARTBEAT_TIMEOUT_MS;
+  }
+
+  // 6. status=active 但无任何信息
+  if (meta.status === "active") return true;
+
+  return false;
+}
+
 module.exports = {
   getTimestamp,
   getDate,
@@ -228,7 +335,11 @@ module.exports = {
   isPidAlive,
   getPidCommand,
   isAgentPidAlive,
+  isMetaActive,
+  HEARTBEAT_TIMEOUT_MS,
   isValidTty,
+  getCurrentTty,
+  getTtyProcessInfo,
   ensureDir,
   appendFileAtomic,
   writeFileAtomic,

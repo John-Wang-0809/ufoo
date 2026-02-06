@@ -1,6 +1,10 @@
 const fs = require("fs");
 const path = require("path");
 const Injector = require("../bus/inject");
+const { getUfooPaths } = require("../ufoo/paths");
+const { shakeTerminalByTty } = require("../bus/shake");
+const { isITerm2 } = require("../terminal/detect");
+const iterm2 = require("../terminal/iterm2");
 
 /**
  * Agent 消息通知监听器
@@ -15,19 +19,75 @@ class AgentNotifier {
     this.timer = null;
     this.stopped = false;
     this.autoTrigger = process.env.UFOO_AUTO_TRIGGER !== "0"; // 默认启用自动触发
+    this.lastNickname = "";
 
     // 计算队列文件路径
     const safeSub = subscriber.replace(/:/g, "_");
+    const paths = getUfooPaths(projectRoot);
     this.queueFile = path.join(
-      projectRoot,
-      ".ufoo/bus/queues",
+      paths.busQueuesDir,
       safeSub,
       "pending.jsonl"
     );
+    this.agentsFile = paths.agentsFile;
 
     // 初始化 injector
-    const busDir = path.join(projectRoot, ".ufoo", "bus");
-    this.injector = new Injector(busDir);
+    const busDir = paths.busDir;
+    this.injector = new Injector(busDir, paths.agentsFile);
+  }
+
+  /**
+   * 读取当前订阅者昵称
+   */
+  getNickname() {
+    try {
+      if (!this.agentsFile || !fs.existsSync(this.agentsFile)) return "";
+      const data = JSON.parse(fs.readFileSync(this.agentsFile, "utf8"));
+      const meta = data.agents && data.agents[this.subscriber];
+      return (meta && meta.nickname) ? String(meta.nickname) : "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
+   * 设置终端标题为昵称
+   * iTerm2: 同时设置 badge 和 cwd
+   */
+  setTitle(nickname) {
+    if (!nickname) return;
+    if (!process.stdout || !process.stdout.isTTY) return;
+    process.stdout.write(`\x1b]0;${nickname}\x07`);
+    if (isITerm2()) {
+      iterm2.setBadge(nickname);
+      iterm2.setCwd(this.projectRoot);
+    }
+  }
+
+  /**
+   * 检查昵称变化并更新标题
+   */
+  refreshTitle() {
+    const nickname = this.getNickname();
+    if (!nickname || nickname === this.lastNickname) return;
+    this.lastNickname = nickname;
+    this.setTitle(nickname);
+  }
+
+  /**
+   * 更新心跳时间戳（last_seen）
+   */
+  updateHeartbeat() {
+    try {
+      if (!this.agentsFile || !fs.existsSync(this.agentsFile)) return;
+      const data = JSON.parse(fs.readFileSync(this.agentsFile, "utf8"));
+      if (data.agents && data.agents[this.subscriber]) {
+        data.agents[this.subscriber].last_seen = new Date().toISOString();
+        fs.writeFileSync(this.agentsFile, JSON.stringify(data, null, 2));
+      }
+    } catch {
+      // 心跳更新失败时静默忽略
+    }
   }
 
   /**
@@ -46,18 +106,16 @@ class AgentNotifier {
 
   /**
    * 发送终端通知
+   * iTerm2: 使用 OSC 9 原生通知
    */
   notify(newCount) {
-    // 终端 bell
-    process.stdout.write("\x07");
-
-    // 终端标题栏显示未读数 - 使用小铃铛emoji
-    const totalCount = this.getMessageCount();
-    if (totalCount > 0) {
-      process.stdout.write(`\x1b]0;🔔(${totalCount})\x07`);
-    } else {
-      // 清除标题栏的未读提示
-      process.stdout.write(`\x1b]0;\x07`);
+    if (isITerm2()) {
+      const nick = this.lastNickname || this.subscriber;
+      iterm2.notify(`${nick}: ${newCount} new message(s)`);
+    }
+    const tty = this.injector.readTty(this.subscriber);
+    if (tty) {
+      shakeTerminalByTty(tty);
     }
   }
 
@@ -95,6 +153,8 @@ class AgentNotifier {
     }
 
     this.lastCount = currentCount;
+    this.refreshTitle();
+    this.updateHeartbeat();
   }
 
   /**
@@ -103,6 +163,10 @@ class AgentNotifier {
   start() {
     // 获取初始计数
     this.lastCount = this.getMessageCount();
+    this.lastNickname = this.getNickname();
+    if (this.lastNickname) {
+      this.setTitle(this.lastNickname);
+    }
 
     // 启动轮询
     this.timer = setInterval(() => {

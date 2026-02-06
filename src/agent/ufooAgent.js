@@ -3,9 +3,10 @@ const path = require("path");
 const { runCliAgent } = require("./cliRunner");
 const { normalizeCliOutput } = require("./normalizeOutput");
 const { buildStatus } = require("../daemon/status");
+const { getUfooPaths } = require("../ufoo/paths");
 
 function loadSessionState(projectRoot) {
-  const dir = path.join(projectRoot, ".ufoo", "agent");
+  const dir = getUfooPaths(projectRoot).agentDir;
   const file = path.join(dir, "ufoo-agent.json");
   try {
     const data = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -16,19 +17,19 @@ function loadSessionState(projectRoot) {
 }
 
 function saveSessionState(projectRoot, state) {
-  const dir = path.join(projectRoot, ".ufoo", "agent");
+  const dir = getUfooPaths(projectRoot).agentDir;
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, "ufoo-agent.json"), JSON.stringify(state, null, 2));
 }
 
 function loadBusSummary(projectRoot, maxLines = 20) {
   // Use daemon's buildStatus as the single source of truth
-  let subscribers = [];
+  let agents = [];
   let nicknames = {};
   try {
     const status = buildStatus(projectRoot);
     const activeMeta = status.active_meta || [];
-    subscribers = activeMeta.map((item) => {
+    agents = activeMeta.map((item) => {
       const nickname = item.nickname || "";
       if (nickname) {
         nicknames[nickname] = item.id;
@@ -43,11 +44,11 @@ function loadBusSummary(projectRoot, maxLines = 20) {
       };
     });
   } catch {
-    subscribers = [];
+    agents = [];
     nicknames = {};
   }
 
-  const eventsDir = path.join(projectRoot, ".ufoo", "bus", "events");
+  const eventsDir = getUfooPaths(projectRoot).busEventsDir;
   let recent = [];
   try {
     const files = fs
@@ -67,11 +68,11 @@ function loadBusSummary(projectRoot, maxLines = 20) {
     recent = [];
   }
 
-  return { subscribers, nicknames, recent };
+  return { agents, nicknames, recent };
 }
 
 function buildSystemPrompt(context) {
-  const hasAgents = context.subscribers && context.subscribers.length > 0;
+  const hasAgents = context.agents && context.agents.length > 0;
   const agentGuidance = hasAgents
     ? ""
     : "\n- IMPORTANT: No agents are currently online. To execute tasks, you MUST launch agents using ops.launch.\n- Example: {\"reply\":\"Creating agent\",\"ops\":[{\"action\":\"launch\",\"agent\":\"claude\",\"count\":1}]}";
@@ -83,13 +84,14 @@ function buildSystemPrompt(context) {
     "{",
     '  "reply": "string",',
     '  "dispatch": [{"target":"broadcast|<agent-id>|<nickname>","message":"string"}],',
-    '  "ops": [{"action":"launch|close","agent":"codex|claude","count":1,"agent_id":"id","nickname":"optional"}],',
+    '  "ops": [{"action":"launch|close|rename","agent":"codex|claude","count":1,"agent_id":"id","nickname":"optional"}],',
     '  "disambiguate": {"prompt":"string","candidates":[{"agent_id":"id","reason":"string"}]}',
     "}",
     "Rules:",
     "- target must be 'broadcast', concrete agent-id, or a known nickname",
     "- If multiple possible agents, use disambiguate with candidates and no dispatch.",
     "- If user specifies a nickname for a new agent, include ops.launch with nickname so daemon can rename.",
+    "- If user requests rename, use ops.rename with agent_id and nickname (do NOT launch).",
     "- If no action needed, return reply with empty dispatch/ops.",
     agentGuidance,
     "",
@@ -99,7 +101,7 @@ function buildSystemPrompt(context) {
 }
 
 function loadHistory(projectRoot, maxTurns = 6) {
-  const file = path.join(projectRoot, ".ufoo", "agent", "ufoo-agent.history.jsonl");
+  const file = path.join(getUfooPaths(projectRoot).agentDir, "ufoo-agent.history.jsonl");
   try {
     const lines = fs.readFileSync(file, "utf8").trim().split(/\r?\n/).filter(Boolean);
     const items = lines.map((l) => JSON.parse(l));
@@ -110,7 +112,7 @@ function loadHistory(projectRoot, maxTurns = 6) {
 }
 
 function appendHistory(projectRoot, item) {
-  const dir = path.join(projectRoot, ".ufoo", "agent");
+  const dir = getUfooPaths(projectRoot).agentDir;
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "ufoo-agent.history.jsonl");
   fs.appendFileSync(file, `${JSON.stringify(item)}\n`);
@@ -193,7 +195,7 @@ async function runUfooAgent({ projectRoot, prompt, provider, model }) {
   const fallbackNickname = extractNickname(prompt);
   if (fallbackNickname && payload && Array.isArray(payload.ops)) {
     for (const op of payload.ops) {
-      if (op && op.action === "launch" && !op.nickname) {
+      if (op && (op.action === "launch" || op.action === "rename") && !op.nickname) {
         op.nickname = fallbackNickname;
         break;
       }

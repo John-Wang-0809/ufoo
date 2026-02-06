@@ -7,7 +7,7 @@ describe('SubscriberManager', () => {
 
   beforeEach(() => {
     busData = {
-      subscribers: {},
+      agents: {},
     };
 
     mockQueueManager = {
@@ -24,15 +24,15 @@ describe('SubscriberManager', () => {
 
       expect(result.subscriber).toBe('claude-code:abc123');
       expect(result.nickname).toBe('claude-1');
-      expect(busData.subscribers['claude-code:abc123']).toBeDefined();
-      expect(busData.subscribers['claude-code:abc123'].status).toBe('active');
+      expect(busData.agents['claude-code:abc123']).toBeDefined();
+      expect(busData.agents['claude-code:abc123'].status).toBe('active');
     });
 
     it('should join with custom nickname', async () => {
       const result = await manager.join('xyz789', 'codex', 'my-agent');
 
       expect(result.nickname).toBe('my-agent');
-      expect(busData.subscribers['codex:xyz789'].nickname).toBe('my-agent');
+      expect(busData.agents['codex:xyz789'].nickname).toBe('my-agent');
     });
 
     it('should throw error for duplicate nickname', async () => {
@@ -48,13 +48,13 @@ describe('SubscriberManager', () => {
       await manager.join('abc123', 'claude-code', 'architect');
 
       // Mark as inactive (simulating leave)
-      busData.subscribers['claude-code:abc123'].status = 'inactive';
+      busData.agents['claude-code:abc123'].status = 'inactive';
 
       // Rejoin without nickname
       const result = await manager.join('abc123', 'claude-code');
 
       expect(result.nickname).toBe('architect');
-      expect(busData.subscribers['claude-code:abc123'].nickname).toBe('architect');
+      expect(busData.agents['claude-code:abc123'].nickname).toBe('architect');
     });
 
     it('should create queue directory', async () => {
@@ -86,32 +86,32 @@ describe('SubscriberManager', () => {
     it('should set joined_at timestamp on first join', async () => {
       await manager.join('abc123', 'claude-code');
 
-      const meta = busData.subscribers['claude-code:abc123'];
+      const meta = busData.agents['claude-code:abc123'];
       expect(meta.joined_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     });
 
     it('should preserve joined_at on rejoin', async () => {
       await manager.join('abc123', 'claude-code');
-      const originalJoinedAt = busData.subscribers['claude-code:abc123'].joined_at;
+      const originalJoinedAt = busData.agents['claude-code:abc123'].joined_at;
 
       // Wait a bit and rejoin
       await new Promise(resolve => setTimeout(resolve, 10));
       await manager.join('abc123', 'claude-code');
 
-      expect(busData.subscribers['claude-code:abc123'].joined_at).toBe(originalJoinedAt);
+      expect(busData.agents['claude-code:abc123'].joined_at).toBe(originalJoinedAt);
     });
 
     it('should update last_seen on join', async () => {
       await manager.join('abc123', 'claude-code');
 
-      const meta = busData.subscribers['claude-code:abc123'];
+      const meta = busData.agents['claude-code:abc123'];
       expect(meta.last_seen).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     });
 
     it('should store process PID', async () => {
       await manager.join('abc123', 'claude-code');
 
-      expect(busData.subscribers['claude-code:abc123'].pid).toBe(process.pid);
+      expect(busData.agents['claude-code:abc123'].pid).toBe(process.pid);
     });
 
     it('should initialize subscribers object if not exists', async () => {
@@ -120,8 +120,8 @@ describe('SubscriberManager', () => {
 
       await emptyManager.join('abc123', 'claude-code');
 
-      expect(emptyBusData.subscribers).toBeDefined();
-      expect(emptyBusData.subscribers['claude-code:abc123']).toBeDefined();
+      expect(emptyBusData.agents).toBeDefined();
+      expect(emptyBusData.agents['claude-code:abc123']).toBeDefined();
     });
 
     it('should generate sequential nicknames for multiple joins', async () => {
@@ -142,17 +142,17 @@ describe('SubscriberManager', () => {
       const result = await manager.leave('claude-code:abc123');
 
       expect(result).toBe(true);
-      expect(busData.subscribers['claude-code:abc123'].status).toBe('inactive');
+      expect(busData.agents['claude-code:abc123'].status).toBe('inactive');
     });
 
     it('should update last_seen on leave', async () => {
       await manager.join('abc123', 'claude-code');
-      const beforeLastSeen = busData.subscribers['claude-code:abc123'].last_seen;
+      const beforeLastSeen = busData.agents['claude-code:abc123'].last_seen;
 
       await new Promise(resolve => setTimeout(resolve, 10));
       await manager.leave('claude-code:abc123');
 
-      const afterLastSeen = busData.subscribers['claude-code:abc123'].last_seen;
+      const afterLastSeen = busData.agents['claude-code:abc123'].last_seen;
       expect(afterLastSeen).not.toBe(beforeLastSeen);
     });
 
@@ -176,7 +176,7 @@ describe('SubscriberManager', () => {
       const result = await manager.join('abc123', 'claude-code');
 
       expect(result.nickname).toBe('architect');
-      expect(busData.subscribers['claude-code:abc123'].status).toBe('active');
+      expect(busData.agents['claude-code:abc123'].status).toBe('active');
     });
   });
 
@@ -188,7 +188,7 @@ describe('SubscriberManager', () => {
 
       expect(result.oldNickname).toBe('old-name');
       expect(result.newNickname).toBe('new-name');
-      expect(busData.subscribers['claude-code:abc123'].nickname).toBe('new-name');
+      expect(busData.agents['claude-code:abc123'].nickname).toBe('new-name');
     });
 
     it('should throw error for non-existent subscriber', async () => {
@@ -212,7 +212,7 @@ describe('SubscriberManager', () => {
       const result = await manager.rename('claude-code:abc123', 'my-name');
 
       expect(result.newNickname).toBe('my-name');
-      expect(busData.subscribers['claude-code:abc123'].nickname).toBe('my-name');
+      expect(busData.agents['claude-code:abc123'].nickname).toBe('my-name');
     });
   });
 
@@ -238,7 +238,7 @@ describe('SubscriberManager', () => {
       await manager.join('abc2', 'codex');
 
       // Mock dead PID
-      busData.subscribers['claude-code:abc1'].pid = 999999;
+      busData.agents['claude-code:abc1'].pid = 999999;
 
       const active = manager.getActiveSubscribers();
 
@@ -248,7 +248,7 @@ describe('SubscriberManager', () => {
 
     it('should include subscribers without PID', async () => {
       await manager.join('abc1', 'claude-code');
-      delete busData.subscribers['claude-code:abc1'].pid;
+      delete busData.agents['claude-code:abc1'].pid;
 
       const active = manager.getActiveSubscribers();
 
@@ -298,12 +298,12 @@ describe('SubscriberManager', () => {
   describe('updateLastSeen', () => {
     it('should update last_seen timestamp', async () => {
       await manager.join('abc123', 'claude-code');
-      const beforeLastSeen = busData.subscribers['claude-code:abc123'].last_seen;
+      const beforeLastSeen = busData.agents['claude-code:abc123'].last_seen;
 
       await new Promise(resolve => setTimeout(resolve, 10));
       manager.updateLastSeen('claude-code:abc123');
 
-      const afterLastSeen = busData.subscribers['claude-code:abc123'].last_seen;
+      const afterLastSeen = busData.agents['claude-code:abc123'].last_seen;
       expect(afterLastSeen).not.toBe(beforeLastSeen);
     });
 
@@ -323,34 +323,34 @@ describe('SubscriberManager', () => {
       await manager.join('abc2', 'codex');
 
       // Mock dead PID
-      busData.subscribers['claude-code:abc1'].pid = 999999;
+      busData.agents['claude-code:abc1'].pid = 999999;
 
       manager.cleanupInactive();
 
-      expect(busData.subscribers['claude-code:abc1'].status).toBe('inactive');
-      expect(busData.subscribers['codex:abc2'].status).toBe('active');
+      expect(busData.agents['claude-code:abc1'].status).toBe('inactive');
+      expect(busData.agents['codex:abc2'].status).toBe('active');
     });
 
     it('should not mark subscribers without PID as inactive', async () => {
       await manager.join('abc1', 'claude-code');
-      delete busData.subscribers['claude-code:abc1'].pid;
+      delete busData.agents['claude-code:abc1'].pid;
 
       manager.cleanupInactive();
 
-      expect(busData.subscribers['claude-code:abc1'].status).toBe('active');
+      expect(busData.agents['claude-code:abc1'].status).toBe('active');
     });
 
     it('should not affect already inactive subscribers', async () => {
       await manager.join('abc1', 'claude-code');
       await manager.leave('claude-code:abc1');
 
-      const lastSeenBefore = busData.subscribers['claude-code:abc1'].last_seen;
+      const lastSeenBefore = busData.agents['claude-code:abc1'].last_seen;
 
       await new Promise(resolve => setTimeout(resolve, 10));
       manager.cleanupInactive();
 
-      expect(busData.subscribers['claude-code:abc1'].status).toBe('inactive');
-      expect(busData.subscribers['claude-code:abc1'].last_seen).toBe(lastSeenBefore);
+      expect(busData.agents['claude-code:abc1'].status).toBe('inactive');
+      expect(busData.agents['claude-code:abc1'].last_seen).toBe(lastSeenBefore);
     });
 
     it('should do nothing if no subscribers', () => {
@@ -359,14 +359,14 @@ describe('SubscriberManager', () => {
 
     it('should update last_seen when marking inactive', async () => {
       await manager.join('abc1', 'claude-code');
-      const lastSeenBefore = busData.subscribers['claude-code:abc1'].last_seen;
+      const lastSeenBefore = busData.agents['claude-code:abc1'].last_seen;
 
-      busData.subscribers['claude-code:abc1'].pid = 999999;
+      busData.agents['claude-code:abc1'].pid = 999999;
 
       await new Promise(resolve => setTimeout(resolve, 10));
       manager.cleanupInactive();
 
-      expect(busData.subscribers['claude-code:abc1'].last_seen).not.toBe(lastSeenBefore);
+      expect(busData.agents['claude-code:abc1'].last_seen).not.toBe(lastSeenBefore);
     });
   });
 
