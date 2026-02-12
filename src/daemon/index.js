@@ -11,6 +11,9 @@ const { getUfooPaths } = require("../ufoo/paths");
 const { scheduleProviderSessionProbe, loadProviderSessionCache } = require("./providerSessions");
 const { loadConfig } = require("../config");
 
+let providerSessions = null;
+let probeHandles = new Map();
+
 /**
  * Agent 进程管理器 - daemon 作为父进程监控所有 internal agents
  */
@@ -241,6 +244,17 @@ function checkAndCleanupNickname(projectRoot, nickname) {
   }
 }
 
+function resolveSubscriberNickname(projectRoot, subscriberId) {
+  if (!subscriberId) return "";
+  try {
+    const busPath = getUfooPaths(projectRoot).agentsFile;
+    const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
+    return bus.agents?.[subscriberId]?.nickname || "";
+  } catch {
+    return "";
+  }
+}
+
 async function handleOps(projectRoot, ops = [], processManager = null) {
   const results = [];
   for (const op of ops) {
@@ -279,20 +293,28 @@ async function handleOps(projectRoot, ops = [], processManager = null) {
         }
         // eslint-disable-next-line no-await-in-loop
         const launchResult = await launchAgent(projectRoot, agent, count, nickname, processManager);
-        if (launchResult.subscriberIds && launchResult.subscriberIds.length > 0) {
+        if (launchResult.mode === "internal" && launchResult.subscriberIds && launchResult.subscriberIds.length > 0) {
           for (const subscriberId of launchResult.subscriberIds) {
-            scheduleProviderSessionProbe({
+            const resolvedNickname = resolveSubscriberNickname(projectRoot, subscriberId) || nickname;
+            const probeHandle = scheduleProviderSessionProbe({
               projectRoot,
               subscriberId,
               agentType: agent === "codex" ? "codex" : "claude-code",
+              nickname: resolvedNickname,
               onResolved: (id, resolved) => {
-                providerSessions.set(id, {
-                  sessionId: resolved.sessionId,
-                  source: resolved.source || "",
-                  updated_at: new Date().toISOString(),
-                });
+                if (providerSessions) {
+                  providerSessions.set(id, {
+                    sessionId: resolved.sessionId,
+                    source: resolved.source || "",
+                    updated_at: new Date().toISOString(),
+                  });
+                }
+                probeHandles.delete(id);
               },
             });
+            if (probeHandle) {
+              probeHandles.set(subscriberId, probeHandle);
+            }
           }
         }
         results.push({
@@ -546,20 +568,46 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
   } catch (err) {
     if (err.code === "EEXIST") {
       // 锁文件已存在，检查是否仍有效
+      let existingPid = null;
       try {
-        const existingPid = parseInt(fs.readFileSync(lockFile, "utf8").trim(), 10);
-        // 检查该进程是否还活着
+        const raw = fs.readFileSync(lockFile, "utf8").trim();
+        const parsed = parseInt(raw, 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          existingPid = parsed;
+        }
+      } catch {
+        // ignore malformed lock file and treat as stale
+      }
+
+      let lockHeld = false;
+      if (existingPid) {
         try {
           process.kill(existingPid, 0);
-          throw new Error(`Daemon already running with PID ${existingPid}`);
-        } catch {
-          // 进程已死，清理旧锁
-          fs.unlinkSync(lockFile);
-          lockFd = fs.openSync(lockFile, "wx");
-          fs.writeSync(lockFd, `${process.pid}\n`);
+          lockHeld = true;
+        } catch (killErr) {
+          // Sandbox/permission constrained environments can throw EPERM
+          // even when the process is alive.
+          if (killErr && killErr.code === "EPERM") {
+            lockHeld = true;
+          }
         }
-      } catch (readErr) {
-        throw new Error(`Failed to acquire daemon lock: ${readErr.message}`);
+      }
+
+      if (lockHeld) {
+        throw new Error(`Daemon already running with PID ${existingPid}`);
+      }
+
+      // 进程已死或锁文件损坏，清理旧锁后重试
+      try {
+        fs.unlinkSync(lockFile);
+      } catch (unlinkErr) {
+        throw new Error(`Failed to remove stale daemon lock: ${unlinkErr.message}`);
+      }
+      try {
+        lockFd = fs.openSync(lockFile, "wx");
+        fs.writeSync(lockFd, `${process.pid}\n`);
+      } catch (retryErr) {
+        throw new Error(`Failed to acquire daemon lock: ${retryErr.message}`);
       }
     } else {
       throw err;
@@ -579,7 +627,8 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
   log(`Process manager initialized`);
 
   // Provider session cache (in-memory)
-  const providerSessions = loadProviderSessionCache(projectRoot);
+  providerSessions = loadProviderSessionCache(projectRoot);
+  probeHandles = new Map();
 
   const sockets = new Set();
   const sendToSockets = (payload) => {
@@ -599,6 +648,33 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
   }, (status) => {
     sendToSockets({ type: "status", data: status });
   }, () => sockets.size > 0);
+
+  // 定期检测状态变化并推送（仅当有变化时）
+  let lastActiveJson = "";
+  const statusSyncInterval = setInterval(() => {
+    if (sockets.size === 0) return; // 没有客户端连接时跳过
+    try {
+      // 先清理不活跃的订阅者，确保状态准确
+      const syncBus = new EventBus(projectRoot);
+      syncBus.ensureBus();
+      syncBus.loadBusData();
+      syncBus.subscriberManager.cleanupInactive();
+      syncBus.saveBusData();
+    } catch {
+      // ignore cleanup errors
+    }
+    try {
+      const status = buildStatus(projectRoot);
+      const currentActiveJson = JSON.stringify(status.active);
+      if (currentActiveJson !== lastActiveJson) {
+        lastActiveJson = currentActiveJson;
+        sendToSockets({ type: "status", data: status });
+        log(`status sync: active agents changed to ${status.active.length}`);
+      }
+    } catch {
+      // ignore status check errors
+    }
+  }, 3000);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -688,6 +764,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
               const publisher = busBridge.getSubscriber() || "ufoo-agent";
               const eventBus = new EventBus(projectRoot);
               await eventBus.send(target, message, publisher);
+              busBridge.markPending(target);
               log(`bus_send target=${target} publisher=${publisher}`);
               socket.write(
                 `${JSON.stringify({
@@ -700,6 +777,42 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
                 `${JSON.stringify({
                   type: "error",
                   error: err.message || "bus_send failed",
+                })}\n`,
+              );
+            }
+            continue;
+          }
+          if (req.type === "close_agent") {
+            const { agent_id } = req;
+            if (!agent_id) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: "close_agent requires agent_id",
+                })}\n`,
+              );
+              continue;
+            }
+            try {
+              const op = { action: "close", agent_id };
+              const opsResults = await handleOps(projectRoot, [op], processManager);
+              const closeResult = opsResults.find((r) => r.action === "close");
+              const ok = closeResult ? closeResult.ok !== false : true;
+              const reply = ok
+                ? `Closed ${agent_id}`
+                : `Close failed: ${closeResult?.error || "unknown error"}`;
+              socket.write(
+                `${JSON.stringify({
+                  type: "response",
+                  data: { reply, dispatch: [], ops: [op] },
+                  opsResults,
+                })}\n`,
+              );
+            } catch (err) {
+              socket.write(
+                `${JSON.stringify({
+                  type: "error",
+                  error: err.message || "close_agent failed",
                 })}\n`,
               );
             }
@@ -794,8 +907,27 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
             }
             try {
               const crypto = require("crypto");
-              const sessionId = crypto.randomBytes(4).toString("hex");
-              const subscriberId = `${agentType}:${sessionId}`;
+              const requestedReuse = req.reuseSession && typeof req.reuseSession === "object"
+                ? req.reuseSession
+                : null;
+              const reuseSessionId = typeof requestedReuse?.sessionId === "string"
+                ? requestedReuse.sessionId.trim()
+                : "";
+              const reuseSubscriberId = typeof requestedReuse?.subscriberId === "string"
+                ? requestedReuse.subscriberId.trim()
+                : "";
+              const reuseProviderSessionId = typeof requestedReuse?.providerSessionId === "string"
+                ? requestedReuse.providerSessionId.trim()
+                : "";
+
+              let sessionId = crypto.randomBytes(4).toString("hex");
+              let subscriberId = `${agentType}:${sessionId}`;
+              if (reuseSessionId && reuseSubscriberId === `${agentType}:${reuseSessionId}`) {
+                sessionId = reuseSessionId;
+                subscriberId = reuseSubscriberId;
+              } else if (reuseSessionId || reuseSubscriberId) {
+                log(`register_agent ignored invalid reuseSession for ${agentType}`);
+              }
 
               // Daemon registers the agent in bus
               const eventBus = new EventBus(projectRoot);
@@ -810,6 +942,9 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
                 launchMode: launchMode || "",
                 tmuxPane: tmuxPane || "",
               };
+              if (reuseProviderSessionId) {
+                joinOptions.providerSessionId = reuseProviderSessionId;
+              }
               if (Object.prototype.hasOwnProperty.call(req, "tty")) {
                 const ttyValue = typeof tty === "string" ? tty.trim() : "";
                 joinOptions.tty = ttyValue;
@@ -823,18 +958,25 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
               const finalNickname = eventBus.busData?.agents?.[subscriberId]?.nickname || "";
               log(`register_agent type=${agentType} nickname=${finalNickname || "(none)"} id=${subscriberId}`);
               if (!skipProbe) {
-                scheduleProviderSessionProbe({
+                const probeHandle = scheduleProviderSessionProbe({
                   projectRoot,
                   subscriberId,
                   agentType,
+                  nickname: finalNickname,
                   onResolved: (id, resolved) => {
-                    providerSessions.set(id, {
-                      sessionId: resolved.sessionId,
-                      source: resolved.source || "",
-                      updated_at: new Date().toISOString(),
-                    });
+                    if (providerSessions) {
+                      providerSessions.set(id, {
+                        sessionId: resolved.sessionId,
+                        source: resolved.source || "",
+                        updated_at: new Date().toISOString(),
+                      });
+                    }
+                    probeHandles.delete(id);
                   },
                 });
+                if (probeHandle) {
+                  probeHandles.set(subscriberId, probeHandle);
+                }
               }
               socket.write(
                 `${JSON.stringify({
@@ -851,6 +993,22 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
                   error: err.message || "register_agent failed",
                 })}\n`,
               );
+            }
+            continue;
+          }
+          if (req.type === "agent_ready") {
+            const { subscriberId } = req;
+            if (!subscriberId) {
+              continue;
+            }
+            log(`agent_ready id=${subscriberId} - triggering probe immediately`);
+            const probeHandle = probeHandles.get(subscriberId);
+            if (probeHandle && typeof probeHandle.triggerNow === "function") {
+              probeHandle.triggerNow().catch((err) => {
+                log(`agent_ready probe trigger failed for ${subscriberId}: ${err.message}`);
+              });
+            } else {
+              log(`agent_ready no probe handle found for ${subscriberId}`);
             }
             continue;
           }
@@ -966,6 +1124,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
     // 清理所有子进程
     processManager.cleanup();
 
+    clearInterval(statusSyncInterval);
     busBridge.stop();
     removeSocket(projectRoot);
 

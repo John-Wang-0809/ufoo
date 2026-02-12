@@ -1,7 +1,51 @@
 const fs = require("fs");
 const path = require("path");
+const childProcess = require("child_process");
 const { readJSON } = require("../bus/utils");
 const { getUfooPaths } = require("../ufoo/paths");
+
+function normalizeTty(ttyPath) {
+  if (!ttyPath) return "";
+  const trimmed = String(ttyPath).trim();
+  if (!trimmed || trimmed === "not a tty") return "";
+  if (trimmed === "/dev/tty") return "";
+  return trimmed;
+}
+
+function tryTtyWithFd(fd) {
+  try {
+    const res = childProcess.spawnSync("tty", {
+      stdio: [fd, "pipe", "ignore"],
+      encoding: "utf8",
+    });
+    if (res && res.status === 0) {
+      const tty = normalizeTty(res.stdout || "");
+      if (tty) return tty;
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
+
+function detectCurrentTty() {
+  const stdinTtyPath = normalizeTty(process.stdin?.ttyPath || "");
+  if (stdinTtyPath) return stdinTtyPath;
+
+  const fromStdin = tryTtyWithFd(0);
+  if (fromStdin) return fromStdin;
+
+  try {
+    const fd = fs.openSync("/dev/tty", "r");
+    const fromTty = tryTtyWithFd(fd);
+    fs.closeSync(fd);
+    if (fromTty) return fromTty;
+  } catch {
+    // ignore
+  }
+
+  return "";
+}
 
 /**
  * 显示项目状态
@@ -38,12 +82,7 @@ class StatusDisplay {
     }
 
     // 尝试通过 tty 查找订阅者
-    let currentTty = null;
-    try {
-      currentTty = fs.readFileSync("/dev/tty", "utf8").trim();
-    } catch {
-      // tty 不可用
-    }
+    const currentTty = detectCurrentTty();
 
     if (currentTty && currentTty.startsWith("/dev/")) {
       const busData = readJSON(agentsFile);
@@ -198,38 +237,15 @@ class StatusDisplay {
   }
 
   /**
-   * 显示横幅（如果存在）
+   * 显示横幅
    */
   showBanner(subscriber) {
-    const { spawnSync } = require("child_process");
-    const bannerScript = path.join(__dirname, "../../scripts/banner.sh");
-
-    const printSimple = () => {
-      console.log("=== ufoo status ===");
-      if (subscriber) {
-        console.log(`Agent: ${subscriber}`);
-      } else {
-        console.log();
-      }
-    };
-
-    if (!subscriber) {
-      printSimple();
-      return;
+    console.log("=== ufoo status ===");
+    if (subscriber) {
+      console.log(`Agent: ${subscriber}`);
+    } else {
+      console.log();
     }
-
-    if (fs.existsSync(bannerScript)) {
-      const agentType = subscriber.startsWith("codex:") ? "codex" : "claude";
-      const sessionId = subscriber.split(":")[1] || "unknown";
-      const nickname = this.getSubscriberNickname(subscriber) || "";
-      const script = `source "${bannerScript}"; show_banner "${agentType}" "${sessionId}" "${nickname}"`;
-      const res = spawnSync("bash", ["-c", script], { stdio: "inherit" });
-      if (res && res.status === 0) {
-        return;
-      }
-    }
-
-    printSimple();
   }
 
   /**

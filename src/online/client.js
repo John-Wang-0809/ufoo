@@ -23,7 +23,6 @@ class OnlineClient extends EventEmitter {
     this.url = options.url || "ws://127.0.0.1:8787/ufoo/online";
     this.subscriberId = options.subscriberId || "";
     this.nickname = options.nickname || "";
-    this.channelType = options.channelType || "world";
     this.world = options.world || "default";
     this.agentType = options.agentType || "";
     this.version = options.version || "0.1.0";
@@ -33,6 +32,7 @@ class OnlineClient extends EventEmitter {
     this.token = options.token || "";
     this.tokenHash = options.tokenHash || "";
     this.tokenFile = options.tokenFile || defaultTokensPath();
+    this.allowInsecureWs = options.allowInsecureWs || false;
 
     this.ws = null;
     this.connected = false;
@@ -57,7 +57,6 @@ class OnlineClient extends EventEmitter {
         subscriber_id: this.subscriberId,
         agent_type: this.agentType,
         nickname: this.nickname,
-        channel_type: this.channelType,
         world: this.world,
         version: this.version,
         capabilities: this.capabilities,
@@ -81,6 +80,29 @@ class OnlineClient extends EventEmitter {
     }
     if (!this.token && !this.tokenHash) {
       throw new Error("token (or token_hash) is required");
+    }
+
+    // Step 10: Enforce TLS for non-local ws:// unless explicitly allowed
+    if (this.url.startsWith("ws://")) {
+      let parsed;
+      try {
+        parsed = new URL(this.url);
+      } catch {
+        throw new Error(`Invalid WebSocket URL: ${this.url}`);
+      }
+      const host = parsed.hostname;
+      const isLocal = host === "127.0.0.1" || host === "localhost" || host === "::1";
+      if (!isLocal) {
+        if (!this.allowInsecureWs) {
+          throw new Error(
+            `Refusing to connect to non-localhost over unencrypted ws:// ("${host}"). Use wss:// or pass --allow-insecure-ws.`
+          );
+        }
+        this.emit(
+          "warning",
+          `Connecting over unencrypted ws:// to non-localhost host "${host}". Consider using wss:// with TLS.`
+        );
+      }
     }
 
     this.ws = new WebSocket(this.url);
@@ -180,8 +202,13 @@ class OnlineClient extends EventEmitter {
   }
 
   send(payload) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify(payload));
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      this.ws.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   join(channel) {
@@ -200,8 +227,8 @@ class OnlineClient extends EventEmitter {
     this.send({ type: "leave", room });
   }
 
-  sendEvent({ channel, room, to, payload }) {
-    this.send({ type: "event", channel, room, to, payload });
+  sendEvent({ channel, room, payload }) {
+    return this.send({ type: "event", channel, room, payload });
   }
 
   close() {

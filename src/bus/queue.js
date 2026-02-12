@@ -15,6 +15,7 @@ class QueueManager {
   constructor(busDir) {
     this.busDir = busDir;
     this.queuesDir = path.join(busDir, "queues");
+    this.offsetsDir = path.join(busDir, "offsets");
   }
 
   /**
@@ -38,7 +39,7 @@ class QueueManager {
    * 获取 offset 文件路径
    */
   getOffsetPath(subscriber) {
-    return path.join(this.queuesDir, `${subscriberToSafeName(subscriber)}.offset`);
+    return path.join(this.offsetsDir, `${subscriberToSafeName(subscriber)}.offset`);
   }
 
   /**

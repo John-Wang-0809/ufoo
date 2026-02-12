@@ -30,6 +30,8 @@ class PtyWrapper {
 
     // 日志记录
     this.logger = null;
+    this._loggerBroken = false;
+    this._loggerErrorHandler = null;
 
     // 监控回调
     this.monitor = null;
@@ -119,7 +121,7 @@ class PtyWrapper {
           dir: "out",
           data: this._serializeData(data),
         };
-        this.logger.write(JSON.stringify(logEntry) + "\n");
+        this.writeLogEntry(logEntry);
       }
 
       // 3. 可选：监控回调
@@ -153,7 +155,7 @@ class PtyWrapper {
           data: this._serializeData(data),
           source: "terminal",
         };
-        this.logger.write(JSON.stringify(logEntry) + "\n");
+        this.writeLogEntry(logEntry);
       }
     };
     stdin.on("data", this._stdinHandler);
@@ -248,7 +250,28 @@ class PtyWrapper {
     if (this.logger) {
       throw new Error("Logging already enabled");
     }
-    this.logger = fs.createWriteStream(logFile, { flags: "a" });
+    this._loggerBroken = false;
+    const logger = fs.createWriteStream(logFile, { flags: "a" });
+    this._loggerErrorHandler = (err) => {
+      this._loggerBroken = true;
+      if (process.env.UFOO_DEBUG) {
+        console.error(`[PtyWrapper] logger error: ${err.message}`);
+      }
+    };
+    logger.on("error", this._loggerErrorHandler);
+    this.logger = logger;
+  }
+
+  writeLogEntry(logEntry) {
+    if (!this.logger || this._loggerBroken) return;
+    try {
+      this.logger.write(JSON.stringify(logEntry) + "\n");
+    } catch (err) {
+      this._loggerBroken = true;
+      if (process.env.UFOO_DEBUG) {
+        console.error(`[PtyWrapper] logger write failed: ${err.message}`);
+      }
+    }
   }
 
   /**
@@ -287,6 +310,8 @@ class PtyWrapper {
         // 忽略错误
       }
       this.logger = null;
+      this._loggerErrorHandler = null;
+      this._loggerBroken = false;
     }
 
     // 2. 清理PTY（codex-44：已退出则跳过，codex-45：移除监听器）

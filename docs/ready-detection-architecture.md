@@ -263,8 +263,7 @@ npm test -- test/integration/ready-detection.test.js
 
 ### E2E Tests
 ```bash
-bash test/integration/ready-detection-e2e.sh
-# 8 shell script tests with real daemon
+npm test -- test/integration/ready-detection.test.js
 ```
 
 ## Troubleshooting

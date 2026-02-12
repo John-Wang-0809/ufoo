@@ -125,6 +125,51 @@ function requireOptional(name) {
   }
 }
 
+function collectOption(value, previous) {
+  const next = Array.isArray(previous) ? previous.slice() : [];
+  const parts = String(value || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return next.concat(parts);
+}
+
+function collectOptionValues(argv, name) {
+  const values = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] !== name) continue;
+    const value = argv[i + 1];
+    if (!value || value.startsWith("--")) continue;
+    values.push(value);
+    i += 1;
+  }
+  return values;
+}
+
+function resolveOnlineAuthToken(opts) {
+  if (!opts) return "";
+  if (opts.authToken) return opts.authToken;
+  let tokens = null;
+  try {
+    // eslint-disable-next-line global-require
+    tokens = require("./online/tokens");
+  } catch {
+    return "";
+  }
+  const filePath = opts.tokenFile || tokens.defaultTokensPath();
+  let entry = null;
+  if (opts.subscriber) entry = tokens.getToken(filePath, opts.subscriber);
+  if (!entry && opts.nickname) entry = tokens.getTokenByNickname(filePath, opts.nickname);
+  if (!entry) return "";
+  return entry.token_hash || entry.token || "";
+}
+
+function onlineAuthHeaders(opts) {
+  const token = resolveOnlineAuthToken(opts);
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
+}
+
 async function runCli(argv) {
   const pkg = require(path.resolve(getPackageRoot(), "package.json"));
 
@@ -254,6 +299,43 @@ async function runCli(argv) {
 
     const online = program.command("online").description("ufoo online helpers");
     online
+      .command("server")
+      .description("Start ufoo-online relay server")
+      .option("--port <port>", "Listen port", "8787")
+      .option("--host <host>", "Listen host", "127.0.0.1")
+      .option("--token-file <path>", "Token file for auth validation")
+      .option("--idle-timeout <ms>", "Idle timeout in ms", "30000")
+      .option("--insecure", "Allow any token (dev only)")
+      .option("--tls-cert <path>", "TLS certificate file")
+      .option("--tls-key <path>", "TLS private key file")
+      .action(async (opts) => {
+        const OnlineServer = require("./online/server");
+        const server = new OnlineServer({
+          host: opts.host,
+          port: parseInt(opts.port, 10),
+          tokenFile: opts.tokenFile || undefined,
+          idleTimeoutMs: parseInt(opts.idleTimeout, 10),
+          insecure: opts.insecure || false,
+          tlsCert: opts.tlsCert || null,
+          tlsKey: opts.tlsKey || null,
+        });
+        try {
+          const isTls = !!(opts.tlsCert && opts.tlsKey);
+          const wsProto = isTls ? "wss" : "ws";
+          const httpProto = isTls ? "https" : "http";
+          await server.start();
+          console.log(`ufoo-online relay listening on ${opts.host}:${server.port}`);
+          console.log(`  WebSocket: ${wsProto}://${opts.host}:${server.port}/ufoo/online`);
+          console.log(`  HTTP API:  ${httpProto}://${opts.host}:${server.port}/ufoo/online/rooms`);
+          console.log(`             ${httpProto}://${opts.host}:${server.port}/ufoo/online/channels`);
+          if (server.insecure) console.log(`  Auth: INSECURE mode (any token accepted)`);
+          if (isTls) console.log(`  TLS: enabled`);
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
+    online
       .command("token")
       .description("Generate and store a ufoo-online token")
       .argument("<subscriber>", "Subscriber ID (e.g., claude-code:abc123)")
@@ -287,6 +369,10 @@ async function runCli(argv) {
       .description("Manage online rooms (HTTP)")
       .argument("<action>", "create|list")
       .option("--server <url>", "Online server base URL (http://host:port)")
+      .option("--auth-token <token>", "Bearer token for HTTP auth (token or token_hash)")
+      .option("--token-file <path>", "Token file path for auth lookup")
+      .option("--subscriber <id>", "Subscriber ID to resolve token")
+      .option("--nickname <name>", "Nickname to resolve token")
       .option("--name <room>", "Room name (optional)")
       .option("--type <type>", "Room type (public|private)")
       .option("--password <pwd>", "Room password (private only)")
@@ -294,8 +380,11 @@ async function runCli(argv) {
         const base = opts.server || "http://127.0.0.1:8787";
         const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/rooms`;
         try {
+          const authHeaders = onlineAuthHeaders(opts);
           if (action === "list") {
-            const res = await fetch(endpoint);
+            const res = await fetch(endpoint, {
+              headers: { ...authHeaders },
+            });
             const data = await res.json();
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -313,7 +402,7 @@ async function runCli(argv) {
             }
             const res = await fetch(endpoint, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", ...authHeaders },
               body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -333,14 +422,21 @@ async function runCli(argv) {
       .description("Manage online channels (HTTP)")
       .argument("<action>", "create|list")
       .option("--server <url>", "Online server base URL (http://host:port)")
+      .option("--auth-token <token>", "Bearer token for HTTP auth (token or token_hash)")
+      .option("--token-file <path>", "Token file path for auth lookup")
+      .option("--subscriber <id>", "Subscriber ID to resolve token")
+      .option("--nickname <name>", "Nickname to resolve token")
       .option("--name <name>", "Channel name (unique)")
       .option("--type <type>", "Channel type (world|public)")
       .action(async (action, opts) => {
         const base = opts.server || "http://127.0.0.1:8787";
         const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
         try {
+          const authHeaders = onlineAuthHeaders(opts);
           if (action === "list") {
-            const res = await fetch(endpoint);
+            const res = await fetch(endpoint, {
+              headers: { ...authHeaders },
+            });
             const data = await res.json();
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -357,7 +453,7 @@ async function runCli(argv) {
             }
             const res = await fetch(endpoint, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", ...authHeaders },
               body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -373,37 +469,77 @@ async function runCli(argv) {
       });
 
     online
-      .command("bridge")
-      .description("Bridge local bus messages to ufoo-online (message-only)")
-      .option("--server <url>", "Online server URL (ws://host:port/ufoo/online)")
-      .option("--channel <name>", "Channel name")
-      .option("--channel-type <type>", "Channel type (world|public|private)")
-      .option("--world <name>", "World name")
-      .option("--subscriber <id>", "Subscriber ID")
-      .option("--nickname <name>", "Nickname")
-      .option("--agent-type <type>", "Agent type label")
-      .option("--token <token>", "Token")
-      .option("--token-hash <hash>", "Token hash")
+      .command("connect")
+      .description("Connect to ufoo-online relay (long-running)")
+      .requiredOption("--nickname <name>", "Agent nickname")
+      .option("--url <url>", "WebSocket URL", "ws://127.0.0.1:8787/ufoo/online")
+      .option("--subscriber <id>", "Subscriber ID (auto-generated if omitted)")
+      .option("--token <tok>", "Auth token")
+      .option("--token-hash <hash>", "Auth token hash")
       .option("--token-file <path>", "Token file path")
-      .option("--interval <ms>", "Poll interval (ms)")
+      .option("--world <name>", "World name", "default")
+      .option("--ping-ms <ms>", "Keepalive ping interval (ms)")
+      .option("--join <channel>", "Join channel after connect")
+      .option("--room <room>", "Join private room (enables bus/decisions/wake sync)")
+      .option("--room-password <pwd>", "Room password")
+      .option("--interval <ms>", "Bus sync poll interval in ms", "1500")
+      .option("--allow-insecure-ws", "Allow ws:// to non-localhost (insecure)")
+      .option("--trust-remote", "Trust all private-room members for bus/decisions/wake sync")
+      .option("--allow-from <subscriberId>", "Allow bus/decisions/wake from subscriber ID (repeatable)", collectOption)
       .action(async (opts) => {
-        const OnlineBridge = require("./online/bridge");
-        const bridge = new OnlineBridge({
+        const OnlineConnect = require("./online/bridge");
+        const conn = new OnlineConnect({
           projectRoot: process.cwd(),
-          url: opts.server || undefined,
-          channel: opts.channel || "",
-          channelType: opts.channelType || "private",
-          world: opts.world || "default",
+          nickname: opts.nickname,
           subscriberId: opts.subscriber || "",
-          nickname: opts.nickname || "",
-          agentType: opts.agentType || "ufoo",
+          url: opts.url,
           token: opts.token || "",
           tokenHash: opts.tokenHash || "",
           tokenFile: opts.tokenFile || "",
-          pollIntervalMs: opts.interval ? parseInt(opts.interval, 10) : undefined,
+          world: opts.world,
+          pingMs: opts.pingMs ? parseInt(opts.pingMs, 10) : 0,
+          channel: opts.join || "",
+          room: opts.room || "",
+          roomPassword: opts.roomPassword || "",
+          pollIntervalMs: opts.interval ? parseInt(opts.interval, 10) : 1500,
+          allowInsecureWs: !!opts.allowInsecureWs,
+          trustRemote: !!opts.trustRemote,
+          allowFrom: opts.allowFrom || [],
         });
         try {
-          await bridge.start();
+          await conn.start();
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
+
+    online
+      .command("send")
+      .description("Send a message to a channel or room via outbox")
+      .requiredOption("--nickname <name>", "Agent nickname (must match a running connect)")
+      .requiredOption("--text <message>", "Message text")
+      .option("--channel <name>", "Target channel")
+      .option("--room <id>", "Target room")
+      .action((opts) => {
+        const { send } = require("./online/runner");
+        send(opts.nickname, {
+          text: opts.text,
+          channel: opts.channel || "",
+          room: opts.room || "",
+        });
+      });
+
+    online
+      .command("inbox")
+      .description("View ufoo-online inbox for a nickname")
+      .argument("<nickname>", "Agent nickname")
+      .option("--clear", "Clear the inbox")
+      .option("--unread", "Show unread messages only")
+      .action((nickname, opts) => {
+        const { checkInbox } = require("./online/runner");
+        try {
+          checkInbox(nickname, { clear: opts.clear, unread: opts.unread });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -603,7 +739,7 @@ async function runCli(argv) {
               await eventBus.whoami();
               break;
             default:
-              console.error(`Unknown bus subcommand: ${sub}`);
+              console.error(`Unknown bus subcommand: ${cmd}`);
               process.exitCode = 1;
           }
         } catch (err) {
@@ -751,12 +887,15 @@ async function runCli(argv) {
     console.log("  ufoo init [--modules <list>] [--project <dir>]");
     console.log("  ufoo skills list");
     console.log("  ufoo skills install <name|all> [--target <dir> | --codex | --agents]");
+    console.log("  ufoo online server [--port 8787] [--host 127.0.0.1] [--token-file <path>]");
     console.log("  ufoo online token <subscriber> [--nickname <name>] [--server <url>] [--file <path>]");
     console.log("  ufoo online room create [--name <room>] --type public|private [--password <pwd>] [--server <url>]");
     console.log("  ufoo online room list [--server <url>]");
     console.log("  ufoo online channel create --name <name> [--type world|public] [--server <url>]");
     console.log("  ufoo online channel list [--server <url>]");
-    console.log("  ufoo online bridge --channel <name> --subscriber <id> --nickname <name> [--server <url>] [...]");
+    console.log("  ufoo online connect --nickname <name> [--join <ch>] [--room <id> --room-password <pwd>] [...]");
+    console.log("  ufoo online send --nickname <name> --text <msg> [--channel <ch>] [--room <id>]");
+    console.log("  ufoo online inbox <nickname> [--clear] [--unread]");
     console.log("  ufoo bus wake <target> [--reason <reason>] [--no-shake]");
     console.log("  ufoo bus <args...>    (JS bus implementation)");
     console.log("  ufoo ctx <subcmd> ... (doctor|lint|decisions)");
@@ -879,6 +1018,41 @@ async function runCli(argv) {
   }
   if (cmd === "online") {
     const sub = rest[0] || "";
+    if (sub === "server") {
+      const getOpt = (name) => {
+        const i = rest.indexOf(name);
+        if (i === -1) return "";
+        return rest[i + 1] || "";
+      };
+      const hasFlag = (name) => rest.includes(name);
+      const OnlineServer = require("./online/server");
+      const tlsCert = getOpt("--tls-cert") || null;
+      const tlsKey = getOpt("--tls-key") || null;
+      const server = new OnlineServer({
+        host: getOpt("--host") || "127.0.0.1",
+        port: parseInt(getOpt("--port") || "8787", 10),
+        tokenFile: getOpt("--token-file") || undefined,
+        idleTimeoutMs: parseInt(getOpt("--idle-timeout") || "30000", 10),
+        insecure: hasFlag("--insecure"),
+        tlsCert,
+        tlsKey,
+      });
+      const isTls = !!(tlsCert && tlsKey);
+      const wsProto = isTls ? "wss" : "ws";
+      const httpProto = isTls ? "https" : "http";
+      server.start().then(() => {
+        console.log(`ufoo-online relay listening on ${server.host}:${server.port}`);
+        console.log(`  WebSocket: ${wsProto}://${server.host}:${server.port}/ufoo/online`);
+        console.log(`  HTTP API:  ${httpProto}://${server.host}:${server.port}/ufoo/online/rooms`);
+        console.log(`             ${httpProto}://${server.host}:${server.port}/ufoo/online/channels`);
+        if (server.insecure) console.log(`  Auth: INSECURE mode (any token accepted)`);
+        if (isTls) console.log(`  TLS: enabled`);
+      }).catch((err) => {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      });
+      return;
+    }
     if (sub === "token") {
       const subscriber = rest[1];
       if (!subscriber) {
@@ -921,10 +1095,16 @@ async function runCli(argv) {
       };
       const base = getOpt("--server") || "http://127.0.0.1:8787";
       const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/rooms`;
+      const authHeaders = onlineAuthHeaders({
+        authToken: getOpt("--auth-token"),
+        tokenFile: getOpt("--token-file"),
+        subscriber: getOpt("--subscriber"),
+        nickname: getOpt("--nickname"),
+      });
       (async () => {
         try {
           if (action === "list") {
-            const res = await fetch(endpoint);
+            const res = await fetch(endpoint, { headers: authHeaders });
             const data = await res.json();
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -942,7 +1122,7 @@ async function runCli(argv) {
             }
             const res = await fetch(endpoint, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", ...authHeaders },
               body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -967,10 +1147,16 @@ async function runCli(argv) {
       };
       const base = getOpt("--server") || "http://127.0.0.1:8787";
       const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
+      const authHeaders = onlineAuthHeaders({
+        authToken: getOpt("--auth-token"),
+        tokenFile: getOpt("--token-file"),
+        subscriber: getOpt("--subscriber"),
+        nickname: getOpt("--nickname"),
+      });
       (async () => {
         try {
           if (action === "list") {
-            const res = await fetch(endpoint);
+            const res = await fetch(endpoint, { headers: authHeaders });
             const data = await res.json();
             console.log(JSON.stringify(data, null, 2));
             return;
@@ -987,7 +1173,7 @@ async function runCli(argv) {
             }
             const res = await fetch(endpoint, {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
+              headers: { "Content-Type": "application/json", ...authHeaders },
               body: JSON.stringify(payload),
             });
             const data = await res.json();
@@ -1001,6 +1187,86 @@ async function runCli(argv) {
           process.exitCode = 1;
         }
       })();
+      return;
+    }
+    if (sub === "connect") {
+      const getOpt = (name) => {
+        const i = rest.indexOf(name);
+        if (i === -1) return "";
+        return rest[i + 1] || "";
+      };
+      const hasFlag = (name) => rest.includes(name);
+      const nickname = getOpt("--nickname");
+      if (!nickname) {
+        console.error("online connect requires --nickname");
+        process.exitCode = 1;
+        return;
+      }
+      const allowFrom = collectOptionValues(rest, "--allow-from")
+        .reduce((acc, value) => collectOption(value, acc), []);
+      const OnlineConnect = require("./online/bridge");
+      const conn = new OnlineConnect({
+        projectRoot: process.cwd(),
+        nickname,
+        subscriberId: getOpt("--subscriber"),
+        url: getOpt("--url") || "ws://127.0.0.1:8787/ufoo/online",
+        token: getOpt("--token"),
+        tokenHash: getOpt("--token-hash"),
+        tokenFile: getOpt("--token-file"),
+        world: getOpt("--world") || "default",
+        pingMs: getOpt("--ping-ms") ? parseInt(getOpt("--ping-ms"), 10) : 0,
+        channel: getOpt("--join"),
+        room: getOpt("--room"),
+        roomPassword: getOpt("--room-password"),
+        pollIntervalMs: getOpt("--interval") ? parseInt(getOpt("--interval"), 10) : 1500,
+        allowInsecureWs: hasFlag("--allow-insecure-ws"),
+        trustRemote: hasFlag("--trust-remote"),
+        allowFrom,
+      });
+      conn.start().catch((err) => {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      });
+      return;
+    }
+    if (sub === "send") {
+      const getOpt = (name) => {
+        const i = rest.indexOf(name);
+        if (i === -1) return "";
+        return rest[i + 1] || "";
+      };
+      const nickname = getOpt("--nickname");
+      const text = getOpt("--text");
+      if (!nickname || !text) {
+        console.error("online send requires --nickname and --text");
+        process.exitCode = 1;
+        return;
+      }
+      const { send } = require("./online/runner");
+      send(nickname, {
+        text,
+        channel: getOpt("--channel"),
+        room: getOpt("--room"),
+      });
+      return;
+    }
+    if (sub === "inbox") {
+      const nickname = rest[1];
+      if (!nickname || nickname.startsWith("--")) {
+        console.error("online inbox requires <nickname>");
+        process.exitCode = 1;
+        return;
+      }
+      const { checkInbox } = require("./online/runner");
+      try {
+        checkInbox(nickname, {
+          clear: rest.includes("--clear"),
+          unread: rest.includes("--unread"),
+        });
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
       return;
     }
     help();

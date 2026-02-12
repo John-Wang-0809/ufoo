@@ -3,6 +3,7 @@ const path = require("path");
 const { readJSON, writeJSON, isPidAlive, isAgentPidAlive, ensureDir, safeNameToSubscriber, subscriberToSafeName } = require("./utils");
 const Injector = require("./inject");
 const QueueManager = require("./queue");
+const MessageManager = require("./message");
 
 /**
  * Bus Daemon - 监控消息并自动注入命令
@@ -198,11 +199,24 @@ class BusDaemon {
       return;
     }
 
+    const busData = readJSON(this.agentsFile) || { agents: {} };
+    const messageManager = new MessageManager(this.busDir, busData, this.queueManager);
     const subscribers = fs.readdirSync(queuesDir);
 
     for (const safeName of subscribers) {
       const pendingFile = path.join(queuesDir, safeName, "pending.jsonl");
       if (!fs.existsSync(pendingFile)) {
+        continue;
+      }
+
+      const subscriber = safeNameToSubscriber(safeName);
+      const meta = busData.agents?.[subscriber];
+      const launchMode = meta?.launch_mode || "";
+      // Delivery ownership:
+      // - terminal/tmux: handled by AgentNotifier inside launcher
+      // - internal/internal-pty: handled by internal runner queue loop
+      // Bus daemon only handles legacy/unknown launch modes.
+      if (launchMode && ["terminal", "tmux", "internal", "internal-pty"].includes(launchMode)) {
         continue;
       }
 
@@ -220,15 +234,68 @@ class BusDaemon {
       const wakePath = path.join(queuesDir, safeName, "wake");
       const wakeActive = fs.existsSync(wakePath);
 
-      if (count > lastCount || wakeActive) {
-        const subscriber = safeNameToSubscriber(safeName);
+      if (count > 0 || wakeActive) {
         const now = new Date().toISOString().split("T")[1].slice(0, 8);
         const note = wakeActive && count <= lastCount ? " (wake)" : "";
         console.log(`[daemon] ${now} New message for ${subscriber} (${lastCount} -> ${count})${note}`);
 
         try {
-          await this.injector.inject(subscriber);
-          console.log(`[daemon] Injected /bus into ${subscriber}`);
+          const events = this.drainPending(pendingFile);
+          const failed = [];
+          for (const evt of events) {
+            if (!evt || evt.event !== "message" || !evt.data || typeof evt.data.message !== "string") {
+              continue;
+            }
+            try {
+              // eslint-disable-next-line no-await-in-loop
+              await this.injector.inject(subscriber, String(evt.data.message));
+            } catch (err) {
+              failed.push(evt);
+              try {
+                const pub = typeof evt.publisher === "object" && evt.publisher
+                  ? (evt.publisher.subscriber || evt.publisher.nickname || "")
+                  : (evt.publisher || "");
+                if (pub) {
+                  // eslint-disable-next-line no-await-in-loop
+                  await messageManager.emit(pub, "delivery", {
+                    target: subscriber,
+                    seq: evt.seq,
+                    status: "error",
+                    message: `delivery failed to ${meta?.nickname || subscriber}: ${err.message || "inject failed"}`,
+                  }, subscriber, "status/delivery");
+                }
+              } catch {
+                // ignore delivery emit errors
+              }
+              continue;
+            }
+            try {
+              // Emit delivery status back to publisher (best-effort)
+              const pub = typeof evt.publisher === "object" && evt.publisher
+                ? (evt.publisher.subscriber || evt.publisher.nickname || "")
+                : (evt.publisher || "");
+              if (pub) {
+                // eslint-disable-next-line no-await-in-loop
+                await messageManager.emit(pub, "delivery", {
+                  target: subscriber,
+                  seq: evt.seq,
+                  status: "ok",
+                  message: `delivered to ${meta?.nickname || subscriber}`,
+                }, subscriber, "status/delivery");
+              }
+            } catch {
+              // ignore delivery emit errors
+            }
+          }
+          if (failed.length > 0) {
+            try {
+              const content = failed.map((e) => JSON.stringify(e)).join("\n") + "\n";
+              fs.appendFileSync(pendingFile, content, "utf8");
+            } catch {
+              // ignore requeue failures
+            }
+          }
+          console.log(`[daemon] Delivered ${events.length} message(s) to ${subscriber}`);
           if (wakeActive) fs.rmSync(wakePath, { force: true });
         } catch (err) {
           console.error(`[daemon] Failed to inject: ${err.message}`);
@@ -238,6 +305,45 @@ class BusDaemon {
       // 更新计数
       this.setLastCount(safeName, count);
     }
+  }
+
+  drainPending(pendingFile) {
+    if (!fs.existsSync(pendingFile)) return [];
+    const processingFile = `${pendingFile}.processing.${process.pid}.${Date.now()}`;
+    let content = "";
+    let readOk = false;
+    try {
+      fs.renameSync(pendingFile, processingFile);
+      content = fs.readFileSync(processingFile, "utf8");
+      readOk = true;
+    } catch {
+      try {
+        if (fs.existsSync(processingFile)) {
+          fs.renameSync(processingFile, pendingFile);
+        }
+      } catch {
+        // ignore rollback errors
+      }
+      return [];
+    } finally {
+      if (readOk) {
+        try {
+          if (fs.existsSync(processingFile)) {
+            fs.rmSync(processingFile, { force: true });
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    }
+    if (!content.trim()) return [];
+    return content.split(/\r?\n/).filter(Boolean).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return null;
+      }
+    }).filter(Boolean);
   }
 
   /**

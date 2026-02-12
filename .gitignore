@@ -3,5 +3,9 @@
 *.swo
 *~
 .vercel
+.claude
+.codex
 .ufoo/
 node_modules
+
+landing

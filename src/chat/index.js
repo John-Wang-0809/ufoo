@@ -1,62 +1,35 @@
-const net = require("net");
 const path = require("path");
 const blessed = require("blessed");
-const { spawn, spawnSync, execSync } = require("child_process");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const { loadConfig, saveConfig, normalizeLaunchMode, normalizeAgentProvider } = require("../config");
 const { socketPath, isRunning } = require("../daemon");
 const UfooInit = require("../init");
-const EventBus = require("../bus");
+const AgentActivator = require("../bus/activate");
+const { subscriberToSafeName } = require("../bus/utils");
 const { getUfooPaths } = require("../ufoo/paths");
-
-function connectSocket(sockPath) {
-  return new Promise((resolve, reject) => {
-    const client = net.createConnection(sockPath, () => resolve(client));
-    client.on("error", reject);
-  });
-}
-
-function resolveProjectFile(projectRoot, relativePath, fallbackRelativePath) {
-  const local = path.join(projectRoot, relativePath);
-  if (fs.existsSync(local)) return local;
-  return path.join(__dirname, "..", "..", fallbackRelativePath);
-}
-
-function startDaemon(projectRoot, options = {}) {
-  const daemonBin = resolveProjectFile(projectRoot, path.join("bin", "ufoo.js"), path.join("bin", "ufoo.js"));
-  const env = options.forceResume
-    ? { ...process.env, UFOO_FORCE_RESUME: "1" }
-    : process.env;
-  const child = spawn(process.execPath, [daemonBin, "daemon", "--start"], {
-    detached: true,
-    stdio: "ignore",
-    cwd: projectRoot,
-    env,
-  });
-  child.unref();
-}
-
-function stopDaemon(projectRoot) {
-  const daemonBin = resolveProjectFile(projectRoot, path.join("bin", "ufoo.js"), path.join("bin", "ufoo.js"));
-  spawnSync(process.execPath, [daemonBin, "daemon", "--stop"], {
-    stdio: "ignore",
-    cwd: projectRoot,
-  });
-}
-
-async function connectWithRetry(sockPath, retries, delayMs) {
-  for (let i = 0; i < retries; i += 1) {
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const client = await connectSocket(sockPath);
-      return client;
-    } catch {
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => setTimeout(r, delayMs));
-    }
-  }
-  return null;
-}
+const { startDaemon, stopDaemon, connectWithRetry } = require("./transport");
+const { escapeBlessed, stripBlessedTags, truncateText } = require("./text");
+const { COMMAND_REGISTRY, parseCommand, parseAtTarget } = require("./commands");
+const inputMath = require("./inputMath");
+const { createStreamTracker } = require("./streamTracker");
+const agentDirectory = require("./agentDirectory");
+const { computeAgentBar } = require("./agentBar");
+const { createAgentSockets } = require("./agentSockets");
+const { createDashboardKeyController } = require("./dashboardKeyController");
+const { computeDashboardContent } = require("./dashboardView");
+const { createCommandExecutor } = require("./commandExecutor");
+const { createInputSubmitHandler } = require("./inputSubmitHandler");
+const { keyToRaw } = require("./rawKeyMap");
+const { createCompletionController } = require("./completionController");
+const { createStatusLineController } = require("./statusLineController");
+const { createInputHistoryController } = require("./inputHistoryController");
+const { createInputListenerController } = require("./inputListenerController");
+const { createDaemonMessageRouter } = require("./daemonMessageRouter");
+const { createChatLogController } = require("./chatLogController");
+const { createPasteController } = require("./pasteController");
+const { createAgentViewController } = require("./agentViewController");
+const { createSettingsController } = require("./settingsController");
 
 async function runChat(projectRoot) {
   if (!fs.existsSync(getUfooPaths(projectRoot).ufooDir)) {
@@ -87,7 +60,6 @@ async function runChat(projectRoot) {
     startDaemon(projectRoot);
   }
 
-  const daemonBin = resolveProjectFile(projectRoot, path.join("bin", "ufoo.js"), path.join("bin", "ufoo.js"));
   const sock = socketPath(projectRoot);
   let client = null;
   let reconnectPromise = null;
@@ -131,17 +103,17 @@ async function runChat(projectRoot) {
     if (exitRequested) return false;
     if (reconnectPromise) return reconnectPromise;
     queueStatusLine("Reconnecting to daemon");
-    logMessage("status", "{magenta-fg}⚙{/magenta-fg} Reconnecting to daemon...");
+    logMessage("status", "{white-fg}⚙{/white-fg} Reconnecting to daemon...");
     reconnectPromise = (async () => {
       const newClient = await connectClient();
       if (!newClient) {
-        resolveStatusLine("{red-fg}✗{/red-fg} Daemon offline");
-        logMessage("error", "{red-fg}✗{/red-fg} Failed to reconnect to daemon");
+        resolveStatusLine("{gray-fg}✗{/gray-fg} Daemon offline");
+        logMessage("error", "{white-fg}✗{/white-fg} Failed to reconnect to daemon");
         return false;
       }
       attachClient(newClient);
       connectionLostNotified = false;
-      resolveStatusLine("{green-fg}✓{/green-fg} Daemon reconnected");
+      resolveStatusLine("{gray-fg}✓{/gray-fg} Daemon reconnected");
       requestStatus();
       return true;
     })();
@@ -234,257 +206,53 @@ async function runChat(projectRoot) {
   const historyFile = path.join(historyDir, "history.jsonl");
   const inputHistoryFile = path.join(historyDir, "input-history.jsonl");
 
-  function appendHistory(entry) {
-    fs.mkdirSync(historyDir, { recursive: true });
-    fs.appendFileSync(historyFile, `${JSON.stringify(entry)}\n`);
-  }
+  const chatLogController = createChatLogController({
+    logBox,
+    fsModule: fs,
+    historyDir,
+    historyFile,
+  });
 
-  const SPACED_TYPES = new Set(["user", "reply", "bus", "dispatch", "error"]);
-  let lastLogWasSpacer = false;
-  let lastLogType = null;
-  let hasLoggedAny = false;
+  const streamTracker = createStreamTracker({
+    logBox,
+    writeSpacer: () => chatLogController.writeSpacer(false),
+    appendHistory: (...args) => chatLogController.appendHistory(...args),
+    escapeBlessed,
+    onStreamStart: () => chatLogController.markStreamStart(),
+  });
 
-  function shouldSpace(type, text) {
-    if (SPACED_TYPES.has(type)) return true;
-    if (text && /daemon/i.test(text)) return true;
-    return false;
-  }
-
-  function writeSpacer(writeHistory) {
-    if (lastLogWasSpacer || !hasLoggedAny) return;
-    logBox.log(" ");
-    if (writeHistory) {
-      appendHistory({
-        ts: new Date().toISOString(),
-        type: "spacer",
-        text: "",
-        meta: {},
-      });
-    }
-    lastLogWasSpacer = true;
-    lastLogType = "spacer";
-    hasLoggedAny = true;
-  }
-
-  function recordLog(type, text, meta = {}, writeHistory = true) {
-    if (type !== "spacer" && shouldSpace(type, text)) {
-      writeSpacer(writeHistory);
-    }
-    logBox.log(text);
-    if (writeHistory) {
-      appendHistory({
-        ts: new Date().toISOString(),
-        type,
-        text,
-        meta,
-      });
-    }
-    lastLogWasSpacer = false;
-    lastLogType = type;
-    hasLoggedAny = true;
-  }
+  const beginStream = (...args) => streamTracker.beginStream(...args);
+  const appendStreamDelta = (...args) => streamTracker.appendStreamDelta(...args);
+  const finalizeStream = (...args) => streamTracker.finalizeStream(...args);
+  const markPendingDelivery = (...args) => streamTracker.markPendingDelivery(...args);
+  const getPendingState = (...args) => streamTracker.getPendingState(...args);
+  const consumePendingDelivery = (...args) => streamTracker.consumePendingDelivery(...args);
 
   function logMessage(type, text, meta = {}) {
-    recordLog(type, text, meta, true);
+    chatLogController.logMessage(type, text, meta);
   }
 
   function loadHistory(limit = 2000) {
-    try {
-      const lines = fs.readFileSync(historyFile, "utf8").trim().split(/\r?\n/).filter(Boolean);
-      const items = lines.slice(-limit).map((line) => JSON.parse(line));
-      const hasSpacer = items.some((item) => item && item.type === "spacer");
-      for (const item of items) {
-        if (!item) continue;
-        if (item.type === "spacer") {
-          writeSpacer(false);
-          continue;
-        }
-        if (!item.text) continue;
-        if (hasSpacer) {
-          logBox.log(item.text);
-          lastLogWasSpacer = false;
-          lastLogType = item.type || null;
-          hasLoggedAny = true;
-        } else {
-          recordLog(item.type || "unknown", item.text, item.meta || {}, false);
-        }
-      }
-    } catch {
-      // ignore missing/invalid history
-    }
+    chatLogController.loadHistory(limit);
   }
 
-  const inputHistory = [];
-  let historyIndex = 0;
-  let historyDraft = "";
-
-  function appendInputHistory(text) {
-    if (!text) return;
-    fs.mkdirSync(historyDir, { recursive: true });
-    fs.appendFileSync(inputHistoryFile, `${JSON.stringify({ text })}\n`);
-  }
+  let inputHistoryController = null;
 
   function loadInputHistory(limit = 2000) {
-    try {
-      const lines = fs.readFileSync(inputHistoryFile, "utf8").trim().split(/\r?\n/).filter(Boolean);
-      const items = lines.slice(-limit).map((line) => JSON.parse(line));
-      for (const item of items) {
-        if (item && typeof item.text === "string" && item.text.trim() !== "") {
-          inputHistory.push(item.text);
-        }
-      }
-    } catch {
-      // ignore missing/invalid history
-    }
-    historyIndex = inputHistory.length;
+    if (!inputHistoryController) return;
+    inputHistoryController.loadInputHistory(limit);
   }
 
-  const pendingStatusLines = [];
-  const busStatusQueue = [];
-  let primaryStatusText = bannerText;
-  let primaryStatusPending = false;
-  const shimmerStart = Date.now();
-  let statusAnimationTimer = null;
-  const STATUS_ANIM_FRAME_MS = 50;
-  const SHIMMER_PADDING = 10;
-  const SHIMMER_BAND_HALF_WIDTH = 5;
-  const SHIMMER_SWEEP_MS = 2000;
-  const SPINNER_PERIOD_MS = 600;
+  const statusLineController = createStatusLineController({
+    statusLine,
+    bannerText,
+    renderScreen: () => screen.render(),
+  });
 
-  function formatProcessingText(text) {
-    if (!text) return text;
-    if (text.includes("{")) return text;
-    if (!/processing/i.test(text)) return text;
-    return text;
-  }
-
-  function shimmerText(text, nowMs) {
-    if (!text) return "";
-    if (text.includes("{")) return text;
-    const chars = Array.from(text);
-    const period = chars.length + SHIMMER_PADDING * 2;
-    const pos =
-      Math.floor(((nowMs - shimmerStart) % SHIMMER_SWEEP_MS) / SHIMMER_SWEEP_MS * period);
-    let out = "";
-    for (let i = 0; i < chars.length; i += 1) {
-      const iPos = i + SHIMMER_PADDING;
-      const dist = Math.abs(iPos - pos);
-      let intensity = 0;
-      if (dist <= SHIMMER_BAND_HALF_WIDTH) {
-        const x = Math.PI * (dist / SHIMMER_BAND_HALF_WIDTH);
-        intensity = 0.5 * (1 + Math.cos(x));
-      }
-      const ch = chars[i];
-      if (intensity < 0.2) {
-        out += `{gray-fg}${ch}{/gray-fg}`;
-      } else if (intensity < 0.6) {
-        out += ch;
-      } else {
-        out += `{bold}{white-fg}${ch}{/white-fg}{/bold}`;
-      }
-    }
-    return out;
-  }
-
-  function spinnerFrame(nowMs) {
-    const on = Math.floor((nowMs - shimmerStart) / SPINNER_PERIOD_MS) % 2 === 0;
-    return on
-      ? "{white-fg}•{/white-fg}"
-      : "{gray-fg}◦{/gray-fg}";
-  }
-
-  function renderPendingStatus(text, nowMs) {
-    const spinner = spinnerFrame(nowMs);
-    const shimmer = shimmerText(text, nowMs);
-    if (!shimmer) return spinner;
-    return `${spinner} ${shimmer}`;
-  }
-
-  function renderStatusLine(nowMs = Date.now()) {
-    let content = primaryStatusText || "";
-    if (primaryStatusPending) {
-      content = renderPendingStatus(primaryStatusText, nowMs);
-    }
-    if (busStatusQueue.length > 0) {
-      const extra = busStatusQueue.length > 1
-        ? ` {gray-fg}(+${busStatusQueue.length - 1}){/gray-fg}`
-        : "";
-      const busText = `${busStatusQueue[0].text}${extra}`;
-      content = content
-        ? `${content} {gray-fg}·{/gray-fg} ${busText}`
-        : busText;
-    }
-    statusLine.setContent(content);
-  }
-
-  function updateStatusAnimation() {
-    if (primaryStatusPending && !statusAnimationTimer) {
-      statusAnimationTimer = setInterval(() => {
-        if (!primaryStatusPending) return;
-        renderStatusLine(Date.now());
-        screen.render();
-      }, STATUS_ANIM_FRAME_MS);
-    } else if (!primaryStatusPending && statusAnimationTimer) {
-      clearInterval(statusAnimationTimer);
-      statusAnimationTimer = null;
-    }
-  }
-
-  function setPrimaryStatus(text, options = {}) {
-    primaryStatusText = text || "";
-    primaryStatusPending = Boolean(options.pending);
-    updateStatusAnimation();
-    renderStatusLine();
-  }
-
-  function queueStatusLine(text) {
-    let raw = text || "";
-    pendingStatusLines.push(raw);
-    if (pendingStatusLines.length === 1) {
-      setPrimaryStatus(raw, { pending: true });
-      screen.render();
-    }
-  }
-
-  function resolveStatusLine(text) {
-    if (pendingStatusLines.length > 0) {
-      pendingStatusLines.shift();
-    }
-    if (pendingStatusLines.length > 0) {
-      setPrimaryStatus(pendingStatusLines[0], { pending: true });
-    } else {
-      setPrimaryStatus(text || "", { pending: false });
-    }
-    screen.render();
-  }
-
-  function enqueueBusStatus(item) {
-    if (!item || !item.text) return;
-    const key = item.key || item.text;
-    const formatted = formatProcessingText(item.text);
-    const existing = busStatusQueue.find((entry) => entry.key === key);
-    if (existing) {
-      existing.text = formatted;
-    } else {
-      busStatusQueue.push({ key, text: formatted });
-    }
-    renderStatusLine();
-  }
-
-  function resolveBusStatus(item) {
-    if (!item) return;
-    const key = item.key || item.text;
-    let index = -1;
-    if (key) {
-      index = busStatusQueue.findIndex((entry) => entry.key === key);
-    }
-    if (index === -1 && item.text) {
-      index = busStatusQueue.findIndex((entry) => entry.text === item.text);
-    }
-    if (index === -1) return;
-    busStatusQueue.splice(index, 1);
-    renderStatusLine();
-  }
+  const queueStatusLine = (...args) => statusLineController.queueStatusLine(...args);
+  const resolveStatusLine = (...args) => statusLineController.resolveStatusLine(...args);
+  const enqueueBusStatus = (...args) => statusLineController.enqueueBusStatus(...args);
+  const resolveBusStatus = (...args) => statusLineController.resolveBusStatus(...args);
 
   // Command completion panel
   const completionPanel = blessed.box({
@@ -527,6 +295,22 @@ async function runChat(projectRoot) {
     tags: true,
   });
 
+  let agentViewController = null;
+  const agentSockets = createAgentSockets({
+    onTermWrite: (text) => writeToAgentTerm(text),
+    onPlaceCursor: (cursor) => placeAgentCursor(cursor),
+    isAgentView: () => getCurrentView() === "agent",
+    isBusMode: () => isAgentViewUsesBus(),
+    getViewingAgent: () => getViewingAgent(),
+    sendBusRaw: (target, data) => {
+      send({
+        type: "bus_send",
+        target,
+        message: JSON.stringify({ raw: true, data }),
+      });
+    },
+  });
+
   // Bottom border line for input area (above dashboard)
   const inputBottomLine = blessed.line({
     parent: screen,
@@ -534,7 +318,7 @@ async function runChat(projectRoot) {
     left: 1,
     width: "100%-2",
     orientation: "horizontal",
-    style: { fg: "cyan" },
+    style: { fg: "gray" },
   });
 
   // Prompt indicator
@@ -568,90 +352,38 @@ async function runChat(projectRoot) {
     left: 1,
     width: "100%-2",
     orientation: "horizontal",
-    style: { fg: "cyan" },
+    style: { fg: "gray" },
   });
 
   // Add cursor position tracking
   let cursorPos = 0;
   let preferredCol = null;
 
-  // Get inner width
   function getInnerWidth() {
-    const lpos = input.lpos || input._getCoords();
-    if (lpos && Number.isFinite(lpos.xl) && Number.isFinite(lpos.xi)) {
-      return Math.max(1, lpos.xl - lpos.xi + 1);
-    }
-    if (typeof input.width === "number") return Math.max(1, input.width);
-    if (typeof input.width === "string") {
-      const match = input.width.match(/^100%-([0-9]+)$/);
-      if (match && typeof screen.width === "number") {
-        return Math.max(1, screen.width - parseInt(match[1], 10));
-      }
-    }
     const promptWidth = typeof promptBox.width === "number" ? promptBox.width : 2;
-    if (typeof screen.width === "number") return Math.max(1, screen.width - promptWidth);
-    if (typeof screen.cols === "number") return Math.max(1, screen.cols - promptWidth);
-    return 1;
+    return inputMath.getInnerWidth({ input, screen, promptWidth });
   }
 
-  // Count lines considering both wrapping and newlines
+  function getWrapWidth() {
+    return inputMath.getWrapWidth(input, getInnerWidth());
+  }
+
   function countLines(text, width) {
-    if (width <= 0) return 1;
-    const lines = text.split("\n");
-    let total = 0;
-    for (const line of lines) {
-      const lineWidth = input.strWidth(line);
-      total += Math.max(1, Math.ceil(lineWidth / width));
-    }
-    return total;
+    return inputMath.countLines(text, width, (value) => input.strWidth(value));
   }
 
   function getCursorRowCol(text, pos, width) {
-    if (width <= 0) return { row: 0, col: 0 };
-    const before = text.slice(0, pos);
-    const lines = before.split("\n");
-    let row = 0;
-    for (let i = 0; i < lines.length - 1; i++) {
-      const lineWidth = input.strWidth(lines[i]);
-      row += Math.max(1, Math.ceil(lineWidth / width));
-    }
-    const lastLine = lines[lines.length - 1] || "";
-    const lastWidth = input.strWidth(lastLine);
-    row += Math.floor(lastWidth / width);
-    const col = lastWidth % width;
-    return { row, col };
-  }
-
-  function getLinePosForCol(line, targetCol) {
-    if (targetCol <= 0) return 0;
-    let col = 0;
-    let offset = 0;
-    for (const ch of Array.from(line)) {
-      const w = input.strWidth(ch);
-      if (col + w > targetCol) return offset;
-      col += w;
-      offset += ch.length;
-    }
-    return offset;
+    return inputMath.getCursorRowCol(text, pos, width, (value) => input.strWidth(value));
   }
 
   function getCursorPosForRowCol(text, targetRow, targetCol, width) {
-    if (width <= 0) return 0;
-    const lines = text.split("\n");
-    let row = 0;
-    let pos = 0;
-    for (const line of lines) {
-      const lineWidth = input.strWidth(line);
-      const wrappedRows = Math.max(1, Math.ceil(lineWidth / width));
-      if (targetRow < row + wrappedRows) {
-        const rowInLine = targetRow - row;
-        const visualCol = rowInLine * width + Math.max(0, targetCol);
-        return pos + getLinePosForCol(line, visualCol);
-      }
-      pos += line.length + 1;
-      row += wrappedRows;
-    }
-    return text.length;
+    return inputMath.getCursorPosForRowCol(
+      text,
+      targetRow,
+      targetCol,
+      width,
+      (value) => input.strWidth(value),
+    );
   }
 
   function ensureInputCursorVisible() {
@@ -686,33 +418,21 @@ async function runChat(projectRoot) {
     preferredCol = null;
   }
 
-  const PASTE_START = "\x1b[200~";
-  const PASTE_END = "\x1b[201~";
-  let pasteActive = false;
-  let pasteBuffer = "";
-  let pasteRemainder = "";
-  let suppressKeypress = false;
-  let suppressReset = null;
+  function getPreferredCol() {
+    return preferredCol;
+  }
 
-  function scheduleSuppressReset() {
-    suppressKeypress = true;
-    if (suppressReset) clearImmediate(suppressReset);
-    suppressReset = setImmediate(() => {
-      if (!pasteActive) suppressKeypress = false;
-    });
+  function setPreferredCol(value) {
+    preferredCol = value;
   }
 
   function normalizePaste(text) {
-    if (!text) return "";
-    let normalized = text.replace(/\x1b\[200~|\x1b\[201~/g, "");
-    normalized = normalized.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    return normalized;
+    return inputMath.normalizePaste(text);
   }
 
   function updateDraftFromInput() {
-    if (historyIndex === inputHistory.length) {
-      historyDraft = input.value;
-    }
+    if (!inputHistoryController) return;
+    inputHistoryController.updateDraftFromInput();
   }
 
   function normalizeCommandPrefix() {
@@ -747,383 +467,101 @@ async function runChat(projectRoot) {
     screen.render();
   }
 
+  inputHistoryController = createInputHistoryController({
+    inputHistoryFile,
+    historyDir,
+    setInputValue,
+    getInputValue: () => input.value || "",
+  });
+
   function historyUp() {
-    if (inputHistory.length === 0) return false;
-    if (historyIndex === inputHistory.length) {
-      historyDraft = input.value;
-    }
-    if (historyIndex > 0) {
-      historyIndex -= 1;
-      setInputValue(inputHistory[historyIndex]);
-      return true;
-    }
-    return true;
+    if (!inputHistoryController) return false;
+    return inputHistoryController.historyUp();
   }
 
   function historyDown() {
-    if (inputHistory.length === 0) return false;
-    if (historyIndex < inputHistory.length - 1) {
-      historyIndex += 1;
-      setInputValue(inputHistory[historyIndex]);
-      return true;
-    }
-    if (historyIndex === inputHistory.length - 1) {
-      historyIndex = inputHistory.length;
-      setInputValue(historyDraft || "");
-      return true;
-    }
-    return false;
+    if (!inputHistoryController) return false;
+    return inputHistoryController.historyDown();
   }
 
   function exitHandler() {
     exitRequested = true;
+    exitAgentView();
     if (screen && screen.program && typeof screen.program.decrst === "function") {
       screen.program.decrst(2004);
     }
-    if (statusAnimationTimer) {
-      clearInterval(statusAnimationTimer);
-      statusAnimationTimer = null;
-    }
+    statusLineController.destroy();
     if (client) {
       client.end();
     }
     process.exit(0);
   }
 
-  // Command completion functions
-  function showCompletion(filterText) {
-    // Ensure accidental double-prefix doesn't break filtering.
-    normalizeCommandPrefix();
-    if (filterText !== input.value) {
-      filterText = input.value;
-    }
-    if (filterText.startsWith("//")) {
-      filterText = filterText.replace(/^\/+/, "/");
-      input.value = filterText;
-      cursorPos = Math.min(cursorPos, input.value.length);
-    }
-    if (!filterText || filterText === "") {
-      hideCompletion();
-      return;
-    }
+  const completionController = createCompletionController({
+    input,
+    screen,
+    completionPanel,
+    promptBox,
+    commandRegistry: COMMAND_REGISTRY,
+    normalizeCommandPrefix,
+    truncateText,
+    getCurrentInputHeight: () => currentInputHeight,
+    getCursorPos: () => cursorPos,
+    setCursorPos: (value) => {
+      cursorPos = value;
+    },
+    resetPreferredCol,
+    updateDraftFromInput,
+    renderScreen: () => screen.render(),
+  });
 
-    // Trim the filterText to handle trailing spaces for main command mode
-    // But preserve spaces for subcommand mode detection
-    const endsWithSpace = /\s$/.test(filterText);
-    const trimmed = filterText.trim();
-    if (!trimmed) {
-      hideCompletion();
-      return;
-    }
-    filterText = trimmed;
+  const pasteController = createPasteController({
+    shouldHandle: () => screen.focused === input && focusMode === "input",
+    normalizePaste,
+    insertTextAtCursor,
+  });
 
-    // Check if we're in subcommand mode
-    const parts = filterText.split(/\s+/);
-    let commands = [];
-
-    const mainCmd = parts[0];
-    const isLaunch = mainCmd && mainCmd.toLowerCase() === "/launch";
-    const wantsSubcommands = (parts.length > 1 || (endsWithSpace && parts.length === 1));
-
-    if ((wantsSubcommands || isLaunch) && mainCmd && mainCmd.startsWith("/")) {
-      // Subcommand mode: "/bus rename"
-      const subFilter = parts[1] || "";
-
-      // Find the main command
-      const mainCmdObj = COMMAND_REGISTRY.find(item =>
-        item.cmd.toLowerCase() === mainCmd.toLowerCase()
-      );
-
-      const fallbackLaunchSubs = [
-        { cmd: "claude", desc: "Launch Claude agent" },
-        { cmd: "codex", desc: "Launch Codex agent" },
-      ];
-
-      if ((mainCmdObj && mainCmdObj.subcommands) || isLaunch) {
-        const baseSubs = mainCmdObj && mainCmdObj.subcommands ? mainCmdObj.subcommands : [];
-        let subs = baseSubs;
-        if (isLaunch) {
-          const merged = new Map();
-          for (const sub of [...baseSubs, ...fallbackLaunchSubs]) {
-            if (!sub || !sub.cmd) continue;
-            merged.set(sub.cmd, sub);
-          }
-          subs = Array.from(merged.values());
-        }
-        if (isLaunch) {
-          // Always show both launch targets for clarity
-          commands = subs
-            .map(sub => ({ ...sub, isSubcommand: true, parentCmd: mainCmd }))
-            .sort((a, b) => a.cmd.localeCompare(b.cmd));
-        } else {
-          // Filter subcommands
-          commands = subs
-            .filter(sub => sub.cmd.toLowerCase().startsWith(subFilter.toLowerCase()))
-            .map(sub => ({ ...sub, isSubcommand: true, parentCmd: mainCmd }))
-            .sort((a, b) => a.cmd.localeCompare(b.cmd));
-        }
-      }
-    } else {
-      // Main command mode: "/bus"
-      const filterLower = filterText.toLowerCase();
-      commands = COMMAND_REGISTRY
-        .filter(item => item.cmd.toLowerCase().startsWith(filterLower))
-        .sort((a, b) => a.cmd.localeCompare(b.cmd, "en", { sensitivity: "base" }));
-    }
-
-    if (commands.length === 0) {
-      hideCompletion();
-      return;
-    }
-
-    completionCommands = commands;
-    completionActive = true;
-    completionIndex = 0;
-    completionScrollOffset = 0;
-
-    // Calculate panel height (max 7 visible + 1 for top border)
-    completionVisibleCount = Math.min(7, completionCommands.length);
-    completionPanel.height = completionVisibleCount + 1;
-    completionPanel.bottom = currentInputHeight - 1;
-    completionPanel.hidden = false;
-
-    renderCompletionPanel();
-  }
-
-  function hideCompletion() {
-    completionActive = false;
-    completionCommands = [];
-    completionIndex = 0;
-    completionScrollOffset = 0;
-    completionVisibleCount = 0;
-    completionPanel.hidden = true;
-    screen.render();
-  }
-
-  function renderCompletionPanel() {
-    if (!completionActive || completionCommands.length === 0) return;
-
-    const panelVisible = Math.max(1, (completionPanel.height || 1) - 1);
-    const maxVisible = completionVisibleCount
-      ? Math.max(1, Math.min(completionVisibleCount, panelVisible))
-      : panelVisible;
-
-    // Adjust scroll offset to keep selected item visible
-    if (completionIndex < completionScrollOffset) {
-      completionScrollOffset = completionIndex;
-    } else if (completionIndex >= completionScrollOffset + maxVisible) {
-      completionScrollOffset = completionIndex - maxVisible + 1;
-    }
-
-    // Calculate visible slice
-    const visibleStart = completionScrollOffset;
-    const visibleEnd = Math.min(completionScrollOffset + maxVisible, completionCommands.length);
-    const visibleCommands = completionCommands.slice(visibleStart, visibleEnd);
-
-    const panelWidth = typeof completionPanel.width === "number"
-      ? completionPanel.width
-      : screen.width;
-    const lines = visibleCommands.map((item, i) => {
-      const actualIndex = visibleStart + i;
-      const cmdText = item.cmd;
-      const descText = item.desc || "";
-      const cmdPart = actualIndex === completionIndex
-        ? `{inverse}${cmdText}{/inverse}`
-        : `{cyan-fg}${cmdText}{/cyan-fg}`;
-      const indent = " ".repeat(promptBox.width || 2);
-      const maxDescWidth = Math.max(0, panelWidth - indent.length - cmdText.length - 2);
-      const trimmedDesc = truncateText(descText, maxDescWidth);
-      const descPart = trimmedDesc ? `{gray-fg}${trimmedDesc}{/gray-fg}` : "";
-      // Use promptBox width (2) to align with input position
-      return descPart
-        ? `${indent}${cmdPart}  ${descPart}`
-        : `${indent}${cmdPart}`;
-    });
-
-    completionPanel.setContent(lines.join("\n"));
-    screen.render();
-  }
-
-  function completionPageSize() {
-    const panelVisible = Math.max(1, (completionPanel.height || 1) - 1);
-    return completionVisibleCount
-      ? Math.max(1, Math.min(completionVisibleCount, panelVisible))
-      : panelVisible;
-  }
-
-  function completionUp() {
-    if (completionCommands.length === 0) return;
-    completionIndex = completionIndex <= 0
-      ? completionCommands.length - 1
-      : completionIndex - 1;
-    renderCompletionPanel();
-  }
-
-  function completionDown() {
-    if (completionCommands.length === 0) return;
-    completionIndex = completionIndex >= completionCommands.length - 1
-      ? 0
-      : completionIndex + 1;
-    renderCompletionPanel();
-  }
-
-  function completionPageUp() {
-    if (completionCommands.length === 0) return;
-    const step = completionPageSize();
-    completionIndex = Math.max(0, completionIndex - step);
-    renderCompletionPanel();
-  }
-
-  function completionPageDown() {
-    if (completionCommands.length === 0) return;
-    const step = completionPageSize();
-    completionIndex = Math.min(completionCommands.length - 1, completionIndex + step);
-    renderCompletionPanel();
-  }
-
-  function completionPreview(selected) {
-    const current = input.value || "";
-    const trimmed = current.trim();
-    const endsWithSpace = /\s$/.test(current);
-    if (selected.isSubcommand) {
-      const parts = trimmed.split(/\s+/);
-      const base = parts[0] || "";
-      const completedCore = base ? `${base} ${selected.cmd}` : selected.cmd;
-      const isComplete = trimmed === completedCore || trimmed.startsWith(`${completedCore} `);
-      return { text: `${completedCore} `, isComplete };
-    }
-    const completedCore = selected.cmd;
-    const hasChildren = selected.subcommands && selected.subcommands.length > 0;
-    const isComplete =
-      (trimmed === completedCore && (!hasChildren || endsWithSpace)) ||
-      trimmed.startsWith(`${completedCore} `);
-    return { text: `${completedCore} `, isComplete };
-  }
-
-  function applyCompletionPreview(preview) {
-    input.value = preview.text;
-    cursorPos = input.value.length;
-    resetPreferredCol();
-    input._updateCursor();
-    updateDraftFromInput();
-    screen.render();
-  }
-
-  function truncateText(text, maxWidth) {
-    if (maxWidth <= 0) return "";
-    if (text.length <= maxWidth) return text;
-    if (maxWidth <= 3) return text.slice(0, maxWidth);
-    return `${text.slice(0, maxWidth - 3)}...`;
-  }
-
-  function confirmCompletion() {
-    if (!completionActive || completionCommands.length === 0) return;
-
-    const selected = completionCommands[completionIndex];
-
-    if (selected.isSubcommand) {
-      // Subcommand: replace the last word with selected subcommand
-      const parts = input.value.split(/\s+/);
-      parts[parts.length - 1] = selected.cmd;
-      input.value = parts.join(" ") + " ";
-    } else {
-      // Main command
-      input.value = selected.cmd + " ";
-    }
-
-    cursorPos = input.value.length;
-    resetPreferredCol();
-    input._updateCursor();
-    updateDraftFromInput();
-
-    // If selected command has subcommands, trigger subcommand completion immediately
-    if (!selected.isSubcommand && selected.subcommands && selected.subcommands.length > 0) {
-      // Don't hide - directly show subcommand completion
-      showCompletion(input.value);
-    } else {
-      // No subcommands - hide completion
-      hideCompletion();
-    }
-
-    screen.render();
-  }
-
-  function handleCompletionKey(ch, key) {
-    if (!completionActive) return false;
-
-    if (key.name === "up") {
-      completionUp();
-      return true;
-    }
-    if (key.name === "down") {
-      completionDown();
-      return true;
-    }
-    if (key.name === "tab") {
-      confirmCompletion();
-      return true;
-    }
-    if (key.name === "pageup") {
-      completionPageUp();
-      return true;
-    }
-    if (key.name === "pagedown") {
-      completionPageDown();
-      return true;
-    }
-    if (key.name === "enter" || key.name === "return") {
-      if (completionEnterSuppressed) {
-        return true;
-      }
-      const selected = completionCommands[completionIndex];
-      if (selected) {
-        const preview = completionPreview(selected);
-        if (!preview.isComplete) {
-          applyCompletionPreview(preview);
-          if (!selected.isSubcommand && selected.subcommands && selected.subcommands.length > 0) {
-            showCompletion(input.value);
-          } else {
-            hideCompletion();
-          }
-          completionEnterSuppressed = true;
-          if (completionEnterReset) clearImmediate(completionEnterReset);
-          completionEnterReset = setImmediate(() => {
-            completionEnterSuppressed = false;
-          });
-          return true;
-        }
-      }
-      // Already complete; allow normal submit
-      hideCompletion();
-      completionEnterSuppressed = true;
-      if (completionEnterReset) clearImmediate(completionEnterReset);
-      completionEnterReset = setImmediate(() => {
-        completionEnterSuppressed = false;
-      });
-      return false;
-    }
-    if (key.name === "escape") {
-      hideCompletion();
-      return true;
-    }
-    if (ch === " ") {
-      // Check if current input is a command that might have subcommands
-      const currentInput = input.value.trim();
-      if (currentInput.startsWith("/") && !currentInput.includes(" ")) {
-        // Let space be inserted, will trigger subcommand completion
-        return false;
-      }
-      hideCompletion();
-      return false;
-    }
-    // Regular character and backspace - don't intercept, let it be handled normally
-    // Completion will be updated in the main input handler
-    return false;
-  }
+  const inputListenerController = createInputListenerController({
+    getCurrentView: () => getCurrentView(),
+    exitHandler,
+    getFocusMode: () => focusMode,
+    getDashboardView: () => dashboardView,
+    getSelectedAgentIndex: () => selectedAgentIndex,
+    getActiveAgents: () => activeAgents,
+    getTargetAgent: () => targetAgent,
+    requestCloseAgent,
+    logMessage,
+    isSuppressKeypress: () => pasteController.isSuppressKeypress(),
+    normalizeCommandPrefix,
+    handleDashboardKey,
+    exitDashboardMode,
+    completionController,
+    getLogHeight: () => logBox.height,
+    scrollLog,
+    insertTextAtCursor,
+    normalizePaste,
+    resetPreferredCol,
+    getCursorPos: () => cursorPos,
+    setCursorPos: (value) => {
+      cursorPos = value;
+    },
+    ensureInputCursorVisible,
+    getWrapWidth,
+    getCursorRowCol,
+    countLines,
+    getCursorPosForRowCol,
+    getPreferredCol,
+    setPreferredCol,
+    historyUp,
+    historyDown,
+    enterDashboardMode,
+    resizeInput,
+    updateDraftFromInput,
+  });
 
   // Resize input box based on content
   function resizeInput() {
-    const innerWidth = getInnerWidth();
+    const innerWidth = getWrapWidth();
     if (innerWidth <= 0) return;
 
     const numLines = countLines(input.value, innerWidth);
@@ -1138,9 +576,7 @@ async function runChat(projectRoot) {
     }
     statusLine.bottom = currentInputHeight;
     // Reposition completion panel if active
-    if (completionActive) {
-      completionPanel.bottom = currentInputHeight - 1;
-    }
+    if (completionController.isActive()) completionController.reflow();
     // dashboard and inputBottomLine stay fixed at bottom 0 and 1
     logBox.height = Math.max(1, screen.height - currentInputHeight - 1);
     ensureInputCursorVisible();
@@ -1148,202 +584,18 @@ async function runChat(projectRoot) {
 
   // Override the internal listener to support cursor movement
   input._listener = function(ch, key) {
-    if (key && key.ctrl && key.name === "c") {
-      exitHandler();
-      return;
-    }
-    if (suppressKeypress) {
-      return;
-    }
-    normalizeCommandPrefix();
-    if (focusMode === "dashboard") {
-      if (handleDashboardKey(key)) return;
-      return;
-    }
-
-    // Command completion mode
-    if (completionActive) {
-      if (handleCompletionKey(ch, key)) return;
-    }
-    if (key && (key.name === "pageup" || key.name === "pagedown")) {
-      const delta = Math.max(1, Math.floor(logBox.height / 2));
-      scrollLog(key.name === "pageup" ? -delta : delta);
-      return;
-    }
-
-    // Treat multi-char input (paste) as insertion, including newlines.
-    if (ch && ch.length > 1 && (!key || !key.name || key.name.length !== 1)) {
-      insertTextAtCursor(normalizePaste(ch));
-      return;
-    }
-    if (ch && (ch.includes("\n") || ch.includes("\r")) && (!key || (key.name !== "return" && key.name !== "enter"))) {
-      insertTextAtCursor(normalizePaste(ch));
-      return;
-    }
-    // Plain enter submits, shift+enter inserts newline
-    if (key.name === "return" || key.name === "enter") {
-      if (key.shift) {
-        // Insert newline at cursor
-        insertTextAtCursor("\n");
-      } else {
-        // Submit
-        resetPreferredCol();
-        this._done(null, this.value);
-      }
-      return;
-    }
-
-    if (key.name === "left") {
-      if (cursorPos > 0) cursorPos--;
-      resetPreferredCol();
-      ensureInputCursorVisible();
-      this._updateCursor();
-      this.screen.render();
-      return;
-    }
-
-    if (key.name === "right") {
-      if (cursorPos < this.value.length) cursorPos++;
-      resetPreferredCol();
-      ensureInputCursorVisible();
-      this._updateCursor();
-      this.screen.render();
-      return;
-    }
-
-    if (key.name === "home") {
-      cursorPos = 0;
-      resetPreferredCol();
-      ensureInputCursorVisible();
-      this._updateCursor();
-      this.screen.render();
-      return;
-    }
-
-    if (key.name === "end") {
-      cursorPos = this.value.length;
-      resetPreferredCol();
-      ensureInputCursorVisible();
-      this._updateCursor();
-      this.screen.render();
-      return;
-    }
-
-    if (key.name === "up") {
-      // Special case: "/" + Up → jump to last command in completion
-      if (completionActive && input.value === "/" && cursorPos === 1) {
-        completionIndex = completionCommands.length - 1;
-        renderCompletionPanel();
-        return;
-      }
-      if (historyUp()) {
-        hideCompletion();
-        return;
-      }
-    }
-    if (key.name === "down") {
-      if (historyDown()) {
-        hideCompletion();
-        return;
-      }
-    }
-    if (key.name === "up" || key.name === "down") {
-      const innerWidth = getInnerWidth();
-      if (innerWidth > 0) {
-        const { row, col } = getCursorRowCol(this.value, cursorPos, innerWidth);
-        if (preferredCol === null) preferredCol = col;
-        const totalRows = countLines(this.value, innerWidth);
-
-        // Down at last row -> enter dashboard mode
-        if (key.name === "down" && row >= totalRows - 1) {
-          enterDashboardMode();
-          return;
-        }
-
-        const targetRow = key.name === "up"
-          ? Math.max(0, row - 1)
-          : Math.min(totalRows - 1, row + 1);
-        cursorPos = getCursorPosForRowCol(this.value, targetRow, preferredCol, innerWidth);
-      }
-      ensureInputCursorVisible();
-      this._updateCursor();
-      this.screen.render();
-      return;
-    }
-
-    if (key.name === "escape") {
-      this._done(null, null);
-      return;
-    }
-
-    if (key.name === "backspace") {
-      if (cursorPos > 0) {
-        this.value = this.value.slice(0, cursorPos - 1) + this.value.slice(cursorPos);
-        cursorPos--;
-        resetPreferredCol();
-        resizeInput();
-        ensureInputCursorVisible();
-        this._updateCursor();
-        updateDraftFromInput();
-
-        // Update or hide completion after backspace
-        if (this.value.startsWith("/")) {
-          showCompletion(this.value);
-        } else {
-          hideCompletion();
-        }
-
-        this.screen.render();
-      }
-      return;
-    }
-
-    if (key.name === "delete") {
-      if (cursorPos < this.value.length) {
-        this.value = this.value.slice(0, cursorPos) + this.value.slice(cursorPos + 1);
-        resetPreferredCol();
-        resizeInput();
-        ensureInputCursorVisible();
-        this._updateCursor();
-        this.screen.render();
-        updateDraftFromInput();
-      }
-      return;
-    }
-
-    // Insert character at cursor position
-    const insertChar = (ch && ch.length === 1)
-      ? ch
-      : (key && key.name && key.name.length === 1 ? key.name : null);
-    if (insertChar && !/^[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]$/.test(insertChar)) {
-      this.value = this.value.slice(0, cursorPos) + insertChar + this.value.slice(cursorPos);
-      cursorPos++;
-      normalizeCommandPrefix();
-      resetPreferredCol();
-      resizeInput();
-      this._updateCursor();
-      updateDraftFromInput();
-
-      // Update completion filter if typing after "/"
-      if (this.value.startsWith("/")) {
-        showCompletion(this.value);
-      } else if (completionActive) {
-        hideCompletion();
-      }
-
-      this.screen.render();
-      return;
-    }
+    inputListenerController.handleKey(ch, key, this);
   };
 
   // Override cursor update to use our cursor position
   input._updateCursor = function() {
     if (this.screen.focused !== this) return;
 
-    const lpos = this._getCoords();
+    let lpos;
+    try { lpos = this._getCoords(); } catch { return; }
     if (!lpos) return;
 
-    const innerWidth = getInnerWidth();
+    const innerWidth = getWrapWidth();
     if (innerWidth <= 0) return;
 
     ensureInputCursorVisible();
@@ -1365,9 +617,8 @@ async function runChat(projectRoot) {
     cursorPos = 0;
     resetPreferredCol();
     currentInputHeight = MIN_INPUT_HEIGHT;
-    historyIndex = inputHistory.length;
-    historyDraft = "";
-    hideCompletion();
+    if (inputHistoryController) inputHistoryController.setIndexToEnd();
+    completionController.hide();
     const contentHeight = 1; // MIN content height
     input.height = contentHeight;
     promptBox.height = contentHeight;
@@ -1379,89 +630,12 @@ async function runChat(projectRoot) {
 
   let pending = null;
 
-  // Command completion state
-  let completionActive = false;
-  let completionCommands = [];
-  let completionIndex = 0;
-  let completionScrollOffset = 0;
-  let completionVisibleCount = 0;
-  let completionEnterSuppressed = false;
-  let completionEnterReset = null;
-
-  const COMMAND_TREE = {
-    "/bus": {
-      desc: "Event bus operations",
-      children: {
-        activate: { desc: "Activate agent terminal" },
-        list: { desc: "List all agents" },
-        rename: { desc: "Rename agent nickname" },
-        send: { desc: "Send message to agent" },
-        status: { desc: "Bus status" },
-      },
-    },
-    "/ctx": {
-      desc: "Context management",
-      children: {
-        decisions: { desc: "List all decisions" },
-        doctor: { desc: "Check context integrity" },
-        status: { desc: "Show context status (default)" },
-      },
-    },
-    "/daemon": {
-      desc: "Daemon management",
-      children: {
-        restart: { desc: "Restart daemon" },
-        start: { desc: "Start daemon" },
-        status: { desc: "Daemon status" },
-        stop: { desc: "Stop daemon" },
-      },
-    },
-    "/doctor": { desc: "Health check diagnostics" },
-    "/init": { desc: "Initialize modules" },
-    "/launch": {
-      desc: "Launch new agent",
-      children: {
-        claude: { desc: "Launch Claude agent" },
-        codex: { desc: "Launch Codex agent" },
-      },
-    },
-    "/resume": { desc: "Resume agents (optional nickname)" },
-    "/skills": {
-      desc: "Skills management",
-      children: {
-        install: { desc: "Install skills (use: all or name)" },
-        list: { desc: "List available skills" },
-      },
-    },
-    "/status": { desc: "Status display" },
-  };
-
-  function buildCommandRegistry(tree) {
-    return Object.keys(tree)
-      .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }))
-      .map((cmd) => {
-        const node = tree[cmd] || {};
-        const entry = { cmd, desc: node.desc || "" };
-        if (node.children) {
-          entry.subcommands = Object.keys(node.children)
-            .sort((a, b) => a.localeCompare(b, "en", { sensitivity: "base" }))
-            .map((sub) => ({
-              cmd: sub,
-              desc: (node.children[sub] && node.children[sub].desc) || "",
-            }));
-        }
-        return entry;
-      });
-  }
-
-  const COMMAND_REGISTRY = buildCommandRegistry(COMMAND_TREE);
-
   // Agent selection state
   let activeAgents = [];
   let activeAgentLabelMap = new Map();
   let activeAgentMetaMap = new Map(); // Store full meta including launch_mode
   let agentListWindowStart = 0;
-  const MAX_AGENT_WINDOW = 5;
+  const MAX_AGENT_WINDOW = 4;
   let selectedAgentIndex = -1;  // -1 = not in dashboard selection mode
   let targetAgent = null;       // Selected agent for direct messaging
   let focusMode = "input";      // "input" or "dashboard"
@@ -1478,27 +652,156 @@ async function runChat(projectRoot) {
   ];
   let selectedResumeIndex = autoResume ? 0 : 1;
   let restartInProgress = false;
+  const DASH_HINTS = {
+    agents: "←/→ select · Enter · ↓ mode · ↑ back",
+    agentsEmpty: "↓ mode · ↑ back",
+    mode: "←/→ select · Enter · ↓ provider · ↑ back",
+    provider: "←/→ select · Enter · ↓ resume · ↑ back",
+    resume: "←/→ select · Enter · ↑ back",
+  };
+  const AGENT_BAR_HINTS = {
+    normal: "↓ agents",
+    dashboard: "←/→ · Enter · ↑ · ^X",
+  };
+
+  function getCurrentView() {
+    return agentViewController ? agentViewController.getCurrentView() : "main";
+  }
+
+  function getViewingAgent() {
+    return agentViewController ? agentViewController.getViewingAgent() : "";
+  }
+
+  function isAgentViewUsesBus() {
+    return agentViewController ? agentViewController.isAgentViewUsesBus() : false;
+  }
+
+  function getAgentInputSuppressUntil() {
+    return agentViewController ? agentViewController.getAgentInputSuppressUntil() : 0;
+  }
+
+  function getAgentOutputSuppressed() {
+    return agentViewController ? agentViewController.getAgentOutputSuppressed() : false;
+  }
+
+  function setAgentOutputSuppressed(value) {
+    if (agentViewController) {
+      agentViewController.setAgentOutputSuppressed(value);
+    }
+  }
+
+  function renderAgentDashboard() {
+    if (agentViewController) {
+      agentViewController.renderAgentDashboard();
+    }
+  }
+
+  function setAgentBarVisible(visible) {
+    if (agentViewController) {
+      agentViewController.setAgentBarVisible(visible);
+    }
+  }
+
+  function enterAgentView(agentId, options = {}) {
+    if (agentViewController) {
+      agentViewController.enterAgentView(agentId, options);
+    }
+  }
+
+  function exitAgentView() {
+    if (agentViewController) {
+      agentViewController.exitAgentView();
+    }
+  }
+
+  function sendRawToAgent(data) {
+    if (agentViewController) {
+      agentViewController.sendRawToAgent(data);
+    }
+  }
+
+  function sendResizeToAgent(cols, rows) {
+    if (agentViewController) {
+      agentViewController.sendResizeToAgent(cols, rows);
+    }
+  }
+
+  function requestAgentSnapshot() {
+    if (agentViewController) {
+      agentViewController.requestAgentSnapshot();
+    }
+  }
+
+  function writeToAgentTerm(text) {
+    if (agentViewController) {
+      agentViewController.writeToAgentTerm(text);
+    }
+  }
+
+  function placeAgentCursor(cursor) {
+    if (agentViewController) {
+      agentViewController.placeAgentCursor(cursor);
+    }
+  }
+
+  function handleResizeInAgentView() {
+    if (!agentViewController) return false;
+    return agentViewController.handleResizeInAgentView();
+  }
 
   function getAgentLabel(agentId) {
-    return activeAgentLabelMap.get(agentId) || agentId;
+    return agentDirectory.getAgentLabel(activeAgentLabelMap, agentId);
+  }
+
+  function resolveAgentId(label) {
+    return agentDirectory.resolveAgentId({
+      label,
+      activeAgents,
+      labelMap: activeAgentLabelMap,
+      lookupNickname: (nickname) => {
+        try {
+          const busPath = getUfooPaths(projectRoot).agentsFile;
+          const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
+          for (const [id, meta] of Object.entries(bus.agents || {})) {
+            if (meta && meta.nickname === nickname) return id;
+          }
+        } catch {
+          // ignore lookup errors
+        }
+        return null;
+      },
+    });
+  }
+
+  function resolveAgentDisplayName(publisher) {
+    return agentDirectory.resolveAgentDisplayName({
+      publisher,
+      labelMap: activeAgentLabelMap,
+      lookupNicknameById: (id) => {
+        try {
+          const busPath = getUfooPaths(projectRoot).agentsFile;
+          const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
+          const meta = bus.agents && bus.agents[id];
+          if (meta && meta.nickname) return meta.nickname;
+        } catch {
+          // Keep original publisher ID
+        }
+        return null;
+      },
+    });
+  }
+
+  function clampAgentWindowWithSelection(selectionIndex) {
+    agentListWindowStart = agentDirectory.clampAgentWindowWithSelection({
+      activeCount: activeAgents.length,
+      maxWindow: MAX_AGENT_WINDOW,
+      windowStart: agentListWindowStart,
+      selectionIndex,
+    });
   }
 
   function clampAgentWindow() {
-    if (activeAgents.length === 0) {
-      agentListWindowStart = 0;
-      return;
-    }
-    const maxItems = Math.max(1, Math.min(MAX_AGENT_WINDOW, activeAgents.length));
-    if (selectedAgentIndex >= 0) {
-      if (selectedAgentIndex < agentListWindowStart) {
-        agentListWindowStart = selectedAgentIndex;
-      } else if (selectedAgentIndex >= agentListWindowStart + maxItems) {
-        agentListWindowStart = selectedAgentIndex - maxItems + 1;
-      }
-    }
-    const maxStart = Math.max(0, activeAgents.length - maxItems);
-    if (agentListWindowStart > maxStart) agentListWindowStart = maxStart;
-    if (agentListWindowStart < 0) agentListWindowStart = 0;
+    clampAgentWindowWithSelection(selectedAgentIndex);
   }
 
   function send(req) {
@@ -1513,8 +816,8 @@ async function runChat(projectRoot) {
   function updatePromptBox() {
     if (targetAgent) {
       const label = getAgentLabel(targetAgent);
-      promptBox.setContent(`@${label}>`);
-      promptBox.width = label.length + 3;  // @name>
+      promptBox.setContent(`>@${label}`);
+      promptBox.width = label.length + 3;  // >@name + spacer
       input.left = promptBox.width;
       input.width = `100%-${promptBox.width}`;
     } else {
@@ -1523,8 +826,34 @@ async function runChat(projectRoot) {
       input.left = 2;
       input.width = "100%-2";
     }
+    if (!input.parent || !promptBox.parent) return;
     resizeInput();
-    input._updateCursor();
+    if (typeof input._updateCursor === "function") {
+      input._updateCursor();
+    }
+  }
+
+  function syncTargetFromSelection() {
+    if (focusMode !== "dashboard" || dashboardView !== "agents") return;
+    if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+      const nextTarget = activeAgents[selectedAgentIndex];
+      if (nextTarget !== targetAgent) {
+        targetAgent = nextTarget;
+        updatePromptBox();
+        screen.render();
+      }
+    } else if (targetAgent) {
+      targetAgent = null;
+      updatePromptBox();
+      screen.render();
+    }
+  }
+
+  function restoreTargetFromSelection() {
+    if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+      targetAgent = activeAgents[selectedAgentIndex];
+      updatePromptBox();
+    }
   }
 
   function focusInput() {
@@ -1542,68 +871,40 @@ async function runChat(projectRoot) {
     screen.render();
   }
 
+  let settingsController = null;
+
   function setLaunchMode(mode) {
-    const next = normalizeLaunchMode(mode);
-    if (next === launchMode) return;
-    launchMode = next;
-    selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
-    saveConfig(projectRoot, { launchMode });
-    logMessage("status", `{magenta-fg}⚙{/magenta-fg} Launch mode: ${launchMode}`);
-    renderDashboard();
-    screen.render();
-    void restartDaemon();
+    if (settingsController) {
+      settingsController.setLaunchMode(mode);
+    }
   }
 
-
-  function providerLabel(value) {
-    return value === "claude-cli" ? "claude" : "codex";
-  }
-
-  function clearUfooAgentIdentity() {
-    const agentDir = getUfooPaths(projectRoot).agentDir;
-    const stateFile = path.join(agentDir, "ufoo-agent.json");
-    const historyFile = path.join(agentDir, "ufoo-agent.history.jsonl");
-    try {
-      fs.rmSync(stateFile, { force: true });
-    } catch {
-      // ignore
+  function requestCloseAgent(agentId) {
+    if (!agentId) {
+      logMessage("error", "{white-fg}✗{/white-fg} No agent selected");
+      return;
     }
-    try {
-      fs.rmSync(historyFile, { force: true });
-    } catch {
-      // ignore
-    }
+    const label = getAgentLabel(agentId);
+    logMessage("status", `{white-fg}⚙{/white-fg} Closing ${label}...`);
+    send({ type: "close_agent", agent_id: agentId });
   }
 
   function setAgentProvider(provider) {
-    const next = normalizeAgentProvider(provider);
-    if (next === agentProvider) return;
-    agentProvider = next;
-    selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
-    saveConfig(projectRoot, { agentProvider });
-    clearUfooAgentIdentity();
-    logMessage("status", `{magenta-fg}⚙{/magenta-fg} ufoo-agent: ${providerLabel(agentProvider)}`);
-    renderDashboard();
-    screen.render();
-    void restartDaemon();
+    if (settingsController) {
+      settingsController.setAgentProvider(provider);
+    }
   }
 
   function setAutoResume(value) {
-    const next = value !== false;
-    if (next === autoResume) return;
-    autoResume = next;
-    selectedResumeIndex = autoResume ? 0 : 1;
-    saveConfig(projectRoot, { autoResume });
-    const label = autoResume ? "Resume previous session" : "Start new session";
-    logMessage("status", `{magenta-fg}⚙{/magenta-fg} Resume mode: ${label}`);
-    renderDashboard();
-    screen.render();
+    if (settingsController) {
+      settingsController.setAutoResume(value);
+    }
   }
 
   async function restartDaemon() {
     if (restartInProgress) return;
     restartInProgress = true;
-    logMessage("status", "{magenta-fg}⚙{/magenta-fg} Restarting daemon...");
+    logMessage("status", "{white-fg}⚙{/white-fg} Restarting daemon...");
     try {
       if (client) {
         client.removeAllListeners();
@@ -1618,14 +919,48 @@ async function runChat(projectRoot) {
       const newClient = await connectClient();
       if (newClient) {
         attachClient(newClient);
-        logMessage("status", "{green-fg}✓{/green-fg} Daemon reconnected");
+        logMessage("status", "{white-fg}✓{/white-fg} Daemon reconnected");
       } else {
-        logMessage("error", "{red-fg}✗{/red-fg} Failed to reconnect to daemon");
+        logMessage("error", "{white-fg}✗{/white-fg} Failed to reconnect to daemon");
       }
     } finally {
       restartInProgress = false;
     }
   }
+
+  settingsController = createSettingsController({
+    projectRoot,
+    saveConfig,
+    normalizeLaunchMode,
+    normalizeAgentProvider,
+    fsModule: fs,
+    getUfooPaths,
+    logMessage,
+    renderDashboard,
+    renderScreen: () => screen.render(),
+    restartDaemon,
+    getLaunchMode: () => launchMode,
+    setLaunchModeState: (value) => {
+      launchMode = value;
+    },
+    setSelectedModeIndex: (value) => {
+      selectedModeIndex = value;
+    },
+    getAgentProvider: () => agentProvider,
+    setAgentProviderState: (value) => {
+      agentProvider = value;
+    },
+    setSelectedProviderIndex: (value) => {
+      selectedProviderIndex = value;
+    },
+    getAutoResume: () => autoResume,
+    setAutoResumeState: (value) => {
+      autoResume = value;
+    },
+    setSelectedResumeIndex: (value) => {
+      selectedResumeIndex = value;
+    },
+  });
 
   function clearLog() {
     logBox.setContent("");
@@ -1636,82 +971,31 @@ async function runChat(projectRoot) {
   }
 
   function renderDashboard() {
-    let content = " ";
-    if (focusMode === "dashboard") {
-      if (dashboardView === "mode") {
-        const modes = ["terminal", "tmux", "internal"];
-        const modeParts = modes.map((mode, i) => {
-          if (i === selectedModeIndex) {
-            return `{inverse}${mode}{/inverse}`;
-          }
-          return `{cyan-fg}${mode}{/cyan-fg}`;
-        });
-        content += `{gray-fg}Mode:{/gray-fg} ${modeParts.join("  ")}`;
-        content += "  {gray-fg}│ ←/→ select, Enter confirm, ↓ agent, ↑ back{/gray-fg}";
-      } else if (dashboardView === "provider") {
-        const providerParts = providerOptions.map((opt, i) => {
-          if (i === selectedProviderIndex) {
-            return `{inverse}${opt.label}{/inverse}`;
-          }
-          return `{cyan-fg}${opt.label}{/cyan-fg}`;
-        });
-        content += `{gray-fg}Agent:{/gray-fg} ${providerParts.join("  ")}`;
-        content += "  {gray-fg}│ ←/→ select, Enter confirm, ↓ resume, ↑ back{/gray-fg}";
-      } else if (dashboardView === "resume") {
-        const resumeParts = resumeOptions.map((opt, i) => {
-          if (i === selectedResumeIndex) {
-            return `{inverse}${opt.label}{/inverse}`;
-          }
-          return `{cyan-fg}${opt.label}{/cyan-fg}`;
-        });
-        content += `{gray-fg}Resume:{/gray-fg} ${resumeParts.join("  ")}`;
-        content += "  {gray-fg}│ ←/→ select, Enter confirm, ↑ back{/gray-fg}";
-      } else {
-        if (activeAgents.length > 0) {
-          clampAgentWindow();
-          const maxItems = Math.max(1, Math.min(MAX_AGENT_WINDOW, activeAgents.length));
-          const start = agentListWindowStart;
-          const end = start + maxItems;
-          const visibleAgents = activeAgents.slice(start, end);
-          const agentParts = visibleAgents.map((agent, i) => {
-            const absoluteIndex = start + i;
-            const label = getAgentLabel(agent);
-            if (absoluteIndex === selectedAgentIndex) {
-              return `{inverse}${label}{/inverse}`;
-            }
-            return `{cyan-fg}${label}{/cyan-fg}`;
-          });
-          const leftMore = start > 0 ? "{gray-fg}«{/gray-fg} " : "";
-          const rightMore = end < activeAgents.length ? " {gray-fg}»{/gray-fg}" : "";
-          content += `{gray-fg}Agents:{/gray-fg} ${agentParts.join("  ")}`;
-          content = `${content.replace("{gray-fg}Agents:{/gray-fg} ", `{gray-fg}Agents:{/gray-fg} ${leftMore}`)}${rightMore}`;
-          content += "  {gray-fg}│ ←/→ select, Enter confirm, ↓ mode, ↑ back{/gray-fg}";
-        } else {
-          content += "{gray-fg}Agents:{/gray-fg} {cyan-fg}none{/cyan-fg}";
-          content += "  {gray-fg}│ ↓ mode, ↑ back{/gray-fg}";
-        }
-      }
-    } else {
-      // Normal dashboard display (input mode)
-      const agents = activeAgents.length > 0
-        ? activeAgents.slice(0, 3).map((id) => {
-            const label = getAgentLabel(id);
-            return label;
-          }).join(", ") + (activeAgents.length > 3 ? ` +${activeAgents.length - 3}` : "")
-        : "none";
-      content += `{gray-fg}Agents:{/gray-fg} {cyan-fg}${agents}{/cyan-fg}`;
-      content += `  {gray-fg}Mode:{/gray-fg} {cyan-fg}${launchMode}{/cyan-fg}`;
-      content += `  {gray-fg}Agent:{/gray-fg} {cyan-fg}${providerLabel(agentProvider)}{/cyan-fg}`;
-      content += `  {gray-fg}Resume:{/gray-fg} {cyan-fg}${autoResume ? "auto" : "off"}{/cyan-fg}`;
-    }
-    dashboard.setContent(content);
+    const computed = computeDashboardContent({
+      focusMode,
+      dashboardView,
+      activeAgents,
+      selectedAgentIndex,
+      agentListWindowStart,
+      maxAgentWindow: MAX_AGENT_WINDOW,
+      getAgentLabel,
+      launchMode,
+      agentProvider,
+      autoResume,
+      selectedModeIndex,
+      selectedProviderIndex,
+      selectedResumeIndex,
+      providerOptions,
+      resumeOptions,
+      dashHints: DASH_HINTS,
+    });
+    agentListWindowStart = computed.windowStart;
+    dashboard.setContent(computed.content);
   }
 
   function updateDashboard(status) {
     activeAgents = status.active || [];
     const metaList = Array.isArray(status.active_meta) ? status.active_meta : [];
-    activeAgentLabelMap = new Map();
-    activeAgentMetaMap = new Map();
     let fallbackMap = null;
     if (metaList.length === 0 && activeAgents.length > 0) {
       try {
@@ -1725,17 +1009,30 @@ async function runChat(projectRoot) {
         fallbackMap = null;
       }
     }
-    for (const id of activeAgents) {
-      const meta = metaList.find((item) => item && item.id === id);
-      const label = meta && meta.nickname
-        ? meta.nickname
-        : (fallbackMap && fallbackMap.get(id)) || id;
-      activeAgentLabelMap.set(id, label);
-      if (meta) {
-        activeAgentMetaMap.set(id, meta);
-      }
-    }
+    const maps = agentDirectory.buildAgentMaps(activeAgents, metaList, fallbackMap);
+    activeAgentLabelMap = maps.labelMap;
+    activeAgentMetaMap = maps.metaMap;
     clampAgentWindow();
+    // If viewing agent went offline, exit view
+    const currentView = getCurrentView();
+    const viewingAgent = getViewingAgent();
+    if (currentView === "agent" && viewingAgent && !activeAgents.includes(viewingAgent)) {
+      writeToAgentTerm("\r\n\x1b[1;31m[Agent went offline]\x1b[0m\r\n");
+      exitAgentView();
+      return;
+    }
+
+    // In agent view, only update the dashboard bar (blessed is frozen)
+    if (currentView === "agent") {
+      if (focusMode === "dashboard") {
+        const totalItems = 1 + activeAgents.length;
+        if (selectedAgentIndex < 0 || selectedAgentIndex >= totalItems) {
+          selectedAgentIndex = 0;
+        }
+      }
+      renderAgentDashboard();
+      return;
+    }
     if (focusMode === "dashboard") {
       if (dashboardView === "agents") {
         if (activeAgents.length === 0) {
@@ -1746,6 +1043,7 @@ async function runChat(projectRoot) {
         clampAgentWindow();
       }
     }
+    syncTargetFromSelection();
     renderDashboard();
     screen.render();
   }
@@ -1756,163 +1054,79 @@ async function runChat(projectRoot) {
     selectedAgentIndex = activeAgents.length > 0 ? 0 : -1;
     agentListWindowStart = 0;
     clampAgentWindow();
-    selectedModeIndex = launchMode === "internal" ? 1 : 0;
+    selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
     selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
     selectedResumeIndex = autoResume ? 0 : 1;
+    // Immediately set @target when first agent is selected
+    if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
+      targetAgent = activeAgents[selectedAgentIndex];
+      updatePromptBox();
+    }
     screen.grabKeys = true;
     renderDashboard();
     screen.program.hideCursor();
     screen.render();
+    syncTargetFromSelection();
   }
 
-  function handleDashboardKey(key) {
-    if (!key || focusMode !== "dashboard") return false;
-    if (dashboardView === "mode") {
-      if (key.name === "left") {
-        selectedModeIndex = selectedModeIndex <= 0 ? 2 : selectedModeIndex - 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "right") {
-        selectedModeIndex = selectedModeIndex >= 2 ? 0 : selectedModeIndex + 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "down") {
-        dashboardView = "provider";
-        selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "up") {
-        dashboardView = "agents";
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "enter" || key.name === "return") {
-        const modes = ["terminal", "tmux", "internal"];
-        setLaunchMode(modes[selectedModeIndex]);
-        exitDashboardMode(false);
-        return true;
-      }
-      if (key.name === "escape") {
-        exitDashboardMode(false);
-        return true;
-      }
-      return true;
-    }
-    if (dashboardView === "provider") {
-      if (key.name === "left") {
-        selectedProviderIndex = selectedProviderIndex <= 0 ? providerOptions.length - 1 : selectedProviderIndex - 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "right") {
-        selectedProviderIndex = selectedProviderIndex >= providerOptions.length - 1 ? 0 : selectedProviderIndex + 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "down") {
-        dashboardView = "resume";
-        selectedResumeIndex = autoResume ? 0 : 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "up") {
-        dashboardView = "mode";
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "enter" || key.name === "return") {
-        const selected = providerOptions[selectedProviderIndex];
-        if (selected) setAgentProvider(selected.value);
-        exitDashboardMode(false);
-        return true;
-      }
-      if (key.name === "escape") {
-        exitDashboardMode(false);
-        return true;
-      }
-      return true;
-    }
-    if (dashboardView === "resume") {
-      if (key.name === "left") {
-        selectedResumeIndex = selectedResumeIndex <= 0 ? resumeOptions.length - 1 : selectedResumeIndex - 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "right") {
-        selectedResumeIndex = selectedResumeIndex >= resumeOptions.length - 1 ? 0 : selectedResumeIndex + 1;
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "up") {
-        dashboardView = "provider";
-        renderDashboard();
-        screen.render();
-        return true;
-      }
-      if (key.name === "enter" || key.name === "return") {
-        const selected = resumeOptions[selectedResumeIndex];
-        if (selected) {
-          setAutoResume(selected.value);
-          const label = selected.value ? "Resume previous session" : "Start new session";
-          logMessage("status", `{magenta-fg}⚙{/magenta-fg} Resume mode: ${label}`);
-        }
-        exitDashboardMode(false);
-        return true;
-      }
-      if (key.name === "escape") {
-        exitDashboardMode(false);
-        return true;
-      }
-      return true;
-    }
+  const dashboardState = {};
+  Object.defineProperties(dashboardState, {
+    currentView: { get: () => getCurrentView() },
+    focusMode: { get: () => focusMode, set: (value) => { focusMode = value; } },
+    dashboardView: { get: () => dashboardView, set: (value) => { dashboardView = value; } },
+    selectedAgentIndex: { get: () => selectedAgentIndex, set: (value) => { selectedAgentIndex = value; } },
+    activeAgents: { get: () => activeAgents },
+    viewingAgent: { get: () => getViewingAgent() },
+    activeAgentMetaMap: { get: () => activeAgentMetaMap },
+    selectedModeIndex: { get: () => selectedModeIndex, set: (value) => { selectedModeIndex = value; } },
+    selectedProviderIndex: { get: () => selectedProviderIndex, set: (value) => { selectedProviderIndex = value; } },
+    selectedResumeIndex: { get: () => selectedResumeIndex, set: (value) => { selectedResumeIndex = value; } },
+    launchMode: { get: () => launchMode },
+    agentProvider: { get: () => agentProvider },
+    autoResume: { get: () => autoResume },
+    providerOptions: { get: () => providerOptions },
+    resumeOptions: { get: () => resumeOptions },
+    agentOutputSuppressed: {
+      get: () => getAgentOutputSuppressed(),
+      set: (value) => { setAgentOutputSuppressed(value); },
+    },
+  });
 
-    if (key.name === "left") {
-      if (activeAgents.length > 0 && selectedAgentIndex > 0) {
-        selectedAgentIndex--;
-        clampAgentWindow();
-        renderDashboard();
-        screen.render();
-      }
-      return true;
-    }
-    if (key.name === "right") {
-      if (activeAgents.length > 0 && selectedAgentIndex < activeAgents.length - 1) {
-        selectedAgentIndex++;
-        clampAgentWindow();
-        renderDashboard();
-        screen.render();
-      }
-      return true;
-    }
-    if (key.name === "down") {
-      dashboardView = "mode";
-      selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
-      renderDashboard();
-      screen.render();
-      return true;
-    }
-    if (key.name === "up" || key.name === "escape") {
-      exitDashboardMode(false);
-      return true;
-    }
-    if (key.name === "enter" || key.name === "return") {
-      exitDashboardMode(true);
-      return true;
-    }
-    return false;
+  function activateAgent(agentId) {
+    if (!agentId) return;
+    const activator = new AgentActivator(projectRoot);
+    activator.activate(agentId).catch(() => {});
+  }
+
+  const dashboardController = createDashboardKeyController({
+    state: dashboardState,
+    existsSync: fs.existsSync,
+    getInjectSockPath,
+    activateAgent,
+    requestCloseAgent,
+    enterAgentView,
+    exitAgentView,
+    setAgentBarVisible,
+    requestAgentSnapshot,
+    clearTargetAgent,
+    restoreTargetFromSelection,
+    syncTargetFromSelection,
+    exitDashboardMode,
+    setLaunchMode,
+    setAgentProvider,
+    setAutoResume,
+    clampAgentWindow,
+    clampAgentWindowWithSelection,
+    renderDashboard,
+    renderAgentDashboard,
+    renderScreen: () => screen.render(),
+    setScreenGrabKeys: (value) => {
+      screen.grabKeys = Boolean(value);
+    },
+  });
+
+  function handleDashboardKey(key) {
+    return dashboardController.handleDashboardKey(key);
   }
 
   function exitDashboardMode(selectAgent = false) {
@@ -1935,9 +1149,97 @@ async function runChat(projectRoot) {
     screen.render();
   }
 
+  function getInjectSockPath(agentId) {
+    const safeName = subscriberToSafeName(agentId);
+    return path.join(getUfooPaths(projectRoot).busQueuesDir, safeName, "inject.sock");
+  }
+
+  agentViewController = createAgentViewController({
+    screen,
+    input,
+    processStdout: process.stdout,
+    computeAgentBar,
+    agentBarHints: AGENT_BAR_HINTS,
+    maxAgentWindow: MAX_AGENT_WINDOW,
+    getFocusMode: () => focusMode,
+    setFocusMode: (value) => {
+      focusMode = value;
+    },
+    getSelectedAgentIndex: () => selectedAgentIndex,
+    setSelectedAgentIndex: (value) => {
+      selectedAgentIndex = value;
+    },
+    getActiveAgents: () => activeAgents,
+    getAgentListWindowStart: () => agentListWindowStart,
+    setAgentListWindowStart: (value) => {
+      agentListWindowStart = value;
+    },
+    getAgentLabel,
+    setDashboardView: (value) => {
+      dashboardView = value;
+    },
+    setScreenGrabKeys: (value) => {
+      screen.grabKeys = Boolean(value);
+    },
+    clearTargetAgent,
+    renderDashboard,
+    focusInput,
+    resizeInput,
+    renderScreen: () => screen.render(),
+    getInjectSockPath,
+    connectAgentOutput: (sockPath) => {
+      agentSockets.connectOutput(sockPath);
+    },
+    disconnectAgentOutput: () => {
+      agentSockets.disconnectOutput();
+    },
+    connectAgentInput: (sockPath) => {
+      agentSockets.connectInput(sockPath);
+    },
+    disconnectAgentInput: () => {
+      agentSockets.disconnectInput();
+    },
+    sendRaw: (data) => {
+      agentSockets.sendRaw(data);
+    },
+    sendResize: (cols, rows) => {
+      agentSockets.sendResize(cols, rows);
+    },
+    requestScreenSnapshot: () => {
+      agentSockets.requestScreenSnapshot();
+    },
+  });
+
   function requestStatus() {
     send({ type: "status" });
   }
+
+  const daemonMessageRouter = createDaemonMessageRouter({
+    escapeBlessed,
+    stripBlessedTags,
+    logMessage,
+    renderScreen: () => screen.render(),
+    updateDashboard,
+    requestStatus,
+    resolveStatusLine,
+    enqueueBusStatus,
+    resolveBusStatus,
+    getPending: () => pending,
+    setPending: (value) => {
+      pending = value;
+    },
+    resolveAgentDisplayName,
+    getCurrentView: () => getCurrentView(),
+    isAgentViewUsesBus: () => isAgentViewUsesBus(),
+    getViewingAgent: () => getViewingAgent(),
+    writeToAgentTerm,
+    consumePendingDelivery,
+    getPendingState,
+    beginStream,
+    appendStreamDelta,
+    finalizeStream,
+    hasStream: (publisher) => streamTracker.hasStream(publisher),
+  });
 
   const detachClient = () => {
     if (!client) return;
@@ -1963,122 +1265,16 @@ async function runChat(projectRoot) {
       buffer = lines.pop() || "";
       for (const line of lines.filter((l) => l.trim())) {
         try {
-        const msg = JSON.parse(line);
-        if (msg.type === "status") {
-          const data = msg.data || {};
-          if (typeof data.phase === "string") {
-            const text = data.text || "";
-            const item = { key: data.key, text };
-            if (data.phase === "start") {
-              enqueueBusStatus(item);
-            } else if (data.phase === "done" || data.phase === "error") {
-              resolveBusStatus(item);
-              if (text) {
-                const prefix = data.phase === "error"
-                  ? "{red-fg}✗{/red-fg}"
-                  : "{green-fg}✓{/green-fg}";
-                logMessage("status", `${prefix} ${text}`, data);
-              }
-            } else {
-              enqueueBusStatus(item);
-            }
-            screen.render();
-          } else {
-            updateDashboard(data);
+          const msg = JSON.parse(line);
+          const shouldStop = daemonMessageRouter.handleMessage(msg);
+          if (shouldStop) {
+            return;
           }
-        } else if (msg.type === "response") {
-          const payload = msg.data || {};
-          if (payload.reply) {
-            resolveStatusLine(`{green-fg}←{/green-fg} ${payload.reply}`);
-            logMessage("reply", `{green-fg}←{/green-fg} ${payload.reply}`);
-          }
-          if (payload.dispatch && payload.dispatch.length > 0) {
-            logMessage("dispatch", `{blue-fg}→{/blue-fg} Dispatched to: ${payload.dispatch.map(d => d.target || d).join(", ")}`);
-          }
-          if (payload.disambiguate && Array.isArray(payload.disambiguate.candidates) && payload.disambiguate.candidates.length > 0) {
-            pending = { disambiguate: payload.disambiguate, original: pending?.original };
-            resolveStatusLine(`{yellow-fg}?{/yellow-fg} ${payload.disambiguate.prompt || "Choose target:"}`);
-            logMessage("disambiguate", `{yellow-fg}?{/yellow-fg} ${payload.disambiguate.prompt || "Choose target:"}`);
-            payload.disambiguate.candidates.forEach((c, i) => {
-              logMessage("disambiguate", `   {cyan-fg}${i + 1}){/cyan-fg} ${c.agent_id} {gray-fg}— ${c.reason || ""}{/gray-fg}`);
-            });
-          } else {
-            pending = null;
-          }
-          if (!payload.reply && !payload.disambiguate) {
-            resolveStatusLine("{gray-fg}✓{/gray-fg} Done");
-          }
-          // opsResults are noisy JSON; keep them out of the log UI
-          screen.render();
-        } else if (msg.type === "bus") {
-          const data = msg.data || {};
-          const prefix = data.event === "broadcast" ? "{magenta-fg}⇢{/magenta-fg}" : "{blue-fg}↔{/blue-fg}";
-          let publisher = data.publisher && data.publisher !== "unknown"
-            ? data.publisher
-            : (data.event === "broadcast" ? "broadcast" : "bus");
-
-          // Try to parse message as JSON (from internal agents)
-          let displayMessage = data.message || "";
-          let isStream = false;
-          try {
-            const parsed = JSON.parse(data.message);
-            if (parsed && typeof parsed === "object" && parsed.reply) {
-              displayMessage = parsed.reply;
-            } else if (parsed && typeof parsed === "object" && parsed.stream) {
-              displayMessage = typeof parsed.delta === "string" ? parsed.delta : "";
-              isStream = true;
-            }
-          } catch {
-            // Not JSON, use as-is
-          }
-
-          // Convert literal \n to actual newlines for better display
-          if (typeof displayMessage === "string") {
-            displayMessage = displayMessage.replace(/\\n/g, "\n");
-          }
-
-          // Extract nickname if publisher is in subscriber:id format
-          let displayName = publisher;
-          if (publisher.includes(":")) {
-            // Try to get nickname from activeAgentLabelMap or all-agents.json
-            if (activeAgentLabelMap && activeAgentLabelMap.has(publisher)) {
-              displayName = activeAgentLabelMap.get(publisher);
-            } else {
-              // Fallback: read directly from all-agents.json
-              try {
-                const busPath = getUfooPaths(projectRoot).agentsFile;
-                const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
-                const meta = bus.agents && bus.agents[publisher];
-                if (meta && meta.nickname) {
-                  displayName = meta.nickname;
-                }
-              } catch {
-                // Keep original publisher ID
-              }
-            }
-          }
-
-          const line = `${prefix} {gray-fg}${displayName}{/gray-fg}: ${displayMessage}`;
-          if (isStream) {
-            recordLog("bus_stream", line, data, true);
-          } else {
-            logMessage("bus", line, data);
-          }
-          if (data.event === "agent_renamed" || data.event === "message") {
-            // 收到消息时刷新 status，更新在线 agent 列表
-            requestStatus();
-          }
-          screen.render();
-        } else if (msg.type === "error") {
-          resolveStatusLine(`{red-fg}✗{/red-fg} Error: ${msg.error}`);
-          logMessage("error", `{red-fg}✗{/red-fg} Error: ${msg.error}`);
-          screen.render();
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
       }
-    }
-  });
+    });
     const handleDisconnect = () => {
       if (client === newClient) {
         client = null;
@@ -2086,7 +1282,7 @@ async function runChat(projectRoot) {
       if (exitRequested) return;
       if (!connectionLostNotified) {
         connectionLostNotified = true;
-        logMessage("status", "{red-fg}✗{/red-fg} Daemon disconnected");
+        logMessage("status", "{white-fg}✗{/white-fg} Daemon disconnected");
       }
       void ensureConnected();
     };
@@ -2097,448 +1293,113 @@ async function runChat(projectRoot) {
 
   attachClient(client);
 
-  // Command handlers
-  async function handleDoctorCommand() {
-    logMessage("system", "{yellow-fg}⚙{/yellow-fg} Running health check...");
-
-    // Capture console output safely
-    const originalLog = console.log;
-    const originalError = console.error;
-
-    console.log = (...args) => logMessage("system", args.join(" "));
-    console.error = (...args) => logMessage("error", args.join(" "));
-
-    try {
-      const UfooDoctor = require("../doctor");
-      const doctor = new UfooDoctor(projectRoot);
-      const result = doctor.run();
-
-      if (result) {
-        logMessage("system", "{green-fg}✓{/green-fg} System healthy");
-      } else {
-        logMessage("error", "{red-fg}✗{/red-fg} Health check failed");
-      }
-      screen.render();
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Doctor check failed: ${err.message}`);
-      screen.render();
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
-    }
-  }
-
-  async function handleStatusCommand() {
-    // Display current status directly instead of requesting
-    if (activeAgents.length === 0) {
-      logMessage("system", "{cyan-fg}Status:{/cyan-fg} No active agents");
-    } else {
-      logMessage("system", `{cyan-fg}Status:{/cyan-fg} ${activeAgents.length} active agent(s)`);
-      for (const id of activeAgents) {
-        const label = getAgentLabel(id);
-        const meta = activeAgentMetaMap.get(id);
-        const mode = meta?.launch_mode || "unknown";
-        logMessage("system", `  • {cyan-fg}${label}{/cyan-fg} {gray-fg}[${mode}]{/gray-fg}`);
-      }
-    }
-
-    // Also show daemon status
-    if (isRunning(projectRoot)) {
-      logMessage("system", "{green-fg}✓{/green-fg} Daemon is running");
-    } else {
-      logMessage("system", "{red-fg}✗{/red-fg} Daemon is not running");
-    }
-  }
-
-  async function handleDaemonCommand(args) {
-    const subcommand = args[0];
-
-    if (subcommand === "start") {
-      if (isRunning(projectRoot)) {
-        logMessage("system", "{yellow-fg}⚠{/yellow-fg} Daemon already running");
-      } else {
-        logMessage("system", "{yellow-fg}⚙{/yellow-fg} Starting daemon...");
-        startDaemon(projectRoot);
-        await new Promise(r => setTimeout(r, 1000));
-        if (isRunning(projectRoot)) {
-          logMessage("system", "{green-fg}✓{/green-fg} Daemon started");
-        } else {
-          logMessage("error", "{red-fg}✗{/red-fg} Failed to start daemon");
-        }
-      }
-    } else if (subcommand === "stop") {
-      logMessage("system", "{yellow-fg}⚙{/yellow-fg} Stopping daemon...");
-      stopDaemon(projectRoot);
-      await new Promise(r => setTimeout(r, 1000));
-      if (!isRunning(projectRoot)) {
-        logMessage("system", "{green-fg}✓{/green-fg} Daemon stopped");
-      } else {
-        logMessage("error", "{red-fg}✗{/red-fg} Failed to stop daemon");
-      }
-    } else if (subcommand === "restart") {
-      logMessage("system", "{yellow-fg}⚙{/yellow-fg} Restarting daemon...");
-      await restartDaemon();
-    } else if (subcommand === "status") {
-      if (isRunning(projectRoot)) {
-        logMessage("system", "{green-fg}✓{/green-fg} Daemon is running");
-      } else {
-        logMessage("system", "{red-fg}✗{/red-fg} Daemon is not running");
-      }
-    } else {
-      logMessage("error", "{red-fg}✗{/red-fg} Unknown daemon command. Use: start, stop, restart, status");
-    }
-  }
-
-  async function handleInitCommand(args) {
-    logMessage("system", "{yellow-fg}⚙{/yellow-fg} Initializing ufoo modules...");
-
-    // Capture console output safely
-    const originalLog = console.log;
-    const originalError = console.error;
-    const logs = [];
-
-    console.log = (...args) => {
-      const msg = args.join(" ");
-      logs.push(msg);
-      // Also output to logMessage immediately to avoid UI blocking
-      logMessage("system", msg);
-    };
-    console.error = (...args) => {
-      const msg = args.join(" ");
-      logs.push(`ERROR: ${msg}`);
-      logMessage("error", msg);
-    };
-
-    try {
-      const repoRoot = path.join(__dirname, "..", "..");
-      const init = new UfooInit(repoRoot);
-      const modules = args.length > 0 ? args.join(",") : "context,bus";
-      await init.init({ modules, project: projectRoot });
-
-      logMessage("system", "{green-fg}✓{/green-fg} Initialization complete");
-      screen.render();
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Init failed: ${err.message}`);
-      if (err.stack) {
-        logMessage("error", err.stack);
-      }
-      screen.render();
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
-    }
-  }
-
-  async function handleBusCommand(args) {
-    const subcommand = args[0];
-
-    try {
-      if (subcommand === "send") {
-        if (args.length < 3) {
-          logMessage("error", "{red-fg}✗{/red-fg} Usage: /bus send <target> <message>");
-          return;
-        }
-        const target = args[1];
-        const message = args.slice(2).join(" ");
-        // Send via daemon to ensure proper publisher ID
-        send({ type: "bus_send", target, message });
-        logMessage("system", `{green-fg}✓{/green-fg} Message sent to ${target}`);
-        return;
-      }
-
-      const bus = new EventBus(projectRoot);
-
-      if (subcommand === "rename") {
-        if (args.length < 3) {
-          logMessage("error", "{red-fg}✗{/red-fg} Usage: /bus rename <agent> <nickname>");
-          return;
-        }
-        const agentId = args[1];
-        const nickname = args[2];
-        await bus.rename(agentId, nickname);
-        logMessage("system", `{green-fg}✓{/green-fg} Renamed ${agentId} to ${nickname}`);
-        requestStatus();
-      } else if (subcommand === "list") {
-        bus.ensureBus();
-        bus.loadBusData();
-        const subscribers = Object.entries(bus.busData.agents || {});
-        if (subscribers.length === 0) {
-          logMessage("system", "{gray-fg}No active agents{/gray-fg}");
-        } else {
-          logMessage("system", "{cyan-fg}Active agents:{/cyan-fg}");
-          for (const [id, meta] of subscribers) {
-            const nickname = meta.nickname ? ` (${meta.nickname})` : "";
-            const status = meta.status || "unknown";
-            logMessage("system", `  • ${id}${nickname} {gray-fg}[${status}]{/gray-fg}`);
-          }
-        }
-      } else if (subcommand === "status") {
-        bus.ensureBus();
-        bus.loadBusData();
-        const count = Object.keys(bus.busData.agents || {}).length;
-        logMessage("system", `{cyan-fg}Bus status:{/cyan-fg} ${count} agent(s) registered`);
-      } else if (subcommand === "activate") {
-        if (args.length < 2) {
-          logMessage("error", "{red-fg}✗{/red-fg} Usage: /bus activate <agent>");
-          return;
-        }
-        const target = args[1];
-        const AgentActivator = require("../bus/activate");
-        const activator = new AgentActivator(projectRoot);
-        await activator.activate(target);
-        logMessage("system", `{green-fg}✓{/green-fg} Activated ${target}`);
-      } else {
-        logMessage("error", "{red-fg}✗{/red-fg} Unknown bus command. Use: send, rename, list, status, activate");
-      }
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Bus command failed: ${err.message}`);
-    }
-  }
-
-  async function handleCtxCommand(args) {
-    logMessage("system", "{yellow-fg}⚙{/yellow-fg} Running context check...");
-
-    // Capture console output safely
-    const originalLog = console.log;
-    const originalError = console.error;
-
-    console.log = (...args) => logMessage("system", args.join(" "));
-    console.error = (...args) => logMessage("error", args.join(" "));
-
-    try {
-      const UfooContext = require("../context");
-      const ctx = new UfooContext(projectRoot);
-
-      if (args.length === 0 || args[0] === "doctor") {
-        await ctx.doctor();
-      } else if (args[0] === "decisions") {
-        await ctx.listDecisions();
-      } else {
-        await ctx.status();
-      }
-
-      screen.render();
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Context check failed: ${err.message}`);
-      screen.render();
-    } finally {
-      console.log = originalLog;
-      console.error = originalError;
-    }
-  }
-
-  async function handleSkillsCommand(args) {
-    const subcommand = args[0];
-
-    // Capture console output safely
-    const originalLog = console.log;
-    console.log = (...args) => logMessage("system", args.join(" "));
-
-    try {
-      const UfooSkills = require("../skills");
-      const skills = new UfooSkills(projectRoot);
-
-      if (subcommand === "list") {
-        const skillList = skills.list();
-        if (skillList.length === 0) {
-          logMessage("system", "{gray-fg}No skills found{/gray-fg}");
-        } else {
-          logMessage("system", `{cyan-fg}Available skills:{/cyan-fg} ${skillList.length}`);
-          for (const skill of skillList) {
-            logMessage("system", `  • ${skill}`);
-          }
-        }
-      } else if (subcommand === "install") {
-        const target = args[1] || "all";
-        logMessage("system", `{yellow-fg}⚙{/yellow-fg} Installing skills: ${target}...`);
-        await skills.install(target);
-        logMessage("system", "{green-fg}✓{/green-fg} Skills installed");
-      } else {
-        logMessage("error", "{red-fg}✗{/red-fg} Unknown skills command. Use: list, install");
-      }
-
-      screen.render();
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Skills command failed: ${err.message}`);
-      screen.render();
-    } finally {
-      console.log = originalLog;
-    }
-  }
-
-  async function handleLaunchCommand(args) {
-    if (args.length === 0) {
-      logMessage("error", "{red-fg}✗{/red-fg} Usage: /launch <claude|codex> [nickname=<name>] [count=<n>]");
-      return;
-    }
-
-    const agentType = args[0];
-    if (agentType !== "claude" && agentType !== "codex") {
-      logMessage("error", "{red-fg}✗{/red-fg} Unknown agent type. Use: claude or codex");
-      return;
-    }
-
-    // Parse options
-    const options = {};
-    for (let i = 1; i < args.length; i++) {
-      const arg = args[i];
-      if (arg.includes("=")) {
-        const [key, value] = arg.split("=", 2);
-        options[key] = value;
-      }
-    }
-
-    const nickname = options.nickname || "";
-    const count = parseInt(options.count || "1", 10);
-    if (nickname && count > 1) {
-      logMessage("error", "{red-fg}✗{/red-fg} nickname requires count=1");
-      return;
-    }
-
-    try {
-      const label = nickname ? ` (${nickname})` : "";
-      logMessage("system", `{yellow-fg}⚙{/yellow-fg} Launching ${agentType}${label}...`);
-      send({
-        type: "launch_agent",
-        agent: agentType,
-        count: Number.isFinite(count) ? count : 1,
-        nickname,
-      });
-      setTimeout(requestStatus, 1000);
-    } catch (err) {
-      logMessage("error", `{red-fg}✗{/red-fg} Launch failed: ${err.message}`);
-    }
-  }
-
-  async function handleResumeCommand(args) {
-    const target = args[0] || "";
-    const label = target ? ` (${target})` : "";
-    logMessage("system", `{yellow-fg}⚙{/yellow-fg} Resuming agents${label}...`);
-    send({ type: "resume_agents", target });
-    setTimeout(requestStatus, 1000);
-  }
-
-  function parseCommand(text) {
-    if (!text.startsWith("/")) return null;
-
-    // Split by whitespace, respecting quotes
-    const parts = text.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
-    if (parts.length === 0) return null;
-
-    const command = parts[0].slice(1); // Remove leading /
-    const args = parts.slice(1).map(arg => arg.replace(/^"|"$/g, "")); // Remove quotes
-
-    return { command, args };
-  }
+  const commandExecutor = createCommandExecutor({
+    projectRoot,
+    parseCommand,
+    escapeBlessed,
+    logMessage,
+    renderScreen: () => screen.render(),
+    getActiveAgents: () => activeAgents,
+    getActiveAgentMetaMap: () => activeAgentMetaMap,
+    getAgentLabel,
+    isDaemonRunning: isRunning,
+    startDaemon,
+    stopDaemon,
+    restartDaemon,
+    send,
+    requestStatus,
+    activateAgent: async (target) => {
+      const activator = new AgentActivator(projectRoot);
+      await activator.activate(target);
+    },
+  });
 
   async function executeCommand(text) {
-    const parsed = parseCommand(text);
-    if (!parsed) return false;
-
-    const { command, args } = parsed;
-
-    switch (command) {
-      case "doctor":
-        await handleDoctorCommand();
-        return true;
-      case "status":
-        await handleStatusCommand();
-        return true;
-      case "daemon":
-        await handleDaemonCommand(args);
-        return true;
-      case "init":
-        await handleInitCommand(args);
-        return true;
-      case "bus":
-        await handleBusCommand(args);
-        return true;
-      case "ctx":
-        await handleCtxCommand(args);
-        return true;
-      case "skills":
-        await handleSkillsCommand(args);
-        return true;
-      case "launch":
-        await handleLaunchCommand(args);
-        return true;
-      case "resume":
-        await handleResumeCommand(args);
-        return true;
-      default:
-        logMessage("error", `{red-fg}✗{/red-fg} Unknown command: /${command}`);
-        return true;
-    }
+    return commandExecutor.executeCommand(text);
   }
 
+  const submitState = {};
+  Object.defineProperties(submitState, {
+    targetAgent: { get: () => targetAgent, set: (value) => { targetAgent = value; } },
+    pending: { get: () => pending, set: (value) => { pending = value; } },
+    activeAgentMetaMap: { get: () => activeAgentMetaMap },
+  });
+
+  const inputSubmitHandler = createInputSubmitHandler({
+    state: submitState,
+    parseAtTarget,
+    resolveAgentId,
+    executeCommand,
+    queueStatusLine,
+    send,
+    logMessage,
+    getAgentLabel,
+    escapeBlessed,
+    markPendingDelivery,
+    clearTargetAgent,
+    enterAgentView,
+    activateAgent: async (agentId) => {
+      const activator = new AgentActivator(projectRoot);
+      await activator.activate(agentId);
+    },
+    getInjectSockPath,
+    existsSync: fs.existsSync,
+    commitInputHistory: (text) => {
+      if (inputHistoryController) inputHistoryController.commitSubmittedText(text);
+    },
+    focusInput: () => input.focus(),
+  });
+
   input.on("submit", async (value) => {
-    const text = value.trim();
     input.clearValue();
     screen.render();
-    if (!text) {
-      input.focus();
-      return;
-    }
-    inputHistory.push(text);
-    appendInputHistory(text);
-    historyIndex = inputHistory.length;
-    historyDraft = "";
-
-    // If target agent is selected, send via daemon
-    if (targetAgent) {
-      const label = getAgentLabel(targetAgent);
-      logMessage("user", `{cyan-fg}→{/cyan-fg} {magenta-fg}@${label}{/magenta-fg} ${text}`);
-
-      // Send via daemon socket to ensure proper publisher ID
-      send({ type: "bus_send", target: targetAgent, message: text });
-
-      clearTargetAgent();
-      input.focus();
-      return;
-    }
-
-    // Check if it's a command
-    if (text.startsWith("/")) {
-      logMessage("user", `{cyan-fg}→{/cyan-fg} ${text}`);
-      try {
-        await executeCommand(text);
-      } catch (err) {
-        logMessage("error", `{red-fg}✗{/red-fg} Command error: ${err.message}`);
-      }
-      input.focus();
-      return;
-    }
-
-    if (pending && pending.disambiguate) {
-      const idx = parseInt(text, 10);
-      const choice = pending.disambiguate.candidates[idx - 1];
-      if (choice) {
-        queueStatusLine(`ufoo-agent processing (assigning ${choice.agent_id})`);
-        send({
-          type: "prompt",
-          text: `Use agent ${choice.agent_id} to handle: ${pending.original || "the request"}`,
-        });
-        pending = null;
-      } else {
-        logMessage("error", "Invalid selection.");
-      }
-    } else {
-      pending = { original: text };
-      queueStatusLine("ufoo-agent processing");
-      send({ type: "prompt", text });
-      logMessage("user", `{cyan-fg}→{/cyan-fg} ${text}`);
-    }
-    input.focus();
+    await inputSubmitHandler.handleSubmit(value);
   });
 
   screen.key(["C-c"], exitHandler);
 
+  // Agent TTY view: enter dashboard mode
+  function enterAgentDashboardMode() {
+    if (agentViewController) {
+      agentViewController.enterAgentDashboardMode();
+    }
+  }
+
   // Dashboard navigation - use screen.on to capture even when input is focused
   screen.on("keypress", (ch, key) => {
+    // Agent TTY view: handle keystrokes
+    if (getCurrentView() === "agent") {
+      if (focusMode === "dashboard") {
+        handleDashboardKey(key);
+        return;
+      }
+      // Suppress input briefly after entering agent view
+      if (Date.now() < getAgentInputSuppressUntil()) {
+        return;
+      }
+      // Ctrl+C exits entire app
+      if (key && key.ctrl && key.name === "c") {
+        return; // handled by screen.key(["C-c"])
+      }
+      // Down arrow: enter agents bar (same pattern as normal chat dashboard)
+      if (key && key.name === "down") {
+        enterAgentDashboardMode();
+        return;
+      }
+      // All other keys (including Esc) go to agent PTY
+      const raw = keyToRaw(ch, key);
+      if (raw) {
+        sendRawToAgent(raw);
+      }
+      return;
+    }
+
+    // Normal mode: dashboard key handling
     handleDashboardKey(key);
   });
 
   screen.key(["tab"], () => {
+    if (getCurrentView() === "agent") return; // Tab goes to PTY via keypress handler
     if (focusMode === "dashboard") {
       exitDashboardMode(false);
     } else {
@@ -2547,11 +1408,13 @@ async function runChat(projectRoot) {
   });
 
   screen.key(["C-k", "M-k"], () => {
+    if (getCurrentView() === "agent") return;
     clearLog();
   });
 
 
   screen.key(["i", "enter"], () => {
+    if (getCurrentView() === "agent") return;
     if (focusMode === "dashboard") return;
     if (screen.focused === input) return;
     focusInput();
@@ -2570,43 +1433,7 @@ async function runChat(projectRoot) {
   }
   if (screen.program) {
     screen.program.on("data", (data) => {
-      if (screen.focused !== input || focusMode !== "input") return;
-      const chunk = data.toString("utf8");
-      if (!pasteActive && !chunk.includes(PASTE_START) && !pasteRemainder.includes(PASTE_START)) {
-        const keep = PASTE_START.length - 1;
-        pasteRemainder = (pasteRemainder + chunk).slice(-keep);
-        return;
-      }
-      let buffer = pasteRemainder + chunk;
-      pasteRemainder = "";
-      while (buffer.length > 0) {
-        if (!pasteActive) {
-          const start = buffer.indexOf(PASTE_START);
-          if (start === -1) {
-            const keep = PASTE_START.length - 1;
-            pasteRemainder = buffer.slice(-keep);
-            return;
-          }
-          buffer = buffer.slice(start + PASTE_START.length);
-          pasteActive = true;
-          pasteBuffer = "";
-          scheduleSuppressReset();
-          continue;
-        }
-        const end = buffer.indexOf(PASTE_END);
-        if (end === -1) {
-          pasteBuffer += buffer;
-          scheduleSuppressReset();
-          return;
-        }
-        pasteBuffer += buffer.slice(0, end);
-        buffer = buffer.slice(end + PASTE_END.length);
-        pasteActive = false;
-        scheduleSuppressReset();
-        const normalized = normalizePaste(pasteBuffer);
-        pasteBuffer = "";
-        if (normalized) insertTextAtCursor(normalized);
-      }
+      pasteController.handleProgramData(data);
     });
   }
   loadHistory();
@@ -2614,9 +1441,19 @@ async function runChat(projectRoot) {
   renderDashboard();
   resizeInput();
   requestStatus();
+
+  // 定期刷新 dashboard 状态（兜底，daemon 会主动推送变化）
+  setInterval(() => {
+    if (client && !client.destroyed) {
+      requestStatus();
+    }
+  }, 30000);
   screen.on("resize", () => {
+    if (handleResizeInAgentView()) {
+      return;
+    }
     resizeInput();
-    if (completionActive) hideCompletion();
+    if (completionController.isActive()) completionController.hide();
     input._updateCursor();
     screen.render();
   });

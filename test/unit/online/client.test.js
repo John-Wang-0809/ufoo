@@ -1,4 +1,4 @@
-const OnlineServer = require('../../../src/online');
+const OnlineServer = require('../../../src/online/server');
 const OnlineClient = require('../../../src/online/client');
 const { generateToken, hashToken } = require('../../../src/online/tokens');
 
@@ -26,7 +26,6 @@ function createPeer(server, tokenHash, opts = {}) {
     url: `ws://127.0.0.1:${server.port}/ufoo/online`,
     subscriberId: opts.subscriberId || `peer-${Math.random().toString(16).slice(2)}`,
     nickname: opts.nickname || `peer-${Math.random().toString(16).slice(2)}`,
-    channelType: opts.channelType || 'world',
     tokenHash,
   });
   return client;
@@ -59,12 +58,12 @@ describe('OnlineClient (Phase 1)', () => {
     client = createPeer(server, hashToken(token), {
       subscriberId: 'codex:alpha',
       nickname: 'alpha',
-      channelType: 'private',
+
     });
     peer = createPeer(server, hashToken(token), {
       subscriberId: 'claude:beta',
       nickname: 'beta',
-      channelType: 'private',
+
     });
 
     await client.connect();

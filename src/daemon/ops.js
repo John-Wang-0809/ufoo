@@ -5,6 +5,7 @@ const { loadConfig } = require("../config");
 const { getUfooPaths } = require("../ufoo/paths");
 const { loadAgentsData, saveAgentsData } = require("../ufoo/agentsStore");
 const { isAgentPidAlive, getTtyProcessInfo } = require("../bus/utils");
+const { isITerm2 } = require("../terminal/detect");
 
 function resolveAgentId(projectRoot, agentId) {
   if (!agentId) return agentId;
@@ -26,19 +27,6 @@ function resolveAgentId(projectRoot, agentId) {
   return agentId;
 }
 
-function runAppleScript(lines) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn("osascript", lines.flatMap((l) => ["-e", l]));
-    let stderr = "";
-    proc.stderr.on("data", (d) => {
-      stderr += d.toString("utf8");
-    });
-    proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr || "osascript failed"));
-    });
-  });
-}
 
 function listSubscribers(projectRoot, agentType) {
   const busPath = getUfooPaths(projectRoot).agentsFile;
@@ -72,6 +60,123 @@ function escapeCommand(cmd) {
 function shellEscape(value) {
   const str = String(value);
   return `'${str.replace(/'/g, `'\\''`)}'`;
+}
+
+function escapeAppleScriptString(str) {
+  return String(str).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function runAppleScript(lines) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("osascript", lines.flatMap((l) => ["-e", l]));
+    let stderr = "";
+    let stdout = "";
+    proc.stderr.on("data", (d) => {
+      stderr += d.toString("utf8");
+    });
+    proc.stdout.on("data", (d) => {
+      stdout += d.toString("utf8");
+    });
+    proc.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(stderr || "osascript failed"));
+    });
+  });
+}
+
+async function openTerminalWindow(runCmd) {
+  if (process.platform !== "darwin") {
+    throw new Error("Terminal mode is only supported on macOS");
+  }
+
+  const escaped = escapeAppleScriptString(runCmd);
+
+  if (isITerm2()) {
+    try {
+      const script = [
+        'tell application "iTerm2"',
+        "  tell current window",
+        `    create tab with default profile command "${escaped}"`,
+        "  end tell",
+        "  activate",
+        "end tell",
+      ];
+      await runAppleScript(script);
+      return;
+    } catch {
+      // fall back to Terminal.app
+    }
+  }
+
+  const script = [
+    'tell application "Terminal"',
+    `do script "${escaped}"`,
+    "activate",
+    "end tell",
+  ];
+  await runAppleScript(script);
+}
+
+async function closeTerminalWindowByTty(ttyPath, preferApp = "") {
+  if (process.platform !== "darwin") return false;
+  if (!ttyPath) return false;
+
+  const escaped = escapeAppleScriptString(ttyPath);
+
+  const tryITerm = async () => {
+    const script = [
+      'tell application "iTerm2"',
+      "  repeat with w in windows",
+      "    repeat with t in tabs of w",
+      "      repeat with s in sessions of t",
+      `        if tty of s is \"${escaped}\" then`,
+      "          close t",
+      '          return "ok"',
+      "        end if",
+      "      end repeat",
+      "    end repeat",
+      "  end repeat",
+      "end tell",
+      'return "not found"',
+    ];
+    const res = await runAppleScript(script);
+    return res === "ok";
+  };
+
+  const tryTerminal = async () => {
+    const script = [
+      'tell application "Terminal"',
+      "  repeat with w in windows",
+      "    repeat with t in tabs of w",
+      `      if tty of t is \"${escaped}\" then`,
+      "        close t",
+      "        if (count of tabs of w) is 0 then close w",
+      '        return "ok"',
+      "      end if",
+      "    end repeat",
+      "  end repeat",
+      "end tell",
+      'return "not found"',
+    ];
+    const res = await runAppleScript(script);
+    return res === "ok";
+  };
+
+  const prefer = (preferApp || "").toLowerCase();
+  const order = prefer === "terminal"
+    ? [tryTerminal, tryITerm]
+    : prefer === "iterm2"
+      ? [tryITerm, tryTerminal]
+      : [tryITerm, tryTerminal];
+
+  for (const attempt of order) {
+    try {
+      if (await attempt()) return true;
+    } catch {
+      // ignore and try next
+    }
+  }
+  return false;
 }
 
 function buildTitleCmd(title) {
@@ -123,39 +228,12 @@ async function spawnManagedTerminalAgent(projectRoot, agent, nickname = "", proc
   const titleCmd = buildTitleCmd(nickname);
   const prefix = titleCmd ? `${titleCmd} && ` : "";
 
-  const logFile = path.join(runDir, `terminal-${agent}-${Date.now()}.log`);
   const runCmd = `cd ${shellEscape(projectRoot)} && ${prefix}${modeEnv}${nickEnv}${envPrefix}${binary}${argText}`;
 
-  // Spawn managed agent as daemon child using a PTY via `script`
-  const scriptCmd = `bash -lc ${shellEscape(runCmd)}`;
-  const child = spawn("script", ["-q", logFile, "-c", scriptCmd], {
-    detached: false,
-    stdio: ["ignore", "ignore", "ignore"],
-    cwd: projectRoot,
-    env: {
-      ...process.env,
-      UFOO_LAUNCH_MODE: "terminal",
-      UFOO_NICKNAME: nickname || "",
-    },
-  });
-
-  if (processManager) {
-    processManager.register(`terminal-${agent}-${child.pid}`, child);
-  }
-
-  // Open Terminal.app to tail logs for visibility
-  if (process.platform === "darwin") {
-    const script = [
-      'tell application "Terminal"',
-      `do script "${escapeCommand(`tail -n +1 -f ${logFile}`)}"`,
-      "activate",
-      "end tell",
-    ];
-    await runAppleScript(script);
-  }
+  await openTerminalWindow(runCmd);
 
   const subscriberId = await waitForNewSubscriber(projectRoot, agentType, existing, 15000);
-  return { child, subscriberId: subscriberId || null };
+  return { child: null, subscriberId: subscriberId || null };
 }
 
 async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", processManager = null) {
@@ -216,10 +294,34 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
       },
     });
 
+    // Update bus data with the actual child PID so isMetaActive
+    // can detect when the ptyRunner process dies.
+    try {
+      bus.loadBusData();
+      if (bus.busData.agents && bus.busData.agents[subscriberId]) {
+        bus.busData.agents[subscriberId].pid = child.pid;
+      }
+      bus.saveBusData();
+    } catch {
+      // ignore pid update errors
+    }
+
     // 本地日志记录
     child.on("exit", (code, signal) => {
       try {
         fs.closeSync(errLog);
+      } catch {
+        // ignore
+      }
+
+      // Mark agent as inactive when its process exits
+      try {
+        bus.loadBusData();
+        if (bus.busData.agents && bus.busData.agents[subscriberId]) {
+          bus.busData.agents[subscriberId].status = "inactive";
+          bus.busData.agents[subscriberId].last_seen = new Date().toISOString();
+        }
+        bus.saveBusData();
       } catch {
         // ignore
       }
@@ -449,12 +551,23 @@ async function closeAgent(projectRoot, agentId) {
   const resolvedId = resolveAgentId(projectRoot, agentId);
   const busPath = getUfooPaths(projectRoot).agentsFile;
   let pid = null;
+  let launchMode = "";
+  let tty = "";
+  let terminalApp = "";
   try {
     const bus = JSON.parse(fs.readFileSync(busPath, "utf8"));
     const entry = bus.agents?.[resolvedId];
-    if (entry && entry.pid) pid = entry.pid;
+    if (entry) {
+      if (entry.pid) pid = entry.pid;
+      launchMode = entry.launch_mode || "";
+      tty = entry.tty || "";
+      terminalApp = entry.terminal_app || "";
+    }
   } catch {
     pid = null;
+  }
+  if (launchMode === "terminal" && tty) {
+    await closeTerminalWindowByTty(tty, terminalApp);
   }
   if (!pid) return false;
   try {

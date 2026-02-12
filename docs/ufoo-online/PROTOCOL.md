@@ -24,7 +24,8 @@ requirements for a secure first pass.
 
 ## Transport
 
-**Recommended**: WebSocket over TLS (`wss://`).
+**Recommended**: WebSocket over TLS (`wss://`). Clients should refuse `ws://`
+to non-localhost targets unless explicitly overridden for dev.
 
 ### Connection
 
@@ -222,8 +223,9 @@ Future phases may add:
 
 ## Security
 
-- TLS required for remote use.
+- TLS required for remote use; non-local `ws://` should be blocked unless explicitly allowed.
 - Token auth is mandatory in Phase 1.
+- HTTP room/channel management must be authenticated (Bearer token).
 - Server must validate `subscriber_id` uniqueness and prevent spoofing.
 
 ---

@@ -50,7 +50,7 @@ describe('QueueManager', () => {
   describe('path getters', () => {
     it('getOffsetPath should return correct offset file path', () => {
       const offsetPath = manager.getOffsetPath('claude-code:abc123');
-      expect(offsetPath).toBe(path.join(testBusDir, 'queues', 'claude-code_abc123.offset'));
+      expect(offsetPath).toBe(path.join(testBusDir, 'offsets', 'claude-code_abc123.offset'));
     });
 
     it('getPendingPath should return correct pending file path', () => {

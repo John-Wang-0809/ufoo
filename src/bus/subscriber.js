@@ -3,6 +3,13 @@ const { getTimestamp, isAgentPidAlive, isValidTty, getTtyProcessInfo } = require
 const NicknameManager = require("./nickname");
 const { spawnSync } = require("child_process");
 
+function detectTerminalAppFromEnv() {
+  const termProgram = process.env.TERM_PROGRAM || "";
+  if (process.env.ITERM_SESSION_ID || termProgram === "iTerm.app") return "iterm2";
+  if (termProgram === "Apple_Terminal") return "terminal";
+  return termProgram || "";
+}
+
 /**
  * 获取当前终端的 tty 路径
  */
@@ -190,6 +197,16 @@ class SubscriberManager {
       tmux_pane: options.tmuxPane || process.env.TMUX_PANE || "",
       launch_mode: launchMode,
     };
+
+    const terminalApp = options.terminalApp || detectTerminalAppFromEnv();
+    if (terminalApp) {
+      this.busData.agents[subscriber].terminal_app = terminalApp;
+    }
+
+    // 如果传入了 providerSessionId（从旧 session 恢复），设置它
+    if (options.providerSessionId) {
+      this.busData.agents[subscriber].provider_session_id = options.providerSessionId;
+    }
 
     // 保存 tty 信息
     if (this.busData.agents[subscriber].tty) {

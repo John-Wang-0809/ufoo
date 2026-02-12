@@ -1,4 +1,4 @@
-const OnlineServer = require('../../../src/online');
+const OnlineServer = require('../../../src/online/server');
 const WebSocket = require('ws');
 
 function waitForOpen(ws) {
@@ -8,7 +8,7 @@ function waitForOpen(ws) {
 
 describe('OnlineServer idle timeout', () => {
   test('disconnects idle clients', async () => {
-    const server = new OnlineServer({ host: '127.0.0.1', port: 0, idleTimeoutMs: 50, sweepIntervalMs: 20 });
+    const server = new OnlineServer({ host: '127.0.0.1', port: 0, idleTimeoutMs: 50, sweepIntervalMs: 20, insecure: true });
     await server.start();
     const port = server.port;
 

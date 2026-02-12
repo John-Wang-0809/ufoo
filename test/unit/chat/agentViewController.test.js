@@ -1,0 +1,215 @@
+const { createAgentViewController } = require("../../../src/chat/agentViewController");
+
+function createHarness(overrides = {}) {
+  let focusMode = "input";
+  let selectedAgentIndex = -1;
+  let dashboardView = "agents";
+  let windowStart = 0;
+
+  const childA = { id: "a" };
+  const childB = { id: "b" };
+  const children = [childA, childB];
+
+  const screen = {
+    children,
+    render: jest.fn(),
+    remove: jest.fn((child) => {
+      const idx = children.indexOf(child);
+      if (idx >= 0) children.splice(idx, 1);
+    }),
+    append: jest.fn((child) => {
+      children.push(child);
+    }),
+    alloc: jest.fn(),
+    program: {
+      showCursor: jest.fn(),
+    },
+    grabKeys: false,
+  };
+  const input = {
+    _updateCursor: jest.fn(),
+  };
+  const processStdout = {
+    rows: 30,
+    columns: 100,
+    write: jest.fn(),
+  };
+  const connectAgentOutput = jest.fn();
+  const disconnectAgentOutput = jest.fn();
+  const connectAgentInput = jest.fn();
+  const disconnectAgentInput = jest.fn();
+  const sendRaw = jest.fn();
+  const sendResize = jest.fn();
+  const requestScreenSnapshot = jest.fn();
+  const setFocusMode = jest.fn((value) => { focusMode = value; });
+  const setSelectedAgentIndex = jest.fn((value) => { selectedAgentIndex = value; });
+  const setDashboardView = jest.fn((value) => { dashboardView = value; });
+  const setAgentListWindowStart = jest.fn((value) => { windowStart = value; });
+  const setScreenGrabKeys = jest.fn((value) => { screen.grabKeys = Boolean(value); });
+  const clearTargetAgent = jest.fn();
+  const renderDashboard = jest.fn();
+  const focusInput = jest.fn();
+  const resizeInput = jest.fn();
+  const renderScreen = jest.fn();
+  const now = jest.fn(() => 1000);
+  const setTimeoutFn = jest.fn((fn) => {
+    fn();
+    return 1;
+  });
+  const computeAgentBar = jest.fn(() => ({ bar: "BAR", windowStart: 2 }));
+
+  const controller = createAgentViewController({
+    screen,
+    input,
+    processStdout,
+    now,
+    setTimeoutFn,
+    computeAgentBar,
+    agentBarHints: { normal: "n", dashboard: "d" },
+    maxAgentWindow: 4,
+    getFocusMode: () => focusMode,
+    setFocusMode,
+    getSelectedAgentIndex: () => selectedAgentIndex,
+    setSelectedAgentIndex,
+    getActiveAgents: () => ["codex:1", "claude:1"],
+    getAgentListWindowStart: () => windowStart,
+    setAgentListWindowStart,
+    getAgentLabel: (id) => id,
+    setDashboardView,
+    setScreenGrabKeys,
+    clearTargetAgent,
+    renderDashboard,
+    focusInput,
+    resizeInput,
+    renderScreen,
+    getInjectSockPath: (id) => `/tmp/${id}.sock`,
+    connectAgentOutput,
+    disconnectAgentOutput,
+    connectAgentInput,
+    disconnectAgentInput,
+    sendRaw,
+    sendResize,
+    requestScreenSnapshot,
+    ...overrides,
+  });
+
+  return {
+    controller,
+    screen,
+    input,
+    processStdout,
+    connectAgentOutput,
+    disconnectAgentOutput,
+    connectAgentInput,
+    disconnectAgentInput,
+    sendRaw,
+    sendResize,
+    requestScreenSnapshot,
+    setFocusMode,
+    setSelectedAgentIndex,
+    setDashboardView,
+    setAgentListWindowStart,
+    setScreenGrabKeys,
+    clearTargetAgent,
+    renderDashboard,
+    focusInput,
+    resizeInput,
+    renderScreen,
+    computeAgentBar,
+    getState: () => ({ focusMode, selectedAgentIndex, dashboardView, windowStart }),
+  };
+}
+
+describe("chat agentViewController", () => {
+  test("requires screen", () => {
+    expect(() => createAgentViewController({})).toThrow(/requires screen\.render/);
+  });
+
+  test("enterAgentView switches to agent mode and connects sockets", () => {
+    const {
+      controller,
+      connectAgentOutput,
+      connectAgentInput,
+      sendResize,
+      requestScreenSnapshot,
+      processStdout,
+      getState,
+    } = createHarness();
+
+    controller.enterAgentView("codex:1");
+
+    expect(controller.getCurrentView()).toBe("agent");
+    expect(controller.getViewingAgent()).toBe("codex:1");
+    expect(connectAgentOutput).toHaveBeenCalledWith("/tmp/codex:1.sock");
+    expect(connectAgentInput).toHaveBeenCalledWith("/tmp/codex:1.sock");
+    expect(sendResize).toHaveBeenCalledWith(100, 29);
+    expect(requestScreenSnapshot).toHaveBeenCalled();
+    expect(controller.getAgentInputSuppressUntil()).toBe(1300);
+    expect(getState().focusMode).toBe("input");
+    expect(processStdout.write).toHaveBeenCalled();
+  });
+
+  test("exitAgentView restores blessed mode and focus", () => {
+    const {
+      controller,
+      disconnectAgentOutput,
+      disconnectAgentInput,
+      setDashboardView,
+      setSelectedAgentIndex,
+      setScreenGrabKeys,
+      clearTargetAgent,
+      renderDashboard,
+      focusInput,
+      resizeInput,
+      renderScreen,
+    } = createHarness();
+
+    controller.enterAgentView("codex:1");
+    controller.exitAgentView();
+
+    expect(controller.getCurrentView()).toBe("main");
+    expect(controller.getViewingAgent()).toBe("");
+    expect(disconnectAgentOutput).toHaveBeenCalled();
+    expect(disconnectAgentInput).toHaveBeenCalled();
+    expect(setDashboardView).toHaveBeenCalledWith("agents");
+    expect(setSelectedAgentIndex).toHaveBeenCalledWith(-1);
+    expect(setScreenGrabKeys).toHaveBeenCalledWith(false);
+    expect(clearTargetAgent).toHaveBeenCalled();
+    expect(renderDashboard).toHaveBeenCalled();
+    expect(focusInput).toHaveBeenCalled();
+    expect(resizeInput).toHaveBeenCalled();
+    expect(renderScreen).toHaveBeenCalled();
+  });
+
+  test("enterAgentDashboardMode enables dashboard focus and output suppression", () => {
+    const { controller, getState } = createHarness();
+
+    controller.enterAgentView("codex:1");
+    controller.enterAgentDashboardMode();
+
+    expect(getState().focusMode).toBe("dashboard");
+    expect(getState().selectedAgentIndex).toBe(0);
+    expect(controller.getAgentOutputSuppressed()).toBe(true);
+  });
+
+  test("writeToAgentTerm sanitizes terminal queries", () => {
+    const { controller, processStdout } = createHarness();
+
+    controller.enterAgentView("codex:1");
+    processStdout.write.mockClear();
+    controller.writeToAgentTerm("hello\x1b[6n");
+
+    expect(processStdout.write).toHaveBeenCalledWith("hello");
+  });
+
+  test("resize handler only acts in agent view", () => {
+    const { controller, sendResize } = createHarness();
+
+    expect(controller.handleResizeInAgentView()).toBe(false);
+
+    controller.enterAgentView("codex:1");
+    sendResize.mockClear();
+    expect(controller.handleResizeInAgentView()).toBe(true);
+    expect(sendResize).toHaveBeenCalledWith(100, 29);
+  });
+});

@@ -39,8 +39,8 @@ function loadTokens(filePath = defaultTokensPath()) {
 
 function saveTokens(filePath = defaultTokensPath(), data = { agents: {} }) {
   const dir = path.dirname(filePath);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), { mode: 0o600 });
 }
 
 function setToken(filePath, agentId, token, server = "", extra = {}) {
@@ -71,6 +71,19 @@ function getToken(filePath, agentId) {
   return data.agents[agentId] || null;
 }
 
+function getTokenByNickname(filePath, nickname) {
+  const data = loadTokens(filePath);
+  let best = null;
+  for (const entry of Object.values(data.agents)) {
+    if (entry.nickname === nickname) {
+      if (!best || (entry.updated_at || "") > (best.updated_at || "")) {
+        best = entry;
+      }
+    }
+  }
+  return best;
+}
+
 function listTokens(filePath) {
   const data = loadTokens(filePath);
   return Object.entries(data.agents).map(([id, entry]) => ({ id, ...entry }));
@@ -85,5 +98,6 @@ module.exports = {
   setToken,
   removeToken,
   getToken,
+  getTokenByNickname,
   listTokens,
 };

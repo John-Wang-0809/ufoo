@@ -1,6 +1,7 @@
 const StatusDisplay = require('../../../src/status');
 const fs = require('fs');
 const path = require('path');
+const childProcess = require('child_process');
 
 describe('StatusDisplay', () => {
   const testProjectRoot = '/tmp/ufoo-status-test';
@@ -9,6 +10,7 @@ describe('StatusDisplay', () => {
   let consoleErrorSpy;
   let consoleLogSpy;
   let processExitSpy;
+  let spawnSyncSpy;
 
   beforeEach(() => {
     if (fs.existsSync(testProjectRoot)) {
@@ -32,6 +34,10 @@ describe('StatusDisplay', () => {
     consoleErrorSpy.mockRestore();
     consoleLogSpy.mockRestore();
     processExitSpy.mockRestore();
+    if (spawnSyncSpy) {
+      spawnSyncSpy.mockRestore();
+      spawnSyncSpy = null;
+    }
 
     // Clean up environment variables
     delete process.env.UFOO_SUBSCRIBER_ID;
@@ -93,10 +99,13 @@ describe('StatusDisplay', () => {
       };
       fs.writeFileSync(busFile, JSON.stringify(busData), 'utf8');
 
-      // This test is difficult to mock properly without causing recursion
-      // Just test the logic directly
-      const result = busData.agents['claude-code:abc123'];
-      expect(result.tty).toBe('/dev/ttys001');
+      spawnSyncSpy = jest.spyOn(childProcess, 'spawnSync').mockReturnValue({
+        status: 0,
+        stdout: '/dev/ttys001\n',
+      });
+
+      const subscriber = statusDisplay.getCurrentSubscriber();
+      expect(subscriber).toBe('claude-code:abc123');
     });
   });
 
@@ -308,7 +317,7 @@ describe('StatusDisplay', () => {
   });
 
   describe('showBanner', () => {
-    it('should show simple banner if banner.sh does not exist', () => {
+    it('should show banner with subscriber', () => {
       statusDisplay.showBanner('claude-code:abc123');
 
       expect(consoleLogSpy).toHaveBeenCalledWith('=== ufoo status ===');
@@ -320,55 +329,6 @@ describe('StatusDisplay', () => {
 
       expect(consoleLogSpy).toHaveBeenCalledWith('=== ufoo status ===');
       expect(consoleLogSpy).toHaveBeenCalledWith(); // Empty line
-    });
-
-    it('should call bash script if exists', () => {
-      // Create a mock banner.sh
-      const scriptsDir = path.join(__dirname, '../../../scripts');
-      const bannerScript = path.join(scriptsDir, 'banner.sh');
-
-      if (!fs.existsSync(scriptsDir)) {
-        fs.mkdirSync(scriptsDir, { recursive: true });
-      }
-      fs.writeFileSync(bannerScript, '#!/bin/bash\nshow_banner() { echo "Custom Banner"; }', 'utf8');
-      fs.chmodSync(bannerScript, '755');
-
-      const { spawnSync } = require('child_process');
-      const spawnSyncSpy = jest.spyOn(require('child_process'), 'spawnSync')
-        .mockReturnValue({ status: 0 });
-
-      statusDisplay.showBanner('codex:xyz789');
-
-      expect(spawnSyncSpy).toHaveBeenCalled();
-      const callArgs = spawnSyncSpy.mock.calls[0];
-      expect(callArgs[0]).toBe('bash');
-      expect(callArgs[1][1]).toContain('show_banner');
-
-      spawnSyncSpy.mockRestore();
-      fs.unlinkSync(bannerScript);
-    });
-
-    it('should fallback if bash script fails', () => {
-      const scriptsDir = path.join(__dirname, '../../../scripts');
-      const bannerScript = path.join(scriptsDir, 'banner.sh');
-
-      if (!fs.existsSync(scriptsDir)) {
-        fs.mkdirSync(scriptsDir, { recursive: true });
-      }
-      fs.writeFileSync(bannerScript, '#!/bin/bash\nexit 1', 'utf8');
-      fs.chmodSync(bannerScript, '755');
-
-      const { spawnSync } = require('child_process');
-      const spawnSyncSpy = jest.spyOn(require('child_process'), 'spawnSync')
-        .mockReturnValue({ status: 1 });
-
-      statusDisplay.showBanner('claude-code:abc123');
-
-      expect(consoleLogSpy).toHaveBeenCalledWith('=== ufoo status ===');
-      expect(consoleLogSpy).toHaveBeenCalledWith('Agent: claude-code:abc123');
-
-      spawnSyncSpy.mockRestore();
-      fs.unlinkSync(bannerScript);
     });
   });
 

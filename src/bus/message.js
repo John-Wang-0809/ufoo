@@ -6,9 +6,13 @@ const {
   readJSONL,
   appendJSONL,
   readLastLine,
-  readJSON,
+  isPidAlive,
 } = require("./utils");
 const NicknameManager = require("./nickname");
+
+const SEQ_LOCK_TIMEOUT_MS = 5000;
+const SEQ_LOCK_POLL_MS = 25;
+const SEQ_LOCK_STALE_MS = 30000;
 
 /**
  * 消息管理器
@@ -19,17 +23,17 @@ class MessageManager {
     this.busData = busData;
     this.queueManager = queueManager;
     this.eventsDir = path.join(busDir, "events");
+    this.seqFile = path.join(busDir, "seq.counter");
+    this.seqLockFile = path.join(busDir, "seq.counter.lock");
   }
 
   /**
-   * 获取下一个全局序号
+   * 从 events 日志中恢复最大序号（仅用于 counter 缺失时）
    */
-  async getNextSeq() {
-    // 读取所有 events/*.jsonl 文件，找到最大的 seq
+  readMaxSeqFromEvents() {
     let maxSeq = 0;
-
     if (!fs.existsSync(this.eventsDir)) {
-      return 1;
+      return maxSeq;
     }
 
     const files = fs.readdirSync(this.eventsDir)
@@ -54,7 +58,116 @@ class MessageManager {
       }
     }
 
-    return maxSeq + 1;
+    return maxSeq;
+  }
+
+  readSeqCounter() {
+    try {
+      const raw = fs.readFileSync(this.seqFile, "utf8").trim();
+      const parsed = parseInt(raw, 10);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        return parsed;
+      }
+    } catch {
+      // ignore
+    }
+    return 0;
+  }
+
+  writeSeqCounter(seq) {
+    fs.mkdirSync(path.dirname(this.seqFile), { recursive: true });
+    fs.writeFileSync(this.seqFile, `${seq}\n`, "utf8");
+  }
+
+  cleanupStaleSeqLock() {
+    if (!fs.existsSync(this.seqLockFile)) return;
+    let shouldRemove = false;
+
+    try {
+      const raw = fs.readFileSync(this.seqLockFile, "utf8").trim();
+      const pid = parseInt(raw, 10);
+      if (!Number.isFinite(pid) || pid <= 0) {
+        shouldRemove = true;
+      } else if (!isPidAlive(pid)) {
+        shouldRemove = true;
+      }
+    } catch {
+      shouldRemove = true;
+    }
+
+    if (!shouldRemove) {
+      try {
+        const stat = fs.statSync(this.seqLockFile);
+        if (Date.now() - stat.mtimeMs > SEQ_LOCK_STALE_MS) {
+          shouldRemove = true;
+        }
+      } catch {
+        shouldRemove = true;
+      }
+    }
+
+    if (shouldRemove) {
+      try {
+        fs.unlinkSync(this.seqLockFile);
+      } catch {
+        // ignore stale lock cleanup errors
+      }
+    }
+  }
+
+  async acquireSeqLock() {
+    const deadline = Date.now() + SEQ_LOCK_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      try {
+        const fd = fs.openSync(this.seqLockFile, "wx");
+        fs.writeSync(fd, `${process.pid}\n`);
+        return fd;
+      } catch (err) {
+        if (err && err.code === "EEXIST") {
+          this.cleanupStaleSeqLock();
+          // eslint-disable-next-line no-await-in-loop
+          await new Promise((resolve) => setTimeout(resolve, SEQ_LOCK_POLL_MS));
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error("Failed to acquire sequence lock");
+  }
+
+  releaseSeqLock(lockFd) {
+    try {
+      if (typeof lockFd === "number") {
+        fs.closeSync(lockFd);
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (fs.existsSync(this.seqLockFile)) {
+        fs.unlinkSync(this.seqLockFile);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * 获取下一个全局序号（文件锁保证跨进程原子递增）
+   */
+  async getNextSeq() {
+    const lockFd = await this.acquireSeqLock();
+    try {
+      let current = this.readSeqCounter();
+      if (current === 0) {
+        current = this.readMaxSeqFromEvents();
+      }
+      const next = current + 1;
+      this.writeSeqCounter(next);
+      return next;
+    } finally {
+      this.releaseSeqLock(lockFd);
+    }
   }
 
   /**

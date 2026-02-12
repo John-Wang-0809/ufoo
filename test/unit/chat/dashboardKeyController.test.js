@@ -1,0 +1,169 @@
+const { createDashboardKeyController } = require("../../../src/chat/dashboardKeyController");
+
+function createState(overrides = {}) {
+  return {
+    currentView: "main",
+    focusMode: "dashboard",
+    dashboardView: "agents",
+    selectedAgentIndex: 0,
+    activeAgents: ["codex:1", "claude:2"],
+    viewingAgent: "codex:1",
+    activeAgentMetaMap: new Map([
+      ["codex:1", { launch_mode: "internal" }],
+      ["claude:2", { launch_mode: "terminal" }],
+    ]),
+    selectedModeIndex: 0,
+    selectedProviderIndex: 0,
+    selectedResumeIndex: 0,
+    launchMode: "terminal",
+    agentProvider: "codex-cli",
+    autoResume: true,
+    providerOptions: [
+      { label: "codex", value: "codex-cli" },
+      { label: "claude", value: "claude-cli" },
+    ],
+    resumeOptions: [
+      { label: "Resume previous session", value: true },
+      { label: "Start new session", value: false },
+    ],
+    agentOutputSuppressed: true,
+    ...overrides,
+  };
+}
+
+function createController(stateOverrides = {}, optionOverrides = {}) {
+  const state = createState(stateOverrides);
+  const deps = {
+    existsSync: jest.fn(() => false),
+    getInjectSockPath: jest.fn((agentId) => `/tmp/${agentId}.sock`),
+    activateAgent: jest.fn(),
+    requestCloseAgent: jest.fn(),
+    enterAgentView: jest.fn(),
+    exitAgentView: jest.fn(),
+    setAgentBarVisible: jest.fn(),
+    requestAgentSnapshot: jest.fn(),
+    clearTargetAgent: jest.fn(),
+    restoreTargetFromSelection: jest.fn(),
+    syncTargetFromSelection: jest.fn(),
+    exitDashboardMode: jest.fn(),
+    setLaunchMode: jest.fn(),
+    setAgentProvider: jest.fn(),
+    setAutoResume: jest.fn(),
+    clampAgentWindow: jest.fn(),
+    clampAgentWindowWithSelection: jest.fn(),
+    renderDashboard: jest.fn(),
+    renderAgentDashboard: jest.fn(),
+    renderScreen: jest.fn(),
+    setScreenGrabKeys: jest.fn(),
+    ...optionOverrides,
+  };
+
+  const controller = createDashboardKeyController({ state, ...deps });
+  return { state, deps, controller };
+}
+
+describe("chat dashboardKeyController", () => {
+  test("throws when state object is missing", () => {
+    expect(() => createDashboardKeyController({})).toThrow(/requires a mutable state object/);
+  });
+
+  test("returns false when not in dashboard focus", () => {
+    const { controller } = createController({ focusMode: "input" });
+    expect(controller.handleDashboardKey({ name: "left" })).toBe(false);
+  });
+
+  test("mode view handles navigation and apply", () => {
+    const { state, deps, controller } = createController({
+      dashboardView: "mode",
+      selectedModeIndex: 0,
+      agentProvider: "claude-cli",
+    });
+
+    expect(controller.handleDashboardKey({ name: "left" })).toBe(true);
+    expect(state.selectedModeIndex).toBe(2);
+
+    expect(controller.handleDashboardKey({ name: "down" })).toBe(true);
+    expect(state.dashboardView).toBe("provider");
+    expect(state.selectedProviderIndex).toBe(1);
+
+    state.dashboardView = "mode";
+    state.selectedModeIndex = 1;
+    expect(controller.handleDashboardKey({ name: "enter" })).toBe(true);
+    expect(deps.setLaunchMode).toHaveBeenCalledWith("tmux");
+    expect(deps.exitDashboardMode).toHaveBeenCalledWith(false);
+  });
+
+  test("agents view enter activates external mode agent", () => {
+    const { state, deps, controller } = createController({
+      dashboardView: "agents",
+      selectedAgentIndex: 1,
+      activeAgentMetaMap: new Map([
+        ["codex:1", { launch_mode: "internal" }],
+        ["claude:2", { launch_mode: "terminal" }],
+      ]),
+    });
+
+    expect(controller.handleDashboardKey({ name: "enter" })).toBe(true);
+    expect(deps.clearTargetAgent).toHaveBeenCalled();
+    expect(deps.exitDashboardMode).toHaveBeenCalledWith(false);
+    expect(deps.activateAgent).toHaveBeenCalledWith("claude:2");
+    expect(deps.enterAgentView).not.toHaveBeenCalled();
+    expect(state.focusMode).toBe("dashboard");
+  });
+
+  test("agents view enter opens internal agent when inject socket exists", () => {
+    const { state, deps, controller } = createController(
+      {
+        dashboardView: "agents",
+        selectedAgentIndex: 0,
+        activeAgentMetaMap: new Map([["codex:1", { launch_mode: "internal" }]]),
+      },
+      { existsSync: jest.fn(() => true) }
+    );
+
+    expect(controller.handleDashboardKey({ name: "enter" })).toBe(true);
+    expect(deps.clearTargetAgent).toHaveBeenCalled();
+    expect(state.focusMode).toBe("input");
+    expect(state.dashboardView).toBe("agents");
+    expect(state.selectedAgentIndex).toBe(-1);
+    expect(deps.setScreenGrabKeys).toHaveBeenCalledWith(false);
+    expect(deps.enterAgentView).toHaveBeenCalledWith("codex:1");
+    expect(deps.exitDashboardMode).not.toHaveBeenCalled();
+  });
+
+  test("agent view ctrl+x closes selected agent and switches to next", () => {
+    const { state, deps, controller } = createController({
+      currentView: "agent",
+      focusMode: "dashboard",
+      selectedAgentIndex: 1,
+      activeAgents: ["codex:1", "codex:3"],
+      viewingAgent: "codex:1",
+      activeAgentMetaMap: new Map([
+        ["codex:1", { launch_mode: "internal" }],
+        ["codex:3", { launch_mode: "internal" }],
+      ]),
+    });
+
+    expect(controller.handleDashboardKey({ name: "x", ctrl: true })).toBe(true);
+    expect(deps.requestCloseAgent).toHaveBeenCalledWith("codex:1");
+    expect(deps.enterAgentView).toHaveBeenCalledWith("codex:3");
+    expect(deps.setAgentBarVisible).toHaveBeenCalledWith(true);
+    expect(state.focusMode).toBe("input");
+    expect(state.agentOutputSuppressed).toBe(false);
+    expect(state.selectedAgentIndex).toBe(1);
+  });
+
+  test("agent view up exits dashboard overlay back to PTY", () => {
+    const { state, deps, controller } = createController({
+      currentView: "agent",
+      focusMode: "dashboard",
+    });
+
+    expect(controller.handleDashboardKey({ name: "up" })).toBe(true);
+    expect(state.focusMode).toBe("input");
+    expect(state.agentOutputSuppressed).toBe(false);
+    expect(deps.setAgentBarVisible).toHaveBeenCalledWith(true);
+    expect(deps.renderAgentDashboard).toHaveBeenCalled();
+    expect(deps.requestAgentSnapshot).toHaveBeenCalled();
+  });
+});

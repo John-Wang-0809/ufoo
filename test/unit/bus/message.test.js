@@ -471,6 +471,19 @@ describe('MessageManager', () => {
       expect(Math.max(...seqs)).toBe(10); // Should reach seq 10
     });
 
+    it('should keep unique seq values under concurrent sends', async () => {
+      const sends = Array.from({ length: 20 }, (_, i) =>
+        manager.send('architect', `Concurrent ${i}`, 'sender')
+      );
+      const results = await Promise.all(sends);
+      const seqs = results.map((r) => r.seq).sort((a, b) => a - b);
+      const uniqueSeqs = new Set(seqs);
+
+      expect(uniqueSeqs.size).toBe(20);
+      expect(seqs[0]).toBe(1);
+      expect(seqs[19]).toBe(20);
+    });
+
     it('should handle messages with complex data', async () => {
       const complexMessage = {
         text: 'Test',
