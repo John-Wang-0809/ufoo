@@ -1,5 +1,6 @@
 const path = require("path");
 const EventBus = require("../bus");
+const { IPC_REQUEST_TYPES } = require("../shared/eventContract");
 const UfooInit = require("../init");
 
 function defaultCreateDoctor(projectRoot) {
@@ -209,7 +210,7 @@ function createCommandExecutor(options = {}) {
         }
         const target = args[1];
         const message = args.slice(2).join(" ");
-        send({ type: "bus_send", target, message });
+        send({ type: IPC_REQUEST_TYPES.BUS_SEND, target, message });
         logMessage("system", `{white-fg}✓{/white-fg} Message sent to ${target}`);
         return;
       }
@@ -371,7 +372,7 @@ function createCommandExecutor(options = {}) {
       const label = nickname ? ` (${nickname})` : "";
       logMessage("system", `{white-fg}⚙{/white-fg} Launching ${agentType}${label}...`);
       send({
-        type: "launch_agent",
+        type: IPC_REQUEST_TYPES.LAUNCH_AGENT,
         agent: agentType,
         count: Number.isFinite(count) ? count : 1,
         nickname,
@@ -383,10 +384,20 @@ function createCommandExecutor(options = {}) {
   }
 
   async function handleResumeCommand(args = []) {
+    const action = String(args[0] || "").toLowerCase();
+    if (action === "list" || action === "ls") {
+      const target = args[1] || "";
+      const label = target ? ` (${target})` : "";
+      logMessage("system", `{white-fg}⚙{/white-fg} Listing recoverable agents${label}...`);
+      send({ type: IPC_REQUEST_TYPES.LIST_RECOVERABLE_AGENTS, target });
+      schedule(requestStatus, 1000);
+      return;
+    }
+
     const target = args[0] || "";
     const label = target ? ` (${target})` : "";
     logMessage("system", `{white-fg}⚙{/white-fg} Resuming agents${label}...`);
-    send({ type: "resume_agents", target });
+    send({ type: IPC_REQUEST_TYPES.RESUME_AGENTS, target });
     schedule(requestStatus, 1000);
   }
 

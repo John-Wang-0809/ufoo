@@ -1,4 +1,5 @@
 const { createDashboardKeyController } = require("../../../src/chat/dashboardKeyController");
+const { createTerminalAdapterRouter } = require("../../../src/terminal/adapterRouter");
 
 function createState(overrides = {}) {
   return {
@@ -33,8 +34,14 @@ function createState(overrides = {}) {
 
 function createController(stateOverrides = {}, optionOverrides = {}) {
   const state = createState(stateOverrides);
+  const adapterRouter = createTerminalAdapterRouter();
   const deps = {
     existsSync: jest.fn(() => false),
+    getAgentAdapter: jest.fn((agentId) => {
+      const meta = state.activeAgentMetaMap.get(agentId) || {};
+      const launchMode = meta.launch_mode || "";
+      return adapterRouter.getAdapter({ launchMode, agentId });
+    }),
     getInjectSockPath: jest.fn((agentId) => `/tmp/${agentId}.sock`),
     activateAgent: jest.fn(),
     requestCloseAgent: jest.fn(),
@@ -116,7 +123,7 @@ describe("chat dashboardKeyController", () => {
       {
         dashboardView: "agents",
         selectedAgentIndex: 0,
-        activeAgentMetaMap: new Map([["codex:1", { launch_mode: "internal" }]]),
+        activeAgentMetaMap: new Map([["codex:1", { launch_mode: "internal-pty" }]]),
       },
       { existsSync: jest.fn(() => true) }
     );

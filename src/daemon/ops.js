@@ -6,6 +6,7 @@ const { getUfooPaths } = require("../ufoo/paths");
 const { loadAgentsData, saveAgentsData } = require("../ufoo/agentsStore");
 const { isAgentPidAlive, getTtyProcessInfo } = require("../bus/utils");
 const { isITerm2 } = require("../terminal/detect");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
 function resolveAgentId(projectRoot, agentId) {
   if (!agentId) return agentId;
@@ -463,7 +464,7 @@ function isActiveAgent(meta) {
   return true;
 }
 
-async function resumeAgents(projectRoot, target = "", processManager = null) {
+function collectRecoverableAgents(projectRoot, target = "") {
   const config = loadConfig(projectRoot);
   const mode = config.launchMode || "terminal";
   const filePath = getUfooPaths(projectRoot).agentsFile;
@@ -475,12 +476,21 @@ async function resumeAgents(projectRoot, target = "", processManager = null) {
     if (target.includes(":")) {
       targets = entries.filter(([id]) => id === target);
     } else {
-      targets = entries.filter(([, meta]) => meta && meta.nickname === target);
+      targets = entries.filter(([id, meta]) => id === target || (meta && meta.nickname === target));
     }
   }
 
-  const resumable = [];
+  const recoverableEntries = [];
   const skipped = [];
+
+  if (target && targets.length === 0) {
+    return {
+      mode,
+      data,
+      recoverableEntries,
+      skipped: [{ id: target, reason: "target not found" }],
+    };
+  }
 
   for (const [id, meta] of targets) {
     if (!meta || !meta.provider_session_id) {
@@ -496,16 +506,47 @@ async function resumeAgents(projectRoot, target = "", processManager = null) {
       skipped.push({ id, reason: "unsupported agent type" });
       continue;
     }
-    resumable.push({ id, meta, agent });
+
+    if (mode === "internal") {
+      skipped.push({ id, reason: "internal mode not supported for resume" });
+      continue;
+    }
+
+    recoverableEntries.push({ id, meta, agent });
   }
 
-  if (resumable.length === 0) {
+  return {
+    mode,
+    data,
+    recoverableEntries,
+    skipped,
+  };
+}
+
+function getRecoverableAgents(projectRoot, target = "") {
+  const { mode, recoverableEntries, skipped } = collectRecoverableAgents(projectRoot, target);
+  const recoverable = recoverableEntries.map((item) => ({
+    id: item.id,
+    nickname: item.meta.nickname || "",
+    agent: item.agent,
+    sessionId: item.meta.provider_session_id || "",
+    launchMode: item.meta.launch_mode || "",
+    lastSeen: item.meta.last_seen || "",
+  }));
+  return { ok: true, mode, recoverable, skipped };
+}
+
+async function resumeAgents(projectRoot, target = "", processManager = null) {
+  const filePath = getUfooPaths(projectRoot).agentsFile;
+  const { mode, data, recoverableEntries, skipped } = collectRecoverableAgents(projectRoot, target);
+
+  if (recoverableEntries.length === 0) {
     return { ok: true, resumed: [], skipped };
   }
 
-  // Clear old nicknames to allow reuse
+  // Clear old nicknames to allow reuse.
   let updated = false;
-  for (const item of resumable) {
+  for (const item of recoverableEntries) {
     if (item.meta && item.meta.nickname) {
       data.agents[item.id] = { ...item.meta, nickname: "" };
       updated = true;
@@ -516,14 +557,7 @@ async function resumeAgents(projectRoot, target = "", processManager = null) {
   }
 
   const resumed = [];
-  if (mode === "internal") {
-    for (const item of resumable) {
-      skipped.push({ id: item.id, reason: "internal mode not supported for resume" });
-    }
-    return { ok: true, resumed, skipped };
-  }
-
-  for (const item of resumable) {
+  for (const item of recoverableEntries) {
     const nickname = item.meta.nickname || "";
     const sessionId = item.meta.provider_session_id;
     const reused = await tryReuseTerminal(projectRoot, item.id, item.meta, item.agent, sessionId);
@@ -566,7 +600,9 @@ async function closeAgent(projectRoot, agentId) {
   } catch {
     pid = null;
   }
-  if (launchMode === "terminal" && tty) {
+  const adapterRouter = createTerminalAdapterRouter();
+  const adapter = adapterRouter.getAdapter({ launchMode, agentId: resolvedId });
+  if (adapter.capabilities.supportsWindowClose && tty) {
     await closeTerminalWindowByTty(tty, terminalApp);
   }
   if (!pid) return false;
@@ -578,4 +614,4 @@ async function closeAgent(projectRoot, agentId) {
   }
 }
 
-module.exports = { launchAgent, closeAgent, resumeAgents };
+module.exports = { launchAgent, closeAgent, getRecoverableAgents, resumeAgents };

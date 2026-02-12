@@ -1,89 +1,20 @@
 const fs = require("fs");
 const path = require("path");
-const net = require("net");
 const { runUfooAgent } = require("../agent/ufooAgent");
-const { launchAgent, closeAgent, resumeAgents } = require("./ops");
+const { launchAgent, closeAgent, getRecoverableAgents, resumeAgents } = require("./ops");
 const { buildStatus } = require("./status");
 const EventBus = require("../bus");
+const { AgentProcessManager } = require("./agentProcessManager");
 const NicknameManager = require("../bus/nickname");
 const { generateInstanceId, subscriberToSafeName } = require("../bus/utils");
+const { createDaemonIpcServer } = require("./ipcServer");
+const { IPC_REQUEST_TYPES, IPC_RESPONSE_TYPES, BUS_STATUS_PHASES } = require("../shared/eventContract");
 const { getUfooPaths } = require("../ufoo/paths");
 const { scheduleProviderSessionProbe, loadProviderSessionCache } = require("./providerSessions");
-const { loadConfig } = require("../config");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
 let providerSessions = null;
 let probeHandles = new Map();
-
-/**
- * Agent 进程管理器 - daemon 作为父进程监控所有 internal agents
- */
-class AgentProcessManager {
-  constructor(projectRoot) {
-    this.projectRoot = projectRoot;
-    this.processes = new Map(); // subscriber_id -> child_process
-  }
-
-  /**
-   * 注册子进程并监听退出事件
-   */
-  register(subscriberId, childProcess) {
-    if (!subscriberId || !childProcess) return;
-
-    this.processes.set(subscriberId, childProcess);
-
-    childProcess.on("exit", (code, signal) => {
-      this.processes.delete(subscriberId);
-
-      // 自动清理 bus 状态
-      try {
-        const eventBus = new EventBus(this.projectRoot);
-        eventBus.loadBusData();
-        if (eventBus.busData.agents?.[subscriberId]) {
-          eventBus.busData.agents[subscriberId].status = "inactive";
-          eventBus.busData.agents[subscriberId].last_seen = new Date().toISOString();
-          eventBus.saveBusData();
-          console.log(`[daemon] Agent ${subscriberId} exited (code=${code}, signal=${signal}), marked inactive`);
-        }
-      } catch (err) {
-        console.error(`[daemon] Failed to cleanup ${subscriberId}:`, err.message);
-      }
-    });
-
-    childProcess.on("error", (err) => {
-      console.error(`[daemon] Agent ${subscriberId} error:`, err.message);
-      this.processes.delete(subscriberId);
-    });
-  }
-
-  /**
-   * 获取运行中的进程
-   */
-  get(subscriberId) {
-    return this.processes.get(subscriberId);
-  }
-
-  /**
-   * 获取所有进程数量
-   */
-  count() {
-    return this.processes.size;
-  }
-
-  /**
-   * 清理所有子进程
-   */
-  cleanup() {
-    for (const [subscriberId, child] of this.processes.entries()) {
-      try {
-        child.kill("SIGTERM");
-        console.log(`[daemon] Killed agent ${subscriberId}`);
-      } catch {
-        // ignore
-      }
-    }
-    this.processes.clear();
-  }
-}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -151,21 +82,42 @@ function readPid(projectRoot) {
   }
 }
 
+function checkPid(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return { alive: false, uncertain: false };
+  }
+  try {
+    process.kill(pid, 0);
+    return { alive: true, uncertain: false };
+  } catch (err) {
+    if (err && err.code === "EPERM") {
+      return { alive: true, uncertain: true };
+    }
+    return { alive: false, uncertain: false };
+  }
+}
+
+function looksLikeRunningDaemon(projectRoot, pid) {
+  const state = checkPid(pid);
+  if (!state.alive) return false;
+  if (!state.uncertain) return true;
+  const recordedPid = readPid(projectRoot);
+  return recordedPid === pid && fs.existsSync(socketPath(projectRoot));
+}
+
 function isRunning(projectRoot) {
   const pid = readPid(projectRoot);
   if (!pid) return false;
-  try {
-    process.kill(pid, 0);
+  if (looksLikeRunningDaemon(projectRoot, pid)) {
     return true;
-  } catch {
-    try {
-      fs.unlinkSync(pidPath(projectRoot));
-    } catch {
-      // ignore
-    }
-    removeSocket(projectRoot);
-    return false;
   }
+  try {
+    fs.unlinkSync(pidPath(projectRoot));
+  } catch {
+    // ignore
+  }
+  removeSocket(projectRoot);
+  return false;
 }
 
 function removeSocket(projectRoot) {
@@ -519,7 +471,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus, shouldDrain) {
         state.pending.delete(evt.publisher);
         if (onStatus) {
           const displayName = getAgentNickname(evt.publisher);
-          onStatus({ phase: "done", text: `${displayName} done`, key: evt.publisher });
+          onStatus({ phase: BUS_STATUS_PHASES.DONE, text: `${displayName} done`, key: evt.publisher });
         }
       }
     }
@@ -532,7 +484,7 @@ function startBusBridge(projectRoot, provider, onEvent, onStatus, shouldDrain) {
       state.pending.add(target);
       if (onStatus) {
         const displayName = getAgentNickname(target);
-        onStatus({ phase: "start", text: `${displayName} processing`, key: target });
+        onStatus({ phase: BUS_STATUS_PHASES.START, text: `${displayName} processing`, key: target });
       }
     },
     getSubscriber() {
@@ -561,6 +513,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
   // 文件锁机制：防止多个 daemon 同时启动
   const lockFile = path.join(runDir, "daemon.lock");
   let lockFd;
+  let recoveredStaleLock = false;
   try {
     // 尝试独占方式打开锁文件（如果已存在且被锁定则失败）
     lockFd = fs.openSync(lockFile, "wx");
@@ -581,16 +534,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
 
       let lockHeld = false;
       if (existingPid) {
-        try {
-          process.kill(existingPid, 0);
-          lockHeld = true;
-        } catch (killErr) {
-          // Sandbox/permission constrained environments can throw EPERM
-          // even when the process is alive.
-          if (killErr && killErr.code === "EPERM") {
-            lockHeld = true;
-          }
-        }
+        lockHeld = looksLikeRunningDaemon(projectRoot, existingPid);
       }
 
       if (lockHeld) {
@@ -600,6 +544,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
       // 进程已死或锁文件损坏，清理旧锁后重试
       try {
         fs.unlinkSync(lockFile);
+        recoveredStaleLock = true;
       } catch (unlinkErr) {
         throw new Error(`Failed to remove stale daemon lock: ${unlinkErr.message}`);
       }
@@ -630,31 +575,8 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
   providerSessions = loadProviderSessionCache(projectRoot);
   probeHandles = new Map();
 
-  const sockets = new Set();
-  const sendToSockets = (payload) => {
-    const line = `${JSON.stringify(payload)}\n`;
-    for (const sock of sockets) {
-      if (!sock || sock.destroyed) continue;
-      try {
-        sock.write(line);
-      } catch {
-        // ignore write errors
-      }
-    }
-  };
-
-  const busBridge = startBusBridge(projectRoot, provider, (evt) => {
-    sendToSockets({ type: "bus", data: evt });
-  }, (status) => {
-    sendToSockets({ type: "status", data: status });
-  }, () => sockets.size > 0);
-
-  // 定期检测状态变化并推送（仅当有变化时）
-  let lastActiveJson = "";
-  const statusSyncInterval = setInterval(() => {
-    if (sockets.size === 0) return; // 没有客户端连接时跳过
+  const cleanupInactiveSubscribers = () => {
     try {
-      // 先清理不活跃的订阅者，确保状态准确
       const syncBus = new EventBus(projectRoot);
       syncBus.ensureBus();
       syncBus.loadBusData();
@@ -663,361 +585,401 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
     } catch {
       // ignore cleanup errors
     }
-    try {
-      const status = buildStatus(projectRoot);
-      const currentActiveJson = JSON.stringify(status.active);
-      if (currentActiveJson !== lastActiveJson) {
-        lastActiveJson = currentActiveJson;
-        sendToSockets({ type: "status", data: status });
-        log(`status sync: active agents changed to ${status.active.length}`);
-      }
-    } catch {
-      // ignore status check errors
-    }
-  }, 3000);
+  };
 
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
-    let buffer = "";
-    socket.on("data", async (data) => {
-      buffer += data.toString("utf8");
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
-      const complete = lines.filter((l) => l.trim());
-      for (const line of complete) {
-        const items = parseJsonLines(line);
-        for (const req of items) {
-          if (!req || typeof req !== "object") continue;
-          if (req.type === "status") {
-            // 先清理不活跃的订阅者，确保状态准确
-            try {
-              const eventBus = new EventBus(projectRoot);
-              eventBus.ensureBus();
-              eventBus.loadBusData();
-              eventBus.subscriberManager.cleanupInactive();
-              eventBus.saveBusData();
-            } catch {
-              // ignore cleanup errors, proceed with status
-            }
-            const status = buildStatus(projectRoot);
-            socket.write(`${JSON.stringify({ type: "status", data: status })}\n`);
-            continue;
-          }
-          if (req.type === "prompt") {
-            log(`prompt ${String(req.text || "").slice(0, 200)}`);
-            let result;
-            try {
-              result = await runUfooAgent({
-                projectRoot,
-                prompt: req.text || "",
-                provider,
-                model,
-              });
-            } catch (err) {
-              log(`error ${err.message || String(err)}`);
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || String(err),
-                })}\n`,
-              );
-              continue;
-            }
-            if (!result.ok) {
-              log(`agent-fail ${result.error || "agent failed"}`);
-              socket.write(
-                `${JSON.stringify({ type: "error", error: result.error || "agent failed" })}\n`,
-              );
-              continue;
-            }
-            for (const item of result.payload.dispatch || []) {
-              if (item && item.target && item.target !== "broadcast") {
-                busBridge.markPending(item.target);
-              }
-            }
-            await dispatchMessages(projectRoot, result.payload.dispatch || []);
-            const opsResults = await handleOps(projectRoot, result.payload.ops || [], processManager);
-            log(`ok reply=${Boolean(result.payload.reply)} dispatch=${(result.payload.dispatch || []).length} ops=${(result.payload.ops || []).length}`);
-            socket.write(
-              `${JSON.stringify({
-                type: "response",
-                data: result.payload,
-                opsResults,
-              })}\n`,
-            );
-            continue;
-          }
-          if (req.type === "bus_send") {
-            // Direct bus send request from chat UI
-            const { target, message } = req;
-            if (!target || !message) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: "bus_send requires target and message",
-                })}\n`,
-              );
-              continue;
-            }
-            try {
-              const publisher = busBridge.getSubscriber() || "ufoo-agent";
-              const eventBus = new EventBus(projectRoot);
-              await eventBus.send(target, message, publisher);
-              busBridge.markPending(target);
-              log(`bus_send target=${target} publisher=${publisher}`);
-              socket.write(
-                `${JSON.stringify({
-                  type: "bus_send_ok",
-                })}\n`,
-              );
-            } catch (err) {
-              log(`bus_send failed: ${err.message}`);
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || "bus_send failed",
-                })}\n`,
-              );
-            }
-            continue;
-          }
-          if (req.type === "close_agent") {
-            const { agent_id } = req;
-            if (!agent_id) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: "close_agent requires agent_id",
-                })}\n`,
-              );
-              continue;
-            }
-            try {
-              const op = { action: "close", agent_id };
-              const opsResults = await handleOps(projectRoot, [op], processManager);
-              const closeResult = opsResults.find((r) => r.action === "close");
-              const ok = closeResult ? closeResult.ok !== false : true;
-              const reply = ok
-                ? `Closed ${agent_id}`
-                : `Close failed: ${closeResult?.error || "unknown error"}`;
-              socket.write(
-                `${JSON.stringify({
-                  type: "response",
-                  data: { reply, dispatch: [], ops: [op] },
-                  opsResults,
-                })}\n`,
-              );
-            } catch (err) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || "close_agent failed",
-                })}\n`,
-              );
-            }
-            continue;
-          }
-          if (req.type === "launch_agent") {
-            const { agent, count, nickname } = req;
-            if (!agent || (agent !== "codex" && agent !== "claude")) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: "launch_agent requires agent=codex|claude",
-                })}\n`,
-              );
-              continue;
-            }
-            const parsedCount = parseInt(count, 10);
-            const finalCount = Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : 1;
-            const op = {
-              action: "launch",
-              agent,
-              count: finalCount,
-              nickname: nickname || "",
-            };
-            try {
-              const opsResults = await handleOps(projectRoot, [op], processManager);
-              const launchResult = opsResults.find((r) => r.action === "launch");
-              const ok = launchResult ? launchResult.ok !== false : true;
-              const reply = ok
-                ? `Launched ${op.count} ${agent} agent(s)`
-                : `Launch failed: ${launchResult?.error || "unknown error"}`;
-              socket.write(
-                `${JSON.stringify({
-                  type: "response",
-                  data: {
-                    reply,
-                    dispatch: [],
-                    ops: [op],
-                  },
-                  opsResults,
-                })}\n`,
-              );
-            } catch (err) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || "launch_agent failed",
-                })}\n`,
-              );
-            }
-            continue;
-          }
-          if (req.type === "resume_agents") {
-            const target = req.target || "";
-            try {
-              const result = await resumeAgents(projectRoot, target, processManager);
-              const resumedCount = result.resumed.length;
-              const skippedCount = result.skipped.length;
-              const reply = resumedCount > 0
-                ? `Resumed ${resumedCount} agent(s)` + (skippedCount ? `, skipped ${skippedCount}` : "")
-                : (skippedCount ? `No agents resumed (skipped ${skippedCount})` : "No agents resumed");
-              socket.write(
-                `${JSON.stringify({
-                  type: "response",
-                  data: {
-                    reply,
-                    resume: result,
-                  },
-                })}\n`,
-              );
-            } catch (err) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || "resume_agents failed",
-                })}\n`,
-              );
-            }
-            continue;
-          }
-          if (req.type === "register_agent") {
-            // Manual agent launch requests daemon to register it
-            const { agentType, nickname, parentPid, launchMode, tmuxPane, tty, skipProbe } = req;
-            if (!agentType) {
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: "register_agent requires agentType",
-                })}\n`,
-              );
-              continue;
-            }
-            try {
-              const crypto = require("crypto");
-              const requestedReuse = req.reuseSession && typeof req.reuseSession === "object"
-                ? req.reuseSession
-                : null;
-              const reuseSessionId = typeof requestedReuse?.sessionId === "string"
-                ? requestedReuse.sessionId.trim()
-                : "";
-              const reuseSubscriberId = typeof requestedReuse?.subscriberId === "string"
-                ? requestedReuse.subscriberId.trim()
-                : "";
-              const reuseProviderSessionId = typeof requestedReuse?.providerSessionId === "string"
-                ? requestedReuse.providerSessionId.trim()
-                : "";
-
-              let sessionId = crypto.randomBytes(4).toString("hex");
-              let subscriberId = `${agentType}:${sessionId}`;
-              if (reuseSessionId && reuseSubscriberId === `${agentType}:${reuseSessionId}`) {
-                sessionId = reuseSessionId;
-                subscriberId = reuseSubscriberId;
-              } else if (reuseSessionId || reuseSubscriberId) {
-                log(`register_agent ignored invalid reuseSession for ${agentType}`);
-              }
-
-              // Daemon registers the agent in bus
-              const eventBus = new EventBus(projectRoot);
-              await eventBus.init();
-              eventBus.loadBusData();
-              const parsedParentPid = Number.parseInt(parentPid, 10);
-              if (!Number.isFinite(parsedParentPid) || parsedParentPid <= 0) {
-                throw new Error("register_agent requires valid parentPid");
-              }
-              const joinOptions = {
-                parentPid: Number.isFinite(parsedParentPid) ? parsedParentPid : undefined,
-                launchMode: launchMode || "",
-                tmuxPane: tmuxPane || "",
-              };
-              if (reuseProviderSessionId) {
-                joinOptions.providerSessionId = reuseProviderSessionId;
-              }
-              if (Object.prototype.hasOwnProperty.call(req, "tty")) {
-                const ttyValue = typeof tty === "string" ? tty.trim() : "";
-                joinOptions.tty = ttyValue;
-                if (!ttyValue) {
-                  log(`register_agent warning: missing tty for ${subscriberId}`);
-                }
-              }
-              await eventBus.subscriberManager.join(sessionId, agentType, nickname || "", joinOptions);
-              eventBus.saveBusData();
-
-              const finalNickname = eventBus.busData?.agents?.[subscriberId]?.nickname || "";
-              log(`register_agent type=${agentType} nickname=${finalNickname || "(none)"} id=${subscriberId}`);
-              if (!skipProbe) {
-                const probeHandle = scheduleProviderSessionProbe({
-                  projectRoot,
-                  subscriberId,
-                  agentType,
-                  nickname: finalNickname,
-                  onResolved: (id, resolved) => {
-                    if (providerSessions) {
-                      providerSessions.set(id, {
-                        sessionId: resolved.sessionId,
-                        source: resolved.source || "",
-                        updated_at: new Date().toISOString(),
-                      });
-                    }
-                    probeHandles.delete(id);
-                  },
-                });
-                if (probeHandle) {
-                  probeHandles.set(subscriberId, probeHandle);
-                }
-              }
-              socket.write(
-                `${JSON.stringify({
-                  type: "register_ok",
-                  subscriberId,
-                  nickname: finalNickname || "",
-                })}\n`,
-              );
-            } catch (err) {
-              log(`register_agent failed: ${err.message}`);
-              socket.write(
-                `${JSON.stringify({
-                  type: "error",
-                  error: err.message || "register_agent failed",
-                })}\n`,
-              );
-            }
-            continue;
-          }
-          if (req.type === "agent_ready") {
-            const { subscriberId } = req;
-            if (!subscriberId) {
-              continue;
-            }
-            log(`agent_ready id=${subscriberId} - triggering probe immediately`);
-            const probeHandle = probeHandles.get(subscriberId);
-            if (probeHandle && typeof probeHandle.triggerNow === "function") {
-              probeHandle.triggerNow().catch((err) => {
-                log(`agent_ready probe trigger failed for ${subscriberId}: ${err.message}`);
-              });
-            } else {
-              log(`agent_ready no probe handle found for ${subscriberId}`);
-            }
-            continue;
-          }
-        }
-      }
-    });
+  let handleIpcRequest = async () => {};
+  const ipcServer = createDaemonIpcServer({
+    projectRoot,
+    parseJsonLines,
+    handleRequest: async (req, socket) => handleIpcRequest(req, socket),
+    buildStatus: () => buildStatus(projectRoot),
+    cleanupInactive: cleanupInactiveSubscribers,
+    log,
   });
 
-  server.listen(socketPath(projectRoot));
+  const busBridge = startBusBridge(projectRoot, provider, (evt) => {
+    ipcServer.sendToSockets({ type: IPC_RESPONSE_TYPES.BUS, data: evt });
+  }, (status) => {
+    ipcServer.sendToSockets({ type: IPC_RESPONSE_TYPES.STATUS, data: status });
+  }, () => ipcServer.hasClients());
+
+  handleIpcRequest = async (req, socket) => {
+    if (!req || typeof req !== "object") return;
+    if (req.type === IPC_REQUEST_TYPES.STATUS) {
+      cleanupInactiveSubscribers();
+      const status = buildStatus(projectRoot);
+      socket.write(`${JSON.stringify({ type: IPC_RESPONSE_TYPES.STATUS, data: status })}
+`);
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.PROMPT) {
+      log(`prompt ${String(req.text || "").slice(0, 200)}`);
+      let result;
+      try {
+        result = await runUfooAgent({
+          projectRoot,
+          prompt: req.text || "",
+          provider,
+          model,
+        });
+      } catch (err) {
+        log(`error ${err.message || String(err)}`);
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || String(err),
+          })}
+`,
+        );
+        return;
+      }
+      if (!result.ok) {
+        log(`agent-fail ${result.error || "agent failed"}`);
+        socket.write(
+          `${JSON.stringify({ type: IPC_RESPONSE_TYPES.ERROR, error: result.error || "agent failed" })}
+`,
+        );
+        return;
+      }
+      for (const item of result.payload.dispatch || []) {
+        if (item && item.target && item.target !== "broadcast") {
+          busBridge.markPending(item.target);
+        }
+      }
+      await dispatchMessages(projectRoot, result.payload.dispatch || []);
+      const opsResults = await handleOps(projectRoot, result.payload.ops || [], processManager);
+      log(`ok reply=${Boolean(result.payload.reply)} dispatch=${(result.payload.dispatch || []).length} ops=${(result.payload.ops || []).length}`);
+      socket.write(
+        `${JSON.stringify({
+          type: IPC_RESPONSE_TYPES.RESPONSE,
+          data: result.payload,
+          opsResults,
+        })}
+`,
+      );
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.BUS_SEND) {
+      // Direct bus send request from chat UI
+      const { target, message } = req;
+      if (!target || !message) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: "bus_send requires target and message",
+          })}
+`,
+        );
+        return;
+      }
+      try {
+        const publisher = busBridge.getSubscriber() || "ufoo-agent";
+        const eventBus = new EventBus(projectRoot);
+        await eventBus.send(target, message, publisher);
+        busBridge.markPending(target);
+        log(`bus_send target=${target} publisher=${publisher}`);
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.BUS_SEND_OK,
+          })}
+`,
+        );
+      } catch (err) {
+        log(`bus_send failed: ${err.message}`);
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "bus_send failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.CLOSE_AGENT) {
+      const { agent_id } = req;
+      if (!agent_id) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: "close_agent requires agent_id",
+          })}
+`,
+        );
+        return;
+      }
+      try {
+        const op = { action: "close", agent_id };
+        const opsResults = await handleOps(projectRoot, [op], processManager);
+        const closeResult = opsResults.find((r) => r.action === "close");
+        const ok = closeResult ? closeResult.ok !== false : true;
+        const reply = ok
+          ? `Closed ${agent_id}`
+          : `Close failed: ${closeResult?.error || "unknown error"}`;
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.RESPONSE,
+            data: { reply, dispatch: [], ops: [op] },
+            opsResults,
+          })}
+`,
+        );
+      } catch (err) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "close_agent failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.LAUNCH_AGENT) {
+      const { agent, count, nickname } = req;
+      if (!agent || (agent !== "codex" && agent !== "claude")) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: "launch_agent requires agent=codex|claude",
+          })}
+`,
+        );
+        return;
+      }
+      const parsedCount = parseInt(count, 10);
+      const finalCount = Number.isFinite(parsedCount) && parsedCount > 0 ? parsedCount : 1;
+      const op = {
+        action: "launch",
+        agent,
+        count: finalCount,
+        nickname: nickname || "",
+      };
+      try {
+        const opsResults = await handleOps(projectRoot, [op], processManager);
+        const launchResult = opsResults.find((r) => r.action === "launch");
+        const ok = launchResult ? launchResult.ok !== false : true;
+        const reply = ok
+          ? `Launched ${op.count} ${agent} agent(s)`
+          : `Launch failed: ${launchResult?.error || "unknown error"}`;
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.RESPONSE,
+            data: {
+              reply,
+              dispatch: [],
+              ops: [op],
+            },
+            opsResults,
+          })}
+`,
+        );
+      } catch (err) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "launch_agent failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.RESUME_AGENTS) {
+      const target = req.target || "";
+      try {
+        const result = await resumeAgents(projectRoot, target, processManager);
+        const resumedCount = result.resumed.length;
+        const skippedCount = result.skipped.length;
+        const reply = resumedCount > 0
+          ? `Resumed ${resumedCount} agent(s)` + (skippedCount ? `, skipped ${skippedCount}` : "")
+          : (skippedCount ? `No agents resumed (skipped ${skippedCount})` : "No agents resumed");
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.RESPONSE,
+            data: {
+              reply,
+              resume: result,
+            },
+          })}
+`,
+        );
+      } catch (err) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "resume_agents failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.LIST_RECOVERABLE_AGENTS) {
+      const target = req.target || "";
+      try {
+        const result = getRecoverableAgents(projectRoot, target);
+        const count = result.recoverable.length;
+        const reply = count > 0 ? `Found ${count} recoverable agent(s)` : "No recoverable agents";
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.RESPONSE,
+            data: {
+              reply,
+              recoverable: result,
+            },
+          })}
+`,
+        );
+      } catch (err) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "list_recoverable_agents failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.REGISTER_AGENT) {
+      // Manual agent launch requests daemon to register it
+      const { agentType, nickname, parentPid, launchMode, tmuxPane, tty, skipProbe } = req;
+      if (!agentType) {
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: "register_agent requires agentType",
+          })}
+`,
+        );
+        return;
+      }
+      try {
+        const crypto = require("crypto");
+        const requestedReuse = req.reuseSession && typeof req.reuseSession === "object"
+          ? req.reuseSession
+          : null;
+        const reuseSessionId = typeof requestedReuse?.sessionId === "string"
+          ? requestedReuse.sessionId.trim()
+          : "";
+        const reuseSubscriberId = typeof requestedReuse?.subscriberId === "string"
+          ? requestedReuse.subscriberId.trim()
+          : "";
+        const reuseProviderSessionId = typeof requestedReuse?.providerSessionId === "string"
+          ? requestedReuse.providerSessionId.trim()
+          : "";
+
+        let sessionId = crypto.randomBytes(4).toString("hex");
+        let subscriberId = `${agentType}:${sessionId}`;
+        if (reuseSessionId && reuseSubscriberId === `${agentType}:${reuseSessionId}`) {
+          sessionId = reuseSessionId;
+          subscriberId = reuseSubscriberId;
+        } else if (reuseSessionId || reuseSubscriberId) {
+          log(`register_agent ignored invalid reuseSession for ${agentType}`);
+        }
+
+        // Daemon registers the agent in bus
+        const eventBus = new EventBus(projectRoot);
+        await eventBus.init();
+        eventBus.loadBusData();
+        const parsedParentPid = Number.parseInt(parentPid, 10);
+        if (!Number.isFinite(parsedParentPid) || parsedParentPid <= 0) {
+          throw new Error("register_agent requires valid parentPid");
+        }
+        const joinOptions = {
+          parentPid: Number.isFinite(parsedParentPid) ? parsedParentPid : undefined,
+          launchMode: launchMode || "",
+          tmuxPane: tmuxPane || "",
+          tty: tty || "",
+          reuseSessionId,
+          reuseProviderSessionId,
+        };
+        if (skipProbe) joinOptions.skipProbe = true;
+
+        let finalNickname = nickname || "";
+        if (finalNickname) {
+          finalNickname = checkAndCleanupNickname(projectRoot, finalNickname).cleaned
+            ? finalNickname
+            : "";
+        }
+        await eventBus.join(subscriberId, agentType === "codex" ? "codex" : "claude-code", joinOptions, finalNickname);
+        if (finalNickname) {
+          eventBus.rename(subscriberId, finalNickname, "ufoo-agent");
+        }
+        eventBus.saveBusData();
+
+        if (!skipProbe && reuseProviderSessionId) {
+          if (providerSessions) {
+            providerSessions.set(subscriberId, {
+              sessionId: reuseProviderSessionId,
+              source: "reuse",
+              updated_at: new Date().toISOString(),
+            });
+          }
+        }
+
+        if (!skipProbe) {
+          const probeHandle = scheduleProviderSessionProbe({
+            projectRoot,
+            subscriberId,
+            agentType,
+            nickname: finalNickname,
+            onResolved: (id, resolved) => {
+              if (providerSessions) {
+                providerSessions.set(id, {
+                  sessionId: resolved.sessionId,
+                  source: resolved.source || "",
+                  updated_at: new Date().toISOString(),
+                });
+              }
+              probeHandles.delete(id);
+            },
+          });
+          if (probeHandle) {
+            probeHandles.set(subscriberId, probeHandle);
+          }
+        }
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.REGISTER_OK,
+            subscriberId,
+            nickname: finalNickname || "",
+          })}
+`,
+        );
+      } catch (err) {
+        log(`register_agent failed: ${err.message}`);
+        socket.write(
+          `${JSON.stringify({
+            type: IPC_RESPONSE_TYPES.ERROR,
+            error: err.message || "register_agent failed",
+          })}
+`,
+        );
+      }
+      return;
+    }
+    if (req.type === IPC_REQUEST_TYPES.AGENT_READY) {
+      const { subscriberId } = req;
+      if (!subscriberId) {
+        return;
+      }
+      log(`agent_ready id=${subscriberId} - triggering probe immediately`);
+      const probeHandle = probeHandles.get(subscriberId);
+      if (probeHandle && typeof probeHandle.triggerNow === "function") {
+        probeHandle.triggerNow().catch((err) => {
+          log(`agent_ready probe trigger failed for ${subscriberId}: ${err.message}`);
+        });
+      } else {
+        log(`agent_ready no probe handle found for ${subscriberId}`);
+      }
+      return;
+    }
+  };
+
+  ipcServer.listen(socketPath(projectRoot));
+
   log(`Started pid=${process.pid}`);
 
   // 清理旧 daemon 留下的孤儿 internal agent 进程
@@ -1087,8 +1049,11 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
     }
 
     // 标记对应的 agents 为 inactive
+    const adapterRouter = createTerminalAdapterRouter();
     for (const [subscriberId, meta] of Object.entries(agents)) {
-      if (meta.launch_mode && meta.launch_mode.startsWith("internal")) {
+      const launchMode = meta.launch_mode || "";
+      const adapter = adapterRouter.getAdapter({ launchMode, agentId: subscriberId });
+      if (launchMode && adapter.capabilities.supportsInternalQueueLoop) {
         if (meta.pid) {
           try {
             process.kill(meta.pid, 0);
@@ -1107,10 +1072,10 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
     log(`Failed to cleanup orphan agents: ${err.message}`);
   }
 
-  const config = loadConfig(projectRoot);
-  const autoResume = config.autoResume !== false;
-  const shouldResume = resumeMode === "force" || (resumeMode === "auto" && autoResume);
+  const shouldResume = resumeMode === "force" || (resumeMode === "auto" && recoveredStaleLock);
   if (shouldResume) {
+    const reason = resumeMode === "force" ? "forced by caller" : "stale daemon state detected";
+    log(`Auto-recover enabled: ${reason}`);
     setTimeout(() => {
       resumeAgents(projectRoot, "", processManager).catch((err) => {
         log(`auto resume failed: ${err.message || String(err)}`);
@@ -1124,7 +1089,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
     // 清理所有子进程
     processManager.cleanup();
 
-    clearInterval(statusSyncInterval);
+    ipcServer.stop();
     busBridge.stop();
     removeSocket(projectRoot);
 

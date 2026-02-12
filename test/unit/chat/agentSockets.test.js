@@ -1,6 +1,7 @@
 const EventEmitter = require("events");
 const fs = require("fs");
 const net = require("net");
+const { PTY_SOCKET_MESSAGE_TYPES, PTY_SOCKET_SUBSCRIBE_MODES } = require("../../../src/shared/ptySocketContract");
 const { createAgentSockets } = require("../../../src/chat/agentSockets");
 
 function createFakeSocket() {
@@ -56,7 +57,7 @@ describe("chat agentSockets", () => {
     mgr.sendRaw("hello");
 
     expect(sockets[0].write).toHaveBeenCalledWith(
-      `${JSON.stringify({ type: "raw", data: "hello" })}\n`
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.RAW, data: "hello" })}\n`
     );
     expect(sendBusRaw).not.toHaveBeenCalled();
   });
@@ -83,7 +84,7 @@ describe("chat agentSockets", () => {
 
     emitConnect(0);
     expect(sockets[0].write).toHaveBeenCalledWith(
-      `${JSON.stringify({ type: "resize", cols: 120, rows: 30 })}\n`
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.RESIZE, cols: 120, rows: 30 })}\n`
     );
   });
 
@@ -100,18 +101,23 @@ describe("chat agentSockets", () => {
     emitConnect(0);
 
     expect(sockets[0].write).toHaveBeenCalledWith(
-      `${JSON.stringify({ type: "subscribe", mode: "full" })}\n`
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE, mode: PTY_SOCKET_SUBSCRIBE_MODES.FULL })}\n`
     );
 
     const ok = mgr.requestScreenSnapshot();
     expect(ok).toBe(true);
     expect(sockets[0].write).toHaveBeenCalledWith(
-      `${JSON.stringify({ type: "subscribe", mode: "screen" })}\n`
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE, mode: PTY_SOCKET_SUBSCRIBE_MODES.SCREEN })}\n`
     );
 
+    const okFull = mgr.requestSnapshot("full");
+    expect(okFull).toBe(true);
+    const lastCall = sockets[0].write.mock.calls[sockets[0].write.mock.calls.length - 1][0];
+    expect(lastCall).toBe(`${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE, mode: PTY_SOCKET_SUBSCRIBE_MODES.FULL })}\n`);
+
     sockets[0].emit("data", Buffer.from(
-      `${JSON.stringify({ type: "output", data: "A" })}\n` +
-      `${JSON.stringify({ type: "snapshot", data: "B", cursor: { x: 1, y: 2 } })}\n`
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.OUTPUT, data: "A" })}\n` +
+      `${JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SNAPSHOT, data: "B", cursor: { x: 1, y: 2 } })}\n`
     ));
 
     expect(onTermWrite).toHaveBeenCalledWith("A");

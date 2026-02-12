@@ -3,6 +3,7 @@ const fs = require("fs");
 const net = require("net");
 const path = require("path");
 const { subscriberToSafeName, isValidTty } = require("./utils");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
 const SHOULD_LOG_INJECT = process.env.UFOO_INJECT_DEBUG === "1";
 const logInject = (message) => {
@@ -35,6 +36,18 @@ class Injector {
   /**
    * 获取订阅者的 tmux pane ID（从 all-agents.json）
    */
+  getAgentMeta(subscriber) {
+    const agentsFile = this.agentsFile;
+    if (!agentsFile || !fs.existsSync(agentsFile)) return null;
+
+    try {
+      const busData = JSON.parse(fs.readFileSync(agentsFile, "utf8"));
+      return busData.agents?.[subscriber] || null;
+    } catch {
+      return null;
+    }
+  }
+
   getTmuxPane(subscriber) {
     const agentsFile = this.agentsFile;
     if (!agentsFile || !fs.existsSync(agentsFile)) return null;
@@ -240,11 +253,22 @@ class Injector {
       ? String(commandOverride)
       : (subscriber.startsWith("codex:") ? "ubus" : "/ubus");
 
+    const meta = this.getAgentMeta(subscriber) || {};
+    const launchMode = meta.launch_mode || "";
+    const adapterRouter = createTerminalAdapterRouter();
+    const adapter = adapterRouter.getAdapter({ launchMode, agentId: subscriber });
+    const supportsSocket = adapter.capabilities.supportsSocketProtocol;
+    const supportsNotifier = adapter.capabilities.supportsNotifierInjector;
+
     // 1. 优先尝试 PTY socket（无需任何macOS权限）
     const injectSockPath = this.getInjectSockPath(subscriber);
     if (fs.existsSync(injectSockPath)) {
       try {
-        logInject(`[inject] Using PTY socket: ${injectSockPath}`);
+        if (!supportsSocket) {
+          logInject(`[inject] PTY socket present but unsupported for launch_mode=${launchMode}`);
+        } else {
+          logInject(`[inject] Using PTY socket: ${injectSockPath}`);
+        }
         await this.injectPty(subscriber, command);
         logInject("[inject] PTY inject success");
         return;
@@ -256,24 +280,26 @@ class Injector {
     // 读取 tty（tmux 需要）
     const tty = this.readTty(subscriber);
 
-    // 2. 尝试 tmux（无需权限）
-    const tmuxPane = this.getTmuxPane(subscriber);
-    if (tmuxPane) {
-      const paneExists = await this.checkTmuxPane(tmuxPane);
-      if (paneExists) {
-        logInject(`[inject] Using tmux send-keys for pane: ${tmuxPane}`);
-        await this.injectTmux(tmuxPane, command);
-        return;
+    if (supportsNotifier) {
+      // 2. 尝试 tmux（无需权限）
+      const tmuxPane = meta.tmux_pane || this.getTmuxPane(subscriber);
+      if (tmuxPane) {
+        const paneExists = await this.checkTmuxPane(tmuxPane);
+        if (paneExists) {
+          logInject(`[inject] Using tmux send-keys for pane: ${tmuxPane}`);
+          await this.injectTmux(tmuxPane, command);
+          return;
+        }
       }
-    }
 
-    // 尝试通过 tty 查找 tmux pane
-    if (tty && isValidTty(tty)) {
-      const fallbackPane = await this.findTmuxPaneByTty(tty);
-      if (fallbackPane) {
-        logInject(`[inject] Using tmux send-keys for pane: ${fallbackPane}`);
-        await this.injectTmux(fallbackPane, command);
-        return;
+      // 尝试通过 tty 查找 tmux pane
+      if (tty && isValidTty(tty)) {
+        const fallbackPane = await this.findTmuxPaneByTty(tty);
+        if (fallbackPane) {
+          logInject(`[inject] Using tmux send-keys for pane: ${fallbackPane}`);
+          await this.injectTmux(fallbackPane, command);
+          return;
+        }
       }
     }
 

@@ -5,6 +5,7 @@ function createDashboardKeyController(options = {}) {
     state,
     existsSync = () => false,
     getInjectSockPath = () => "",
+    getAgentAdapter = () => null,
     activateAgent = () => {},
     requestCloseAgent = () => {},
     enterAgentView = () => {},
@@ -33,6 +34,21 @@ function createDashboardKeyController(options = {}) {
   function renderDashboardAndScreen() {
     renderDashboard();
     renderScreen();
+  }
+
+  function getAgentCapabilities(agentId) {
+    const adapter = getAgentAdapter(agentId);
+    return adapter && adapter.capabilities ? adapter.capabilities : null;
+  }
+
+  function supportsActivate(agentId) {
+    const caps = getAgentCapabilities(agentId);
+    return Boolean(caps && caps.supportsActivate);
+  }
+
+  function supportsSocket(agentId) {
+    const caps = getAgentCapabilities(agentId);
+    return Boolean(caps && caps.supportsSocketProtocol);
   }
 
   function withAgentInputFocus() {
@@ -97,9 +113,7 @@ function createDashboardKeyController(options = {}) {
         return true;
       }
 
-      const meta = state.activeAgentMetaMap.get(agentId);
-      const agentLaunchMode = (meta && meta.launch_mode) || "";
-      if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+      if (supportsActivate(agentId)) {
         exitAgentView();
         activateExternalAgent(agentId);
         return true;
@@ -128,9 +142,7 @@ function createDashboardKeyController(options = {}) {
 
       if (agentId === state.viewingAgent) {
         if (nextAgent) {
-          const meta = state.activeAgentMetaMap.get(nextAgent);
-          const agentLaunchMode = (meta && meta.launch_mode) || "";
-          if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+          if (supportsActivate(nextAgent)) {
             exitAgentView();
             activateExternalAgent(nextAgent);
           } else {
@@ -216,9 +228,7 @@ function createDashboardKeyController(options = {}) {
     }
 
     if (key.name === "down") {
-      state.dashboardView = "resume";
-      state.selectedResumeIndex = state.autoResume ? 0 : 1;
-      renderDashboardAndScreen();
+      // Resume setting is no longer part of dashboard navigation.
       return true;
     }
 
@@ -329,10 +339,7 @@ function createDashboardKeyController(options = {}) {
     if (key.name === "enter" || key.name === "return") {
       if (state.selectedAgentIndex >= 0 && state.selectedAgentIndex < state.activeAgents.length) {
         const agentId = state.activeAgents[state.selectedAgentIndex];
-        const meta = state.activeAgentMetaMap.get(agentId);
-        const agentLaunchMode = (meta && meta.launch_mode) || "";
-
-        if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+        if (supportsActivate(agentId)) {
           clearTargetAgent();
           exitDashboardMode(false);
           activateExternalAgent(agentId);
@@ -340,7 +347,7 @@ function createDashboardKeyController(options = {}) {
         }
 
         const sockPath = getInjectSockPath(agentId);
-        if (existsSync(sockPath)) {
+        if (supportsSocket(agentId) && existsSync(sockPath)) {
           clearTargetAgent();
           state.focusMode = "input";
           state.dashboardView = "agents";

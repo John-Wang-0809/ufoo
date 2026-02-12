@@ -46,9 +46,7 @@ function runDaemonCli(argv) {
     // Start fresh daemon
     if (!process.env.UFOO_DAEMON_CHILD) {
       const { spawn } = require("child_process");
-      const forceResume = launchMode !== "terminal";
       const childEnv = { ...process.env, UFOO_DAEMON_CHILD: "1" };
-      if (forceResume) childEnv.UFOO_FORCE_RESUME = "1";
       const child = spawn(process.execPath, [path.join(__dirname, "..", "..", "bin", "ufoo.js"), "daemon", "start"], {
         detached: true,
         stdio: "ignore",
@@ -58,9 +56,8 @@ function runDaemonCli(argv) {
       child.unref();
       return;
     }
-    // Skip auto-resume on restart in terminal mode to avoid reopening stale terminals.
-    const forceResume = launchMode !== "terminal";
-    startDaemon({ projectRoot, provider, model, resumeMode: forceResume ? "force" : "none" });
+    // Manual restart does not auto-resume; crash-recovery is handled on next auto start with stale lock detection.
+    startDaemon({ projectRoot, provider, model, resumeMode: "none" });
     return;
   }
   if (cmd === "status" || cmd === "--status") {

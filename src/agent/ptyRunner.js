@@ -3,6 +3,7 @@ const path = require("path");
 const net = require("net");
 const { spawnSync } = require("child_process");
 const EventBus = require("../bus");
+const { PTY_SOCKET_MESSAGE_TYPES, PTY_SOCKET_SUBSCRIBE_MODES } = require("../shared/ptySocketContract");
 const { runInternalRunner } = require("./internalRunner");
 const { getUfooPaths } = require("../ufoo/paths");
 
@@ -299,7 +300,7 @@ async function runPtyRunner({ projectRoot, agentType = "codex" }) {
       outputRingBuffer = outputRingBuffer.slice(-OUTPUT_RING_MAX);
     }
     if (outputSubscribers.size === 0) return;
-    const msg = JSON.stringify({ type: "output", data: text, encoding: "utf8" }) + "\n";
+    const msg = JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.OUTPUT, data: text, encoding: "utf8" }) + "\n";
     for (const sub of outputSubscribers) {
       try {
         sub.write(msg);
@@ -341,14 +342,14 @@ async function runPtyRunner({ projectRoot, agentType = "codex" }) {
               } else {
                 client.write(JSON.stringify({ ok: false, error: "pty not ready" }) + "\n");
               }
-            } else if (req.type === "raw" && typeof req.data === "string") {
+            } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.RAW && typeof req.data === "string") {
               if (ptyProcess && ptyAlive) {
                 ptyProcess.write(req.data);
                 client.write(JSON.stringify({ ok: true }) + "\n");
               } else {
                 client.write(JSON.stringify({ ok: false, error: "pty not ready" }) + "\n");
               }
-            } else if (req.type === "resize" && req.cols && req.rows) {
+            } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.RESIZE && req.cols && req.rows) {
               if (ptyProcess && ptyAlive && typeof ptyProcess.resize === "function") {
                 ptyProcess.resize(req.cols, req.rows);
               }
@@ -356,15 +357,17 @@ async function runPtyRunner({ projectRoot, agentType = "codex" }) {
                 try { term.resize(req.cols, req.rows); } catch { /* ignore */ }
               }
               client.write(JSON.stringify({ ok: true }) + "\n");
-            } else if (req.type === "subscribe") {
+            } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE) {
               outputSubscribers.add(client);
-              client.write(JSON.stringify({ type: "subscribed", ok: true }) + "\n");
-              const mode = req.mode === "screen" ? "screen" : "full";
-              if (mode === "full") {
+              client.write(JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBED, ok: true }) + "\n");
+              const mode = req.mode === PTY_SOCKET_SUBSCRIBE_MODES.SCREEN
+                ? PTY_SOCKET_SUBSCRIBE_MODES.SCREEN
+                : PTY_SOCKET_SUBSCRIBE_MODES.FULL;
+              if (mode === PTY_SOCKET_SUBSCRIBE_MODES.FULL) {
                 if (outputRingBuffer.length > 0) {
                   try {
                     client.write(JSON.stringify({
-                      type: "replay",
+                      type: PTY_SOCKET_MESSAGE_TYPES.REPLAY,
                       data: outputRingBuffer,
                       encoding: "utf8",
                     }) + "\n");
@@ -372,11 +375,11 @@ async function runPtyRunner({ projectRoot, agentType = "codex" }) {
                     // ignore replay send errors
                   }
                 } else {
-                  serializeSnapshot("full").then((snapshot) => {
+                  serializeSnapshot(PTY_SOCKET_SUBSCRIBE_MODES.FULL).then((snapshot) => {
                     if (snapshot && snapshot.data) {
                       try {
                         client.write(JSON.stringify({
-                          type: "snapshot",
+                          type: PTY_SOCKET_MESSAGE_TYPES.SNAPSHOT,
                           data: snapshot.data,
                           encoding: "utf8",
                         }) + "\n");
@@ -387,11 +390,11 @@ async function runPtyRunner({ projectRoot, agentType = "codex" }) {
                   }).catch(() => {});
                 }
               } else {
-                serializeSnapshot("screen").then((snapshot) => {
+                serializeSnapshot(PTY_SOCKET_SUBSCRIBE_MODES.SCREEN).then((snapshot) => {
                   if (snapshot && snapshot.data) {
                     try {
                       client.write(JSON.stringify({
-                        type: "snapshot",
+                        type: PTY_SOCKET_MESSAGE_TYPES.SNAPSHOT,
                         data: snapshot.data,
                         encoding: "utf8",
                       }) + "\n");

@@ -3,6 +3,9 @@ const { spawnSync } = require("child_process");
 const net = require("net");
 const fs = require("fs");
 const { socketPath, isRunning } = require("./daemon");
+const { runBusCoreCommand } = require("./cli/busCoreCommands");
+const { runCtxCommand } = require("./cli/ctxCoreCommands");
+const { runOnlineCommand } = require("./cli/onlineCoreCommands");
 
 function getPackageRoot() {
   return path.resolve(__dirname, "..");
@@ -58,6 +61,7 @@ async function ensureDaemonRunning(projectRoot) {
     // eslint-disable-next-line no-await-in-loop
     await new Promise((r) => setTimeout(r, 200));
   }
+  throw new Error("Failed to start ufoo daemon");
 }
 
 async function sendDaemonRequest(projectRoot, payload) {
@@ -249,6 +253,67 @@ async function runCli(argv) {
           process.exitCode = 1;
         }
       });
+    program
+      .command("recover")
+      .description("List recoverable agents or recover a specific one")
+      .argument("[action]", "list|run", "list")
+      .argument("[target]", "Nickname or subscriber ID")
+      .option("--json", "Output recoverable list as JSON")
+      .action(async (action, target, opts) => {
+        try {
+          const projectRoot = process.cwd();
+          await ensureDaemonRunning(projectRoot);
+          const normalizedAction = (action || "list").toLowerCase();
+
+          if (normalizedAction === "list") {
+            const resp = await sendDaemonRequest(projectRoot, {
+              type: "list_recoverable_agents",
+              target: target || "",
+            });
+            const result = resp?.data?.recoverable || { recoverable: [], skipped: [] };
+            if (opts.json) {
+              console.log(JSON.stringify(result, null, 2));
+              return;
+            }
+
+            const recoverable = result.recoverable || [];
+            console.log(resp?.data?.reply || `Found ${recoverable.length} recoverable agent(s)`);
+            recoverable.forEach((item) => {
+              const nickname = item.nickname ? ` (${item.nickname})` : "";
+              const meta = item.launchMode ? ` [${item.agent}/${item.launchMode}]` : ` [${item.agent}]`;
+              console.log(`  - ${item.id}${nickname}${meta}`);
+            });
+            return;
+          }
+
+          if (normalizedAction === "run") {
+            if (!target) {
+              console.error("recover run requires <target>");
+              process.exitCode = 1;
+              return;
+            }
+            const resp = await sendDaemonRequest(projectRoot, {
+              type: "resume_agents",
+              target,
+            });
+            const reply = resp?.data?.reply || "Recover requested";
+            console.log(reply);
+            if (resp?.data?.resume?.resumed?.length) {
+              resp.data.resume.resumed.forEach((item) => {
+                const label = item.nickname ? ` (${item.nickname})` : "";
+                console.log(`  - ${item.id}${label}`);
+              });
+            }
+            return;
+          }
+
+          console.error("recover action must be list|run");
+          process.exitCode = 1;
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
 
     program
       .command("init")
@@ -309,27 +374,12 @@ async function runCli(argv) {
       .option("--tls-cert <path>", "TLS certificate file")
       .option("--tls-key <path>", "TLS private key file")
       .action(async (opts) => {
-        const OnlineServer = require("./online/server");
-        const server = new OnlineServer({
-          host: opts.host,
-          port: parseInt(opts.port, 10),
-          tokenFile: opts.tokenFile || undefined,
-          idleTimeoutMs: parseInt(opts.idleTimeout, 10),
-          insecure: opts.insecure || false,
-          tlsCert: opts.tlsCert || null,
-          tlsKey: opts.tlsKey || null,
-        });
         try {
-          const isTls = !!(opts.tlsCert && opts.tlsKey);
-          const wsProto = isTls ? "wss" : "ws";
-          const httpProto = isTls ? "https" : "http";
-          await server.start();
-          console.log(`ufoo-online relay listening on ${opts.host}:${server.port}`);
-          console.log(`  WebSocket: ${wsProto}://${opts.host}:${server.port}/ufoo/online`);
-          console.log(`  HTTP API:  ${httpProto}://${opts.host}:${server.port}/ufoo/online/rooms`);
-          console.log(`             ${httpProto}://${opts.host}:${server.port}/ufoo/online/channels`);
-          if (server.insecure) console.log(`  Auth: INSECURE mode (any token accepted)`);
-          if (isTls) console.log(`  TLS: enabled`);
+          await runOnlineCommand("server", { opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -342,22 +392,13 @@ async function runCli(argv) {
       .option("--nickname <name>", "Nickname for this agent")
       .option("--server <url>", "Online server URL")
       .option("--file <path>", "Tokens file path")
-      .action((subscriber, opts) => {
+      .action(async (subscriber, opts) => {
         try {
-          const { generateToken, setToken, defaultTokensPath } = require("./online/tokens");
-          const filePath = opts.file || defaultTokensPath();
-          const token = generateToken();
-          const entry = setToken(filePath, subscriber, token, opts.server || "", {
-            nickname: opts.nickname || "",
+          await runOnlineCommand("token", { subscriber, opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
           });
-          console.log(JSON.stringify({
-            subscriber,
-            token,
-            token_hash: entry.token_hash,
-            server: entry.server,
-            nickname: entry.nickname,
-            file: filePath,
-          }, null, 2));
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -377,40 +418,12 @@ async function runCli(argv) {
       .option("--type <type>", "Room type (public|private)")
       .option("--password <pwd>", "Room password (private only)")
       .action(async (action, opts) => {
-        const base = opts.server || "http://127.0.0.1:8787";
-        const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/rooms`;
         try {
-          const authHeaders = onlineAuthHeaders(opts);
-          if (action === "list") {
-            const res = await fetch(endpoint, {
-              headers: { ...authHeaders },
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          if (action === "create") {
-            const payload = {
-              name: opts.name,
-              type: opts.type,
-              password: opts.password,
-            };
-            if (!payload.type) {
-              console.error("online room create requires --type");
-              process.exitCode = 1;
-              return;
-            }
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", ...authHeaders },
-              body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          console.error("online room requires action create|list");
-          process.exitCode = 1;
+          await runOnlineCommand("room", { action, opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -429,39 +442,12 @@ async function runCli(argv) {
       .option("--name <name>", "Channel name (unique)")
       .option("--type <type>", "Channel type (world|public)")
       .action(async (action, opts) => {
-        const base = opts.server || "http://127.0.0.1:8787";
-        const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
         try {
-          const authHeaders = onlineAuthHeaders(opts);
-          if (action === "list") {
-            const res = await fetch(endpoint, {
-              headers: { ...authHeaders },
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          if (action === "create") {
-            const payload = {
-              name: opts.name,
-              type: opts.type,
-            };
-            if (!payload.name) {
-              console.error("online channel create requires --name");
-              process.exitCode = 1;
-              return;
-            }
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", ...authHeaders },
-              body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          console.error("online channel requires action create|list");
-          process.exitCode = 1;
+          await runOnlineCommand("channel", { action, opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -487,27 +473,12 @@ async function runCli(argv) {
       .option("--trust-remote", "Trust all private-room members for bus/decisions/wake sync")
       .option("--allow-from <subscriberId>", "Allow bus/decisions/wake from subscriber ID (repeatable)", collectOption)
       .action(async (opts) => {
-        const OnlineConnect = require("./online/bridge");
-        const conn = new OnlineConnect({
-          projectRoot: process.cwd(),
-          nickname: opts.nickname,
-          subscriberId: opts.subscriber || "",
-          url: opts.url,
-          token: opts.token || "",
-          tokenHash: opts.tokenHash || "",
-          tokenFile: opts.tokenFile || "",
-          world: opts.world,
-          pingMs: opts.pingMs ? parseInt(opts.pingMs, 10) : 0,
-          channel: opts.join || "",
-          room: opts.room || "",
-          roomPassword: opts.roomPassword || "",
-          pollIntervalMs: opts.interval ? parseInt(opts.interval, 10) : 1500,
-          allowInsecureWs: !!opts.allowInsecureWs,
-          trustRemote: !!opts.trustRemote,
-          allowFrom: opts.allowFrom || [],
-        });
         try {
-          await conn.start();
+          await runOnlineCommand("connect", { opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -521,13 +492,17 @@ async function runCli(argv) {
       .requiredOption("--text <message>", "Message text")
       .option("--channel <name>", "Target channel")
       .option("--room <id>", "Target room")
-      .action((opts) => {
-        const { send } = require("./online/runner");
-        send(opts.nickname, {
-          text: opts.text,
-          channel: opts.channel || "",
-          room: opts.room || "",
-        });
+      .action(async (opts) => {
+        try {
+          await runOnlineCommand("send", { opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
       });
 
     online
@@ -536,10 +511,13 @@ async function runCli(argv) {
       .argument("<nickname>", "Agent nickname")
       .option("--clear", "Clear the inbox")
       .option("--unread", "Show unread messages only")
-      .action((nickname, opts) => {
-        const { checkInbox } = require("./online/runner");
+      .action(async (nickname, opts) => {
         try {
-          checkInbox(nickname, { clear: opts.clear, unread: opts.unread });
+          await runOnlineCommand("inbox", { nickname, opts }, {
+            mode: "commander",
+            onlineAuthHeaders,
+            projectRoot: process.cwd(),
+          });
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
@@ -684,64 +662,8 @@ async function runCli(argv) {
         const cmdArgs = args.slice(1);
 
         try {
-          switch (cmd) {
-            case "init":
-              await eventBus.init();
-              break;
-            case "join":
-              {
-                const subscriber = await eventBus.join(cmdArgs[0], cmdArgs[1], cmdArgs[2]);
-                if (subscriber) console.log(subscriber);
-              }
-              break;
-            case "leave":
-              await eventBus.leave(cmdArgs[0]);
-              break;
-            case "send":
-              {
-                // 自动 join（如果还没有 join）并获取 subscriber ID
-                const publisher = await eventBus.ensureJoined();
-                await eventBus.send(cmdArgs[0], cmdArgs[1], publisher);
-              }
-              break;
-            case "broadcast":
-              {
-                // 自动 join（如果还没有 join）并获取 subscriber ID
-                const publisher = await eventBus.ensureJoined();
-                await eventBus.broadcast(cmdArgs[0], publisher);
-              }
-              break;
-            case "wake":
-              {
-                const publisher = await eventBus.ensureJoined();
-                await eventBus.wake(cmdArgs[0], { publisher, reason: "remote" });
-              }
-              break;
-            case "check":
-              await eventBus.check(cmdArgs[0]);
-              break;
-            case "ack":
-              await eventBus.ack(cmdArgs[0]);
-              break;
-            case "consume":
-              await eventBus.consume(cmdArgs[0], cmdArgs.includes("--from-beginning"));
-              break;
-            case "status":
-              await eventBus.status();
-              break;
-            case "resolve":
-              await eventBus.resolve(cmdArgs[0], cmdArgs[1]);
-              break;
-            case "rename":
-              await eventBus.rename(cmdArgs[0], cmdArgs[1]);
-              break;
-            case "whoami":
-              await eventBus.whoami();
-              break;
-            default:
-              console.error(`Unknown bus subcommand: ${cmd}`);
-              process.exitCode = 1;
-          }
+          const result = await runBusCoreCommand(eventBus, cmd, cmdArgs);
+          if (result && result.subscriber) console.log(result.subscriber);
         } catch (err) {
           console.error(err.message);
           process.exitCode = 1;
@@ -755,97 +677,20 @@ async function runCli(argv) {
       .allowUnknownOption(true)
       .argument("[subargs...]", "Subcommand args")
       .action(async (subcmd, subargs = []) => {
-        const DecisionsManager = require("./context/decisions");
-        const ContextDoctor = require("./context/doctor");
         const cwd = process.cwd();
 
         try {
-          switch (subcmd) {
-            case "doctor": {
-              const doctor = new ContextDoctor(cwd);
-              const mode = subargs.includes("--project") ? "project" : "protocol";
-              const projectPath = mode === "project" ? subargs[subargs.indexOf("--project") + 1] : null;
-              await doctor.run({ mode, projectPath });
-              break;
-            }
-            case "lint": {
-              const doctor = new ContextDoctor(cwd);
-              const mode = subargs.includes("--project") ? "project" : "protocol";
-              const projectPath = mode === "project" ? subargs[subargs.indexOf("--project") + 1] : null;
-              if (mode === "project") {
-                doctor.lintProject(projectPath);
-              } else {
-                doctor.lintProtocol();
-              }
-              break;
-            }
-            case "decisions": {
-              const manager = new DecisionsManager(cwd);
-              const opts = {};
-
-              if (subargs[0] === "index" || subargs.includes("--index")) {
-                manager.writeIndex();
-                break;
-              }
-              if (subargs[0] === "new") {
-                const create = { title: "", author: "", status: "", nickname: "" };
-                for (let i = 1; i < subargs.length; i++) {
-                  const arg = subargs[i];
-                  if (arg === "--author") {
-                    create.author = subargs[++i] || "";
-                    continue;
-                  }
-                  if (arg === "--status") {
-                    create.status = subargs[++i] || "";
-                    continue;
-                  }
-                  if (arg === "--nickname") {
-                    create.nickname = subargs[++i] || "";
-                    continue;
-                  }
-                  if (!arg.startsWith("-")) {
-                    create.title = create.title ? `${create.title} ${arg}` : arg;
-                    continue;
-                  }
-                }
-                manager.createDecision(create);
-                break;
-              }
-
-              // Parse options
-              for (let i = 0; i < subargs.length; i++) {
-                if (subargs[i] === "-n") opts.num = parseInt(subargs[++i]);
-                if (subargs[i] === "-s") opts.status = subargs[++i];
-                if (subargs[i] === "-l") opts.listOnly = true;
-                if (subargs[i] === "-a") opts.all = true;
-                if (subargs[i] === "-d") {
-                  manager.decisionsDir = subargs[++i];
-                  manager.contextDir = path.dirname(manager.decisionsDir);
-                  manager.indexFile = path.join(manager.contextDir, "decisions.jsonl");
-                }
-              }
-
-              if (opts.listOnly) {
-                manager.list({ status: opts.status || "open" });
-              } else {
-                manager.show({
-                  status: opts.status || "open",
-                  num: opts.num || 1,
-                  all: opts.all || false,
-                });
-              }
-              break;
-            }
-            default:
-              console.error(
-                chalk.red(
-                  `Unknown ctx subcommand: ${subcmd}. Supported: doctor, lint, decisions`
-                )
-              );
-              process.exitCode = 1;
-          }
+          await runCtxCommand(subcmd, subargs, {
+            cwd,
+            allowIndexNew: true,
+            updateDecisionIndexPaths: true,
+          });
         } catch (err) {
-          console.error(chalk.red(`Error: ${err.message}`));
+          if (err && err.code === "UFOO_CTX_UNKNOWN") {
+            console.error(chalk.red(err.message));
+          } else {
+            console.error(chalk.red(`Error: ${err.message}`));
+          }
           process.exitCode = 1;
         }
       });
@@ -884,6 +729,7 @@ async function runCli(argv) {
     console.log("  ufoo daemon --start|--stop|--status");
     console.log("  ufoo chat");
     console.log("  ufoo resume [nickname]");
+    console.log("  ufoo recover [list [target] | run <target>] [--json]");
     console.log("  ufoo init [--modules <list>] [--project <dir>]");
     console.log("  ufoo skills list");
     console.log("  ufoo skills install <name|all> [--target <dir> | --codex | --agents]");
@@ -958,6 +804,61 @@ async function runCli(argv) {
     })();
     return;
   }
+  if (cmd === "recover") {
+    const first = rest[0] || "";
+    const action = first && !first.startsWith("--") ? first.toLowerCase() : "list";
+    const targetIdx = first && !first.startsWith("--") ? 1 : 0;
+    const target = rest[targetIdx] && !rest[targetIdx].startsWith("--") ? rest[targetIdx] : "";
+    const outputJson = rest.includes("--json");
+    (async () => {
+      try {
+        const projectRoot = process.cwd();
+        await ensureDaemonRunning(projectRoot);
+
+        if (action === "list") {
+          const resp = await sendDaemonRequest(projectRoot, {
+            type: "list_recoverable_agents",
+            target,
+          });
+          const result = resp?.data?.recoverable || { recoverable: [], skipped: [] };
+          if (outputJson) {
+            console.log(JSON.stringify(result, null, 2));
+            return;
+          }
+          const recoverable = result.recoverable || [];
+          console.log(resp?.data?.reply || `Found ${recoverable.length} recoverable agent(s)`);
+          recoverable.forEach((item) => {
+            const nickname = item.nickname ? ` (${item.nickname})` : "";
+            const meta = item.launchMode ? ` [${item.agent}/${item.launchMode}]` : ` [${item.agent}]`;
+            console.log(`  - ${item.id}${nickname}${meta}`);
+          });
+          return;
+        }
+
+        if (action === "run") {
+          if (!target) {
+            console.error("recover run requires <target>");
+            process.exitCode = 1;
+            return;
+          }
+          const resp = await sendDaemonRequest(projectRoot, {
+            type: "resume_agents",
+            target,
+          });
+          const reply = resp?.data?.reply || "Recover requested";
+          console.log(reply);
+          return;
+        }
+
+        console.error("recover action must be list|run");
+        process.exitCode = 1;
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
+    })();
+    return;
+  }
   if (cmd === "init") {
     const UfooInit = require("./init");
     const init = new UfooInit(repoRoot);
@@ -1018,259 +919,31 @@ async function runCli(argv) {
   }
   if (cmd === "online") {
     const sub = rest[0] || "";
-    if (sub === "server") {
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
-      const hasFlag = (name) => rest.includes(name);
-      const OnlineServer = require("./online/server");
-      const tlsCert = getOpt("--tls-cert") || null;
-      const tlsKey = getOpt("--tls-key") || null;
-      const server = new OnlineServer({
-        host: getOpt("--host") || "127.0.0.1",
-        port: parseInt(getOpt("--port") || "8787", 10),
-        tokenFile: getOpt("--token-file") || undefined,
-        idleTimeoutMs: parseInt(getOpt("--idle-timeout") || "30000", 10),
-        insecure: hasFlag("--insecure"),
-        tlsCert,
-        tlsKey,
-      });
-      const isTls = !!(tlsCert && tlsKey);
-      const wsProto = isTls ? "wss" : "ws";
-      const httpProto = isTls ? "https" : "http";
-      server.start().then(() => {
-        console.log(`ufoo-online relay listening on ${server.host}:${server.port}`);
-        console.log(`  WebSocket: ${wsProto}://${server.host}:${server.port}/ufoo/online`);
-        console.log(`  HTTP API:  ${httpProto}://${server.host}:${server.port}/ufoo/online/rooms`);
-        console.log(`             ${httpProto}://${server.host}:${server.port}/ufoo/online/channels`);
-        if (server.insecure) console.log(`  Auth: INSECURE mode (any token accepted)`);
-        if (isTls) console.log(`  TLS: enabled`);
-      }).catch((err) => {
-        console.error(err.message || String(err));
-        process.exitCode = 1;
-      });
+    if (!sub) {
+      help();
+      process.exitCode = 1;
       return;
     }
-    if (sub === "token") {
-      const subscriber = rest[1];
-      if (!subscriber) {
-        console.error("online token requires <subscriber>");
-        process.exitCode = 1;
-        return;
-      }
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
+
+    (async () => {
       try {
-        const { generateToken, setToken, defaultTokensPath } = require("./online/tokens");
-        const filePath = getOpt("--file") || defaultTokensPath();
-        const token = generateToken();
-        const entry = setToken(filePath, subscriber, token, getOpt("--server"), {
-          nickname: getOpt("--nickname"),
-        });
-        console.log(JSON.stringify({
-          subscriber,
-          token,
-          token_hash: entry.token_hash,
-          server: entry.server,
-          nickname: entry.nickname,
-          file: filePath,
-        }, null, 2));
-      } catch (err) {
-        console.error(err.message || String(err));
-        process.exitCode = 1;
-      }
-      return;
-    }
-    if (sub === "room") {
-      const action = rest[1] || "";
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
-      const base = getOpt("--server") || "http://127.0.0.1:8787";
-      const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/rooms`;
-      const authHeaders = onlineAuthHeaders({
-        authToken: getOpt("--auth-token"),
-        tokenFile: getOpt("--token-file"),
-        subscriber: getOpt("--subscriber"),
-        nickname: getOpt("--nickname"),
-      });
-      (async () => {
-        try {
-          if (action === "list") {
-            const res = await fetch(endpoint, { headers: authHeaders });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          if (action === "create") {
-            const payload = {
-              name: getOpt("--name"),
-              type: getOpt("--type"),
-              password: getOpt("--password"),
-            };
-            if (!payload.type) {
-              console.error("online room create requires --type");
-              process.exitCode = 1;
-              return;
-            }
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", ...authHeaders },
-              body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          console.error("online room requires action create|list");
-          process.exitCode = 1;
-        } catch (err) {
-          console.error(err.message || String(err));
-          process.exitCode = 1;
-        }
-      })();
-      return;
-    }
-    if (sub === "channel") {
-      const action = rest[1] || "";
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
-      const base = getOpt("--server") || "http://127.0.0.1:8787";
-      const endpoint = `${base.replace(/\/$/, "")}/ufoo/online/channels`;
-      const authHeaders = onlineAuthHeaders({
-        authToken: getOpt("--auth-token"),
-        tokenFile: getOpt("--token-file"),
-        subscriber: getOpt("--subscriber"),
-        nickname: getOpt("--nickname"),
-      });
-      (async () => {
-        try {
-          if (action === "list") {
-            const res = await fetch(endpoint, { headers: authHeaders });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          if (action === "create") {
-            const payload = {
-              name: getOpt("--name"),
-              type: getOpt("--type") || "public",
-            };
-            if (!payload.name) {
-              console.error("online channel create requires --name");
-              process.exitCode = 1;
-              return;
-            }
-            const res = await fetch(endpoint, {
-              method: "POST",
-              headers: { "Content-Type": "application/json", ...authHeaders },
-              body: JSON.stringify(payload),
-            });
-            const data = await res.json();
-            console.log(JSON.stringify(data, null, 2));
-            return;
-          }
-          console.error("online channel requires action create|list");
-          process.exitCode = 1;
-        } catch (err) {
-          console.error(err.message || String(err));
-          process.exitCode = 1;
-        }
-      })();
-      return;
-    }
-    if (sub === "connect") {
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
-      const hasFlag = (name) => rest.includes(name);
-      const nickname = getOpt("--nickname");
-      if (!nickname) {
-        console.error("online connect requires --nickname");
-        process.exitCode = 1;
-        return;
-      }
-      const allowFrom = collectOptionValues(rest, "--allow-from")
-        .reduce((acc, value) => collectOption(value, acc), []);
-      const OnlineConnect = require("./online/bridge");
-      const conn = new OnlineConnect({
-        projectRoot: process.cwd(),
-        nickname,
-        subscriberId: getOpt("--subscriber"),
-        url: getOpt("--url") || "ws://127.0.0.1:8787/ufoo/online",
-        token: getOpt("--token"),
-        tokenHash: getOpt("--token-hash"),
-        tokenFile: getOpt("--token-file"),
-        world: getOpt("--world") || "default",
-        pingMs: getOpt("--ping-ms") ? parseInt(getOpt("--ping-ms"), 10) : 0,
-        channel: getOpt("--join"),
-        room: getOpt("--room"),
-        roomPassword: getOpt("--room-password"),
-        pollIntervalMs: getOpt("--interval") ? parseInt(getOpt("--interval"), 10) : 1500,
-        allowInsecureWs: hasFlag("--allow-insecure-ws"),
-        trustRemote: hasFlag("--trust-remote"),
-        allowFrom,
-      });
-      conn.start().catch((err) => {
-        console.error(err.message || String(err));
-        process.exitCode = 1;
-      });
-      return;
-    }
-    if (sub === "send") {
-      const getOpt = (name) => {
-        const i = rest.indexOf(name);
-        if (i === -1) return "";
-        return rest[i + 1] || "";
-      };
-      const nickname = getOpt("--nickname");
-      const text = getOpt("--text");
-      if (!nickname || !text) {
-        console.error("online send requires --nickname and --text");
-        process.exitCode = 1;
-        return;
-      }
-      const { send } = require("./online/runner");
-      send(nickname, {
-        text,
-        channel: getOpt("--channel"),
-        room: getOpt("--room"),
-      });
-      return;
-    }
-    if (sub === "inbox") {
-      const nickname = rest[1];
-      if (!nickname || nickname.startsWith("--")) {
-        console.error("online inbox requires <nickname>");
-        process.exitCode = 1;
-        return;
-      }
-      const { checkInbox } = require("./online/runner");
-      try {
-        checkInbox(nickname, {
-          clear: rest.includes("--clear"),
-          unread: rest.includes("--unread"),
+        await runOnlineCommand(sub, { argv: rest }, {
+          mode: "fallback",
+          onlineAuthHeaders,
+          projectRoot: process.cwd(),
+          collectOptionValues,
+          collectOption,
+          defaultChannelType: "public",
         });
       } catch (err) {
-        console.error(err.message || String(err));
+        if (err && err.code === "UFOO_ONLINE_UNKNOWN") {
+          help();
+        } else {
+          console.error(err.message || String(err));
+        }
         process.exitCode = 1;
       }
-      return;
-    }
-    help();
-    process.exitCode = 1;
+    })();
     return;
   }
   if (cmd === "bus") {
@@ -1391,64 +1064,8 @@ async function runCli(argv) {
     (async () => {
       try {
         const cmdArgs = rest.slice(1);
-        switch (sub) {
-          case "init":
-            await eventBus.init();
-            break;
-          case "join":
-            {
-              const subscriber = await eventBus.join(cmdArgs[0], cmdArgs[1], cmdArgs[2]);
-              if (subscriber) console.log(subscriber);
-            }
-            break;
-          case "leave":
-            await eventBus.leave(cmdArgs[0]);
-            break;
-          case "send":
-            {
-              // 自动 join（如果还没有 join）并获取 subscriber ID
-              const publisher = await eventBus.ensureJoined();
-              await eventBus.send(cmdArgs[0], cmdArgs[1], publisher);
-            }
-            break;
-          case "broadcast":
-            {
-              // 自动 join（如果还没有 join）并获取 subscriber ID
-              const publisher = await eventBus.ensureJoined();
-              await eventBus.broadcast(cmdArgs[0], publisher);
-            }
-            break;
-          case "wake":
-            {
-              const publisher = await eventBus.ensureJoined();
-              await eventBus.wake(cmdArgs[0], { publisher, reason: "remote" });
-            }
-            break;
-          case "check":
-            await eventBus.check(cmdArgs[0]);
-            break;
-          case "ack":
-            await eventBus.ack(cmdArgs[0]);
-            break;
-          case "consume":
-            await eventBus.consume(cmdArgs[0], cmdArgs.includes("--from-beginning"));
-            break;
-          case "status":
-            await eventBus.status();
-            break;
-          case "resolve":
-            await eventBus.resolve(cmdArgs[0], cmdArgs[1]);
-            break;
-          case "rename":
-            await eventBus.rename(cmdArgs[0], cmdArgs[1]);
-            break;
-          case "whoami":
-            await eventBus.whoami();
-            break;
-          default:
-            console.error(`Unknown bus subcommand: ${sub}`);
-            process.exitCode = 1;
-        }
+        const result = await runBusCoreCommand(eventBus, sub, cmdArgs);
+        if (result && result.subscriber) console.log(result.subscriber);
       } catch (err) {
         console.error(err.message);
         process.exitCode = 1;
@@ -1459,58 +1076,15 @@ async function runCli(argv) {
   if (cmd === "ctx") {
     const sub = rest[0] || "doctor";
     const subargs = rest.slice(1);
-    const DecisionsManager = require("./context/decisions");
-    const ContextDoctor = require("./context/doctor");
     const cwd = process.cwd();
 
     (async () => {
       try {
-        switch (sub) {
-          case "doctor": {
-            const doctor = new ContextDoctor(cwd);
-            const mode = subargs.includes("--project") ? "project" : "protocol";
-            const projectPath = mode === "project" ? subargs[subargs.indexOf("--project") + 1] : null;
-            await doctor.run({ mode, projectPath });
-            break;
-          }
-          case "lint": {
-            const doctor = new ContextDoctor(cwd);
-            const mode = subargs.includes("--project") ? "project" : "protocol";
-            const projectPath = mode === "project" ? subargs[subargs.indexOf("--project") + 1] : null;
-            if (mode === "project") {
-              doctor.lintProject(projectPath);
-            } else {
-              doctor.lintProtocol();
-            }
-            break;
-          }
-          case "decisions": {
-            const manager = new DecisionsManager(cwd);
-            const opts = {};
-
-            for (let i = 0; i < subargs.length; i++) {
-              if (subargs[i] === "-n") opts.num = parseInt(subargs[++i]);
-              if (subargs[i] === "-s") opts.status = subargs[++i];
-              if (subargs[i] === "-l") opts.listOnly = true;
-              if (subargs[i] === "-a") opts.all = true;
-              if (subargs[i] === "-d") manager.decisionsDir = subargs[++i];
-              if (subargs[i] === "--nickname") opts.nickname = subargs[++i];
-            }
-
-            if (opts.listOnly) {
-              manager.list({ status: opts.status || "open" });
-            } else {
-              manager.show({
-                status: opts.status || "open",
-                num: opts.num || 1,
-                all: opts.all || false,
-              });
-            }
-            break;
-          }
-          default:
-            throw new Error(`Unknown ctx subcommand: ${sub}`);
-        }
+        await runCtxCommand(sub, subargs, {
+          cwd,
+          allowIndexNew: false,
+          updateDecisionIndexPaths: false,
+        });
       } catch (err) {
         console.error(`Error: ${err.message}`);
         process.exit(1);

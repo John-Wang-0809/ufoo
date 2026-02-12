@@ -1,5 +1,6 @@
 const fs = require("fs");
 const net = require("net");
+const { PTY_SOCKET_MESSAGE_TYPES, PTY_SOCKET_SUBSCRIBE_MODES } = require("../shared/ptySocketContract");
 
 function createAgentSockets(options = {}) {
   const {
@@ -16,14 +17,24 @@ function createAgentSockets(options = {}) {
   let inputClient = null;
   let pendingResize = null;
 
-  function requestScreenSnapshot() {
+  function requestSnapshot(mode = PTY_SOCKET_SUBSCRIBE_MODES.SCREEN) {
     if (!outputClient || outputClient.destroyed) return false;
+    const safeMode = mode === PTY_SOCKET_SUBSCRIBE_MODES.FULL
+      ? PTY_SOCKET_SUBSCRIBE_MODES.FULL
+      : PTY_SOCKET_SUBSCRIBE_MODES.SCREEN;
     try {
-      outputClient.write(JSON.stringify({ type: "subscribe", mode: "screen" }) + "\n");
+      outputClient.write(JSON.stringify({
+        type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE,
+        mode: safeMode,
+      }) + "\n");
       return true;
     } catch {
       return false;
     }
+  }
+
+  function requestScreenSnapshot() {
+    return requestSnapshot(PTY_SOCKET_SUBSCRIBE_MODES.SCREEN);
   }
 
   function connectOutput(sockPath) {
@@ -41,7 +52,10 @@ function createAgentSockets(options = {}) {
 
     try {
       outputClient = net.createConnection(sockPath, () => {
-        outputClient.write(JSON.stringify({ type: "subscribe", mode: "full" }) + "\n");
+        outputClient.write(JSON.stringify({
+          type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE,
+          mode: PTY_SOCKET_SUBSCRIBE_MODES.FULL,
+        }) + "\n");
       });
 
       const connectTimeout = setTimeout(() => {
@@ -63,11 +77,12 @@ function createAgentSockets(options = {}) {
           if (!line.trim()) continue;
           try {
             const msg = JSON.parse(line);
-            if (msg.type === "output") {
+            if (msg.type === PTY_SOCKET_MESSAGE_TYPES.OUTPUT) {
               if (msg.data) onTermWrite(msg.data);
-            } else if (msg.type === "replay" || msg.type === "snapshot") {
+            } else if (msg.type === PTY_SOCKET_MESSAGE_TYPES.REPLAY ||
+              msg.type === PTY_SOCKET_MESSAGE_TYPES.SNAPSHOT) {
               if (msg.data) onTermWrite(msg.data);
-              if (msg.type === "snapshot" && msg.cursor) {
+              if (msg.type === PTY_SOCKET_MESSAGE_TYPES.SNAPSHOT && msg.cursor) {
                 onPlaceCursor(msg.cursor);
               }
             }
@@ -118,7 +133,11 @@ function createAgentSockets(options = {}) {
           const { cols, rows } = pendingResize;
           pendingResize = null;
           try {
-            inputClient.write(JSON.stringify({ type: "resize", cols, rows }) + "\n");
+            inputClient.write(JSON.stringify({
+              type: PTY_SOCKET_MESSAGE_TYPES.RESIZE,
+              cols,
+              rows,
+            }) + "\n");
           } catch {
             // ignore write errors
           }
@@ -150,7 +169,10 @@ function createAgentSockets(options = {}) {
   function sendRaw(data) {
     if (inputClient && !inputClient.destroyed) {
       try {
-        inputClient.write(JSON.stringify({ type: "raw", data }) + "\n");
+        inputClient.write(JSON.stringify({
+          type: PTY_SOCKET_MESSAGE_TYPES.RAW,
+          data,
+        }) + "\n");
         return;
       } catch {
         // ignore write errors
@@ -170,7 +192,11 @@ function createAgentSockets(options = {}) {
       return;
     }
     try {
-      inputClient.write(JSON.stringify({ type: "resize", cols, rows }) + "\n");
+      inputClient.write(JSON.stringify({
+        type: PTY_SOCKET_MESSAGE_TYPES.RESIZE,
+        cols,
+        rows,
+      }) + "\n");
     } catch {
       // ignore write errors
     }
@@ -189,6 +215,7 @@ function createAgentSockets(options = {}) {
     disconnectAll,
     sendRaw,
     sendResize,
+    requestSnapshot,
     requestScreenSnapshot,
   };
 }

@@ -30,7 +30,6 @@ describe("chat dashboardView", () => {
     expect(out.content).toContain("{gray-fg}Agents:{/gray-fg} {cyan-fg}@a, @b, @c +1{/cyan-fg}");
     expect(out.content).toContain("{gray-fg}Mode:{/gray-fg} {cyan-fg}tmux{/cyan-fg}");
     expect(out.content).toContain("{gray-fg}Agent:{/gray-fg} {cyan-fg}claude{/cyan-fg}");
-    expect(out.content).toContain("{gray-fg}Resume:{/gray-fg} {cyan-fg}off{/cyan-fg}");
   });
 
   test("dashboard mode page highlights selected mode", () => {

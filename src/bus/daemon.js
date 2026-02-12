@@ -4,6 +4,7 @@ const { readJSON, writeJSON, isPidAlive, isAgentPidAlive, ensureDir, safeNameToS
 const Injector = require("./inject");
 const QueueManager = require("./queue");
 const MessageManager = require("./message");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
 /**
  * Bus Daemon - 监控消息并自动注入命令
@@ -23,6 +24,7 @@ class BusDaemon {
 
     this.queueManager = new QueueManager(busDir);
     this.injector = new Injector(busDir, agentsFile);
+    this.adapterRouter = createTerminalAdapterRouter();
   }
 
   /**
@@ -213,10 +215,12 @@ class BusDaemon {
       const meta = busData.agents?.[subscriber];
       const launchMode = meta?.launch_mode || "";
       // Delivery ownership:
-      // - terminal/tmux: handled by AgentNotifier inside launcher
-      // - internal/internal-pty: handled by internal runner queue loop
+      // - notifier/injector: terminal/tmux
+      // - internal queue loop: internal/internal-pty
       // Bus daemon only handles legacy/unknown launch modes.
-      if (launchMode && ["terminal", "tmux", "internal", "internal-pty"].includes(launchMode)) {
+      const adapter = this.adapterRouter.getAdapter({ launchMode, agentId: subscriber });
+      const { supportsNotifierInjector, supportsInternalQueueLoop } = adapter.capabilities;
+      if (launchMode && (supportsNotifierInjector || supportsInternalQueueLoop)) {
         continue;
       }
 

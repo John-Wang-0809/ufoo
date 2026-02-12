@@ -1,3 +1,5 @@
+const { IPC_REQUEST_TYPES } = require("../shared/eventContract");
+
 function createInputSubmitHandler(options = {}) {
   const {
     state,
@@ -12,6 +14,7 @@ function createInputSubmitHandler(options = {}) {
     markPendingDelivery = () => {},
     clearTargetAgent = () => {},
     enterAgentView = () => {},
+    getAgentAdapter = () => null,
     activateAgent = async () => {},
     getInjectSockPath = () => "",
     existsSync = () => false,
@@ -24,22 +27,29 @@ function createInputSubmitHandler(options = {}) {
   }
 
   async function tryActivateTargetAgent(agentId) {
-    const meta = state.activeAgentMetaMap.get(agentId);
-    const agentLaunchMode = (meta && meta.launch_mode) || "";
+    const adapter = getAgentAdapter(agentId);
+    const capabilities = adapter && adapter.capabilities ? adapter.capabilities : null;
     const sockPath = getInjectSockPath(agentId);
+    const supportsSocket = Boolean(capabilities && capabilities.supportsSocketProtocol);
+    const supportsActivate = Boolean(capabilities && capabilities.supportsActivate);
+    const supportsInternalQueue = Boolean(capabilities && capabilities.supportsInternalQueueLoop);
 
-    if (existsSync(sockPath)) {
+    if (existsSync(sockPath) && supportsSocket) {
       clearTargetAgent();
       enterAgentView(agentId);
       return true;
     }
 
-    if (agentLaunchMode === "tmux" || agentLaunchMode === "terminal") {
+    if (supportsActivate) {
       clearTargetAgent();
       try {
-        const pendingActivation = activateAgent(agentId);
-        if (pendingActivation && typeof pendingActivation.catch === "function") {
-          pendingActivation.catch(() => {});
+        if (adapter && typeof adapter.activate === "function") {
+          adapter.activate(agentId);
+        } else {
+          const pendingActivation = activateAgent(agentId);
+          if (pendingActivation && typeof pendingActivation.catch === "function") {
+            pendingActivation.catch(() => {});
+          }
         }
       } catch {
         // Best-effort activation.
@@ -47,7 +57,7 @@ function createInputSubmitHandler(options = {}) {
       return true;
     }
 
-    if (agentLaunchMode === "internal" || agentLaunchMode === "internal-pty") {
+    if (supportsInternalQueue) {
       clearTargetAgent();
       enterAgentView(agentId, { useBus: true });
       return true;
@@ -77,7 +87,7 @@ function createInputSubmitHandler(options = {}) {
         `{cyan-fg}→{/cyan-fg} {magenta-fg}@${escapeBlessed(label)}{/magenta-fg} ${escapeBlessed(text)}`
       );
       markPendingDelivery(state.targetAgent);
-      send({ type: "bus_send", target: state.targetAgent, message: text });
+      send({ type: IPC_REQUEST_TYPES.BUS_SEND, target: state.targetAgent, message: text });
       clearTargetAgent();
       focusInput();
       return;
@@ -96,7 +106,7 @@ function createInputSubmitHandler(options = {}) {
         `{cyan-fg}→{/cyan-fg} {magenta-fg}@${escapeBlessed(atTarget.target)}{/magenta-fg} ${escapeBlessed(atTarget.message)}`
       );
       markPendingDelivery(resolvedTarget);
-      send({ type: "bus_send", target: atTarget.target, message: atTarget.message });
+      send({ type: IPC_REQUEST_TYPES.BUS_SEND, target: atTarget.target, message: atTarget.message });
       focusInput();
       return;
     }
@@ -118,7 +128,7 @@ function createInputSubmitHandler(options = {}) {
       if (choice) {
         queueStatusLine(`ufoo-agent processing (assigning ${choice.agent_id})`);
         send({
-          type: "prompt",
+          type: IPC_REQUEST_TYPES.PROMPT,
           text: `Use agent ${choice.agent_id} to handle: ${state.pending.original || "the request"}`,
         });
         state.pending = null;
@@ -128,7 +138,7 @@ function createInputSubmitHandler(options = {}) {
     } else {
       state.pending = { original: text };
       queueStatusLine("ufoo-agent processing");
-      send({ type: "prompt", text });
+      send({ type: IPC_REQUEST_TYPES.PROMPT, text });
       logMessage("user", `{white-fg}→{/white-fg} ${escapeBlessed(text)}`);
     }
 

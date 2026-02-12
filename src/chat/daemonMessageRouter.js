@@ -1,3 +1,5 @@
+const { IPC_RESPONSE_TYPES, BUS_STATUS_PHASES } = require("../shared/eventContract");
+
 function createDaemonMessageRouter(options = {}) {
   const {
     escapeBlessed = (value) => String(value || ""),
@@ -50,12 +52,12 @@ function createDaemonMessageRouter(options = {}) {
     if (typeof data.phase === "string") {
       const text = data.text || "";
       const item = { key: data.key, text };
-      if (data.phase === "start") {
+      if (data.phase === BUS_STATUS_PHASES.START) {
         enqueueBusStatus(item);
-      } else if (data.phase === "done" || data.phase === "error") {
+      } else if (data.phase === BUS_STATUS_PHASES.DONE || data.phase === BUS_STATUS_PHASES.ERROR) {
         resolveBusStatus(item);
         if (text) {
-          const prefix = data.phase === "error"
+          const prefix = data.phase === BUS_STATUS_PHASES.ERROR
             ? "{white-fg}✗{/white-fg}"
             : "{white-fg}✓{/white-fg}";
           logMessage("status", `${prefix} ${escapeBlessed(text)}`, data);
@@ -76,6 +78,35 @@ function createDaemonMessageRouter(options = {}) {
     if (payload.reply) {
       resolveStatusLine(`{gray-fg}←{/gray-fg} ${escapeBlessed(payload.reply)}`);
       logMessage("reply", `{white-fg}←{/white-fg} ${escapeBlessed(payload.reply)}`);
+    }
+
+    if (payload.recoverable && typeof payload.recoverable === "object") {
+      const recoverableList = Array.isArray(payload.recoverable.recoverable)
+        ? payload.recoverable.recoverable
+        : [];
+      const skippedList = Array.isArray(payload.recoverable.skipped)
+        ? payload.recoverable.skipped
+        : [];
+
+      if (recoverableList.length > 0) {
+        logMessage("system", "{cyan-fg}Recoverable agents:{/cyan-fg}");
+        recoverableList.forEach((item) => {
+          const nickname = item.nickname ? ` (${item.nickname})` : "";
+          const meta = item.launchMode ? ` [${item.agent}/${item.launchMode}]` : ` [${item.agent}]`;
+          logMessage("system", `  • ${escapeBlessed(`${item.id}${nickname}${meta}`)}`);
+        });
+      } else {
+        logMessage("system", "{gray-fg}No recoverable agents{/gray-fg}");
+      }
+
+      if (skippedList.length > 0) {
+        logMessage("system", "{gray-fg}Skipped:{/gray-fg}");
+        skippedList.forEach((item) => {
+          const reason = item && item.reason ? item.reason : "skipped";
+          const id = item && item.id ? item.id : "unknown";
+          logMessage("system", `  - ${escapeBlessed(`${id}: ${reason}`)}`);
+        });
+      }
     }
 
     if (payload.dispatch && payload.dispatch.length > 0) {
@@ -199,10 +230,10 @@ function createDaemonMessageRouter(options = {}) {
   function handleMessage(msg) {
     if (!msg || typeof msg !== "object") return false;
 
-    if (msg.type === "status") return handleStatusMessage(msg);
-    if (msg.type === "response") return handleResponseMessage(msg);
-    if (msg.type === "bus") return handleBusMessage(msg);
-    if (msg.type === "error") return handleErrorMessage(msg);
+    if (msg.type === IPC_RESPONSE_TYPES.STATUS) return handleStatusMessage(msg);
+    if (msg.type === IPC_RESPONSE_TYPES.RESPONSE) return handleResponseMessage(msg);
+    if (msg.type === IPC_RESPONSE_TYPES.BUS) return handleBusMessage(msg);
+    if (msg.type === IPC_RESPONSE_TYPES.ERROR) return handleErrorMessage(msg);
 
     return false;
   }

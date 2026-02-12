@@ -34,9 +34,9 @@ fi
 **IMPORTANT**: Always check for existing subscriber ID first to avoid creating duplicates.
 
 ```bash
-# Check environment variable first (set by launcher/daemon)
-if [ -n "$UFOO_SUBSCRIBER_ID" ]; then
-  SUBSCRIBER="$UFOO_SUBSCRIBER_ID"
+# Reuse existing subscriber first (env -> whoami), join only if missing
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+if [ -n "$SUBSCRIBER" ]; then
   echo "Using existing subscriber ID: $SUBSCRIBER"
 else
   # Not launched via uclaude/ucodex, need to join manually
@@ -48,7 +48,8 @@ fi
 
 **Why this matters**:
 - `uclaude`/`ucodex` automatically set `UFOO_SUBSCRIBER_ID` during launch
-- Re-joining creates a new ID, causing message loss
+- `ufoo bus whoami` can recover current ID even when env is missing
+- Re-joining may create identity drift and message routing issues
 - Always reuse existing ID when available
 
 To join with a custom nickname:

@@ -1,3 +1,5 @@
+const { IPC_REQUEST_TYPES } = require("../shared/eventContract");
+const { PTY_SOCKET_MESSAGE_TYPES } = require("../shared/ptySocketContract");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const net = require("net");
@@ -265,15 +267,17 @@ class AgentLauncher {
     const tmuxPane = process.env.TMUX_PANE || "";
     const launchMode = resolveLaunchMode();
 
-    // 只在 terminal/tmux 模式下查找旧 session（可见终端才需要恢复）
+    // 只在支持 session reuse 的模式下查找旧 session（可见终端才需要恢复）
     // internal 模式由 daemon 管理，不需要自动恢复
-    const shouldReuse = launchMode === "terminal" || launchMode === "tmux";
+    const adapterRouter = createTerminalAdapterRouter();
+    const adapter = adapterRouter.getAdapter({ launchMode, agentId: "" });
+    const shouldReuse = adapter.capabilities.supportsSessionReuse;
     const previousSession = shouldReuse
       ? findPreviousSession(this.cwd, this.agentType, tty, tmuxPane)
       : null;
 
     const req = {
-      type: "register_agent",
+      type: IPC_REQUEST_TYPES.REGISTER_AGENT,
       agentType: this.agentType,
       nickname: nickname || (previousSession?.nickname) || "",
       parentPid: process.pid,
@@ -417,6 +421,7 @@ class AgentLauncher {
       // 4. 更新环境变量（供子进程/后续使用）
       if (subscriberId) process.env.UFOO_SUBSCRIBER_ID = subscriberId;
       if (finalNickname) process.env.UFOO_NICKNAME = finalNickname;
+      process.env.UFOO_AGENT_TYPE = this.agentType;
 
       // 5. 显示 banner
       showBanner({
@@ -480,7 +485,7 @@ class AgentLauncher {
               const daemonSock = await connectWithRetry(daemonSockPath, 3, 100);
               if (daemonSock) {
                 daemonSock.write(`${JSON.stringify({
-                  type: "agent_ready",
+                  type: IPC_REQUEST_TYPES.AGENT_READY,
                   subscriberId,
                 })}\n`);
                 daemonSock.end();
@@ -571,7 +576,7 @@ class AgentLauncher {
               }
               // Forward to all output subscribers
               if (outputSubscribers.size > 0) {
-                const msg = JSON.stringify({ type: "output", data: text, encoding: "utf8" }) + "\n";
+                const msg = JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.OUTPUT, data: text, encoding: "utf8" }) + "\n";
                 for (const sub of outputSubscribers) {
                   try {
                     sub.write(msg);
@@ -613,23 +618,23 @@ class AgentLauncher {
                       };
                       wrapper.logger.write(JSON.stringify(logEntry) + "\n");
                     }
-                  } else if (req.type === "raw" && req.data) {
+                  } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.RAW && req.data) {
                     // Raw PTY write (no Enter appended) - for TTY view passthrough
                     wrapper.write(req.data);
                     client.write(JSON.stringify({ ok: true }) + "\n");
-                  } else if (req.type === "resize" && req.cols && req.rows) {
+                  } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.RESIZE && req.cols && req.rows) {
                     // Resize PTY - for TTY view viewport adjustment
                     if (wrapper.pty && !wrapper.pty._closed) {
                       wrapper.pty.resize(req.cols, req.rows);
                     }
                     client.write(JSON.stringify({ ok: true }) + "\n");
-                  } else if (req.type === "subscribe") {
+                  } else if (req.type === PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBE) {
                     // Subscribe to PTY output stream for TTY view
                     outputSubscribers.add(client);
-                    client.write(JSON.stringify({ type: "subscribed", ok: true }) + "\n");
+                    client.write(JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.SUBSCRIBED, ok: true }) + "\n");
                     // Replay from in-memory ring buffer
                     if (outputRingBuffer.length > 0) {
-                      client.write(JSON.stringify({ type: "replay", data: outputRingBuffer, encoding: "utf8" }) + "\n");
+                      client.write(JSON.stringify({ type: PTY_SOCKET_MESSAGE_TYPES.REPLAY, data: outputRingBuffer, encoding: "utf8" }) + "\n");
                     }
                   } else {
                     client.write(JSON.stringify({ ok: false, error: "invalid request" }) + "\n");

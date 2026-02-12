@@ -1,4 +1,5 @@
 const { createInputSubmitHandler } = require("../../../src/chat/inputSubmitHandler");
+const { createTerminalAdapterRouter } = require("../../../src/terminal/adapterRouter");
 
 function createHarness(stateOverrides = {}, optionOverrides = {}) {
   const state = {
@@ -8,9 +9,16 @@ function createHarness(stateOverrides = {}, optionOverrides = {}) {
     ...stateOverrides,
   };
 
+  const adapterRouter = createTerminalAdapterRouter();
+
   const options = {
     state,
     parseAtTarget: jest.fn(() => null),
+    getAgentAdapter: jest.fn((agentId) => {
+      const meta = state.activeAgentMetaMap.get(agentId) || {};
+      const launchMode = meta.launch_mode || "";
+      return adapterRouter.getAdapter({ launchMode, agentId });
+    }),
     resolveAgentId: jest.fn(() => null),
     executeCommand: jest.fn(() => Promise.resolve(true)),
     queueStatusLine: jest.fn(),
@@ -44,7 +52,7 @@ describe("chat inputSubmitHandler", () => {
     const { state, options, handler } = createHarness(
       {
         targetAgent: "codex:1",
-        activeAgentMetaMap: new Map([["codex:1", { launch_mode: "internal" }]]),
+        activeAgentMetaMap: new Map([["codex:1", { launch_mode: "internal-pty" }]]),
       },
       {
         existsSync: jest.fn(() => true),

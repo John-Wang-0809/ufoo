@@ -1,4 +1,5 @@
 const { createDaemonMessageRouter } = require("../../../src/chat/daemonMessageRouter");
+const { IPC_RESPONSE_TYPES, BUS_STATUS_PHASES } = require("../../../src/shared/eventContract");
 
 function createHarness(overrides = {}) {
   let pending = null;
@@ -39,8 +40,8 @@ describe("chat daemonMessageRouter", () => {
     const { router, options } = createHarness();
 
     const stop = router.handleMessage({
-      type: "status",
-      data: { phase: "start", key: "k1", text: "processing" },
+      type: IPC_RESPONSE_TYPES.STATUS,
+      data: { phase: BUS_STATUS_PHASES.START, key: "k1", text: "processing" },
     });
 
     expect(stop).toBe(false);
@@ -54,7 +55,7 @@ describe("chat daemonMessageRouter", () => {
     });
 
     router.handleMessage({
-      type: "response",
+      type: IPC_RESPONSE_TYPES.RESPONSE,
       data: {
         disambiguate: {
           prompt: "Pick",
@@ -82,7 +83,7 @@ describe("chat daemonMessageRouter", () => {
     });
 
     const stop = router.handleMessage({
-      type: "bus",
+      type: IPC_RESPONSE_TYPES.BUS,
       data: {
         event: "message",
         publisher: "codex:1",
@@ -100,7 +101,7 @@ describe("chat daemonMessageRouter", () => {
     });
 
     const stop = router.handleMessage({
-      type: "bus",
+      type: IPC_RESPONSE_TYPES.BUS,
       data: {
         event: "delivery",
         publisher: "codex:1",
@@ -122,7 +123,7 @@ describe("chat daemonMessageRouter", () => {
     const { router, options } = createHarness();
 
     router.handleMessage({
-      type: "bus",
+      type: IPC_RESPONSE_TYPES.BUS,
       data: {
         event: "message",
         publisher: "codex:1",
@@ -133,6 +134,47 @@ describe("chat daemonMessageRouter", () => {
     expect(options.beginStream).toHaveBeenCalled();
     expect(options.appendStreamDelta).toHaveBeenCalled();
     expect(options.finalizeStream).toHaveBeenCalledWith("codex:1", expect.any(Object), "end");
+  });
+
+  test("response with recoverable payload logs recoverable and skipped entries", () => {
+    const { router, options } = createHarness();
+
+    router.handleMessage({
+      type: IPC_RESPONSE_TYPES.RESPONSE,
+      data: {
+        reply: "Found 1 recoverable agent(s)",
+        recoverable: {
+          recoverable: [
+            {
+              id: "codex:abc",
+              nickname: "codex-3",
+              agent: "codex",
+              launchMode: "terminal",
+            },
+          ],
+          skipped: [
+            { id: "claude-code:def", reason: "no provider session" },
+          ],
+        },
+      },
+    });
+
+    expect(options.logMessage).toHaveBeenCalledWith(
+      "system",
+      "{cyan-fg}Recoverable agents:{/cyan-fg}"
+    );
+    expect(options.logMessage).toHaveBeenCalledWith(
+      "system",
+      expect.stringContaining("ESC(codex:abc (codex-3) [codex/terminal])")
+    );
+    expect(options.logMessage).toHaveBeenCalledWith(
+      "system",
+      "{gray-fg}Skipped:{/gray-fg}"
+    );
+    expect(options.logMessage).toHaveBeenCalledWith(
+      "system",
+      expect.stringContaining("ESC(claude-code:def: no provider session)")
+    );
   });
 
   test("handles error messages", () => {

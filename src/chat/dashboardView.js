@@ -17,7 +17,6 @@ function computeDashboardContent(options = {}) {
     getAgentLabel = (id) => id,
     launchMode = "terminal",
     agentProvider = "codex-cli",
-    autoResume = true,
     selectedModeIndex = 0,
     selectedProviderIndex = 0,
     selectedResumeIndex = 0,
@@ -103,7 +102,6 @@ function computeDashboardContent(options = {}) {
   content += `{gray-fg}Agents:{/gray-fg} {cyan-fg}${agents}{/cyan-fg}`;
   content += `  {gray-fg}Mode:{/gray-fg} {cyan-fg}${launchMode}{/cyan-fg}`;
   content += `  {gray-fg}Agent:{/gray-fg} {cyan-fg}${providerLabel(agentProvider)}{/cyan-fg}`;
-  content += `  {gray-fg}Resume:{/gray-fg} {cyan-fg}${autoResume ? "auto" : "off"}{/cyan-fg}`;
 
   return { content, windowStart };
 }

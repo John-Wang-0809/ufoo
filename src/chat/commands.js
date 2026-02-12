@@ -35,7 +35,12 @@ const COMMAND_TREE = {
       codex: { desc: "Launch Codex agent" },
     },
   },
-  "/resume": { desc: "Resume agents (optional nickname)" },
+  "/resume": {
+    desc: "Resume agents (optional nickname) or list recoverable targets",
+    children: {
+      list: { desc: "List recoverable agents (optional target)" },
+    },
+  },
   "/skills": {
     desc: "Skills management",
     children: {

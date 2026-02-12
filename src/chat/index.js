@@ -30,6 +30,11 @@ const { createChatLogController } = require("./chatLogController");
 const { createPasteController } = require("./pasteController");
 const { createAgentViewController } = require("./agentViewController");
 const { createSettingsController } = require("./settingsController");
+const { createChatLayout } = require("./layout");
+const { createDaemonCoordinator } = require("./daemonCoordinator");
+const { IPC_REQUEST_TYPES } = require("../shared/eventContract");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
+const { createDaemonTransport } = require("./daemonTransport");
 
 async function runChat(projectRoot) {
   if (!fs.existsSync(getUfooPaths(projectRoot).ufooDir)) {
@@ -61,102 +66,14 @@ async function runChat(projectRoot) {
   }
 
   const sock = socketPath(projectRoot);
-  let client = null;
-  let reconnectPromise = null;
-  let exitRequested = false;
-  let connectionLostNotified = false;
-  const pendingRequests = [];
-  const MAX_PENDING_REQUESTS = 50;
-
-  const connectClient = async () => {
-    let newClient = await connectWithRetry(sock, 25, 200);
-    if (!newClient) {
-      // Retry once with a fresh daemon start and longer wait.
-      if (!isRunning(projectRoot)) {
-        startDaemon(projectRoot);
-        // Wait for daemon to write PID file and create socket
-        await new Promise(r => setTimeout(r, 1000));
-      }
-      newClient = await connectWithRetry(sock, 50, 200);
-    }
-    return newClient;
-  };
-
-  function enqueueRequest(req) {
-    if (!req || req.type === "status") return;
-    pendingRequests.push(req);
-    if (pendingRequests.length > MAX_PENDING_REQUESTS) {
-      pendingRequests.shift();
-    }
-  }
-
-  function flushPendingRequests() {
-    if (!client || client.destroyed) return;
-    while (pendingRequests.length > 0) {
-      const req = pendingRequests.shift();
-      client.write(`${JSON.stringify(req)}\n`);
-    }
-  }
-
-  async function ensureConnected() {
-    if (client && !client.destroyed) return true;
-    if (exitRequested) return false;
-    if (reconnectPromise) return reconnectPromise;
-    queueStatusLine("Reconnecting to daemon");
-    logMessage("status", "{white-fg}⚙{/white-fg} Reconnecting to daemon...");
-    reconnectPromise = (async () => {
-      const newClient = await connectClient();
-      if (!newClient) {
-        resolveStatusLine("{gray-fg}✗{/gray-fg} Daemon offline");
-        logMessage("error", "{white-fg}✗{/white-fg} Failed to reconnect to daemon");
-        return false;
-      }
-      attachClient(newClient);
-      connectionLostNotified = false;
-      resolveStatusLine("{gray-fg}✓{/gray-fg} Daemon reconnected");
-      requestStatus();
-      return true;
-    })();
-    try {
-      return await reconnectPromise;
-    } finally {
-      reconnectPromise = null;
-    }
-  }
-
-  client = await connectClient();
-  if (!client) {
-    // Check if daemon failed to start
-    if (!isRunning(projectRoot)) {
-      const logFile = getUfooPaths(projectRoot).ufooDaemonLog;
-      // eslint-disable-next-line no-console
-      console.error("Failed to start ufoo daemon. Check logs at:", logFile);
-      throw new Error("Daemon failed to start. Check the daemon log for details.");
-    }
-    throw new Error("Failed to connect to ufoo daemon (timeout). The daemon may still be starting.");
-  }
-
-  const screen = blessed.screen({
-    smartCSR: true,
-    title: "ufoo chat",
-    fullUnicode: true,
-    // Toggle mouse at runtime to balance copy vs scroll
-    sendFocus: true,
-    mouse: false,
-    // Allow Ctrl+C to exit even when input grabs keys
-    ignoreLocked: ["C-c"],
+  let daemonCoordinator = null;
+  const daemonTransport = createDaemonTransport({
+    projectRoot,
+    sockPath: sock,
+    isRunning,
+    startDaemon,
+    connectWithRetry,
   });
-  // Prefer normal buffer for reliable terminal selection/copy
-  if (screen.program && typeof screen.program.normalBuffer === "function") {
-    screen.program.normalBuffer();
-    if (screen.program.put && typeof screen.program.put.keypad_local === "function") {
-      screen.program.put.keypad_local();
-    }
-    if (typeof screen.program.clear === "function") {
-      screen.program.clear();
-      screen.program.cup(0, 0);
-    }
-  }
 
   const config = loadConfig(projectRoot);
   let launchMode = config.launchMode;
@@ -168,39 +85,23 @@ async function runChat(projectRoot) {
   const MIN_INPUT_HEIGHT = 4;  // 1 content + 3
   const MAX_INPUT_HEIGHT = 9;  // 6 content + 3
   let currentInputHeight = MIN_INPUT_HEIGHT;
-
-  // Log area (no border for cleaner look)
-  const logBox = blessed.log({
-    parent: screen,
-    top: 0,
-    left: 0,
-    width: "100%",
-    height: "100%-5",  // Will be adjusted dynamically
-    tags: true,
-    scrollable: true,
-    alwaysScroll: true,
-    scrollback: 10000,
-    scrollbar: null,
-    keys: true,
-    vi: true,
-    // Mouse handled globally (toggleable) to keep copy working
-    mouse: false,
-  });
-
-  // Status line just above input
-  const statusLine = blessed.box({
-    parent: screen,
-    bottom: currentInputHeight,
-    left: 0,
-    width: "100%",
-    height: 1,
-    style: { fg: "gray" },
-    tags: true,
-    content: "",
-  });
   const pkg = require("../../package.json");
-  const bannerText = `{bold}UFOO{/bold} · Multi-Agent Manager{|}v${pkg.version}`;
-  statusLine.setContent(bannerText);
+  const {
+    screen,
+    logBox,
+    statusLine,
+    bannerText,
+    completionPanel,
+    dashboard,
+    inputBottomLine,
+    promptBox,
+    input,
+    inputTopLine,
+  } = createChatLayout({
+    blessed,
+    currentInputHeight,
+    version: pkg.version,
+  });
 
   const historyDir = path.join(getUfooPaths(projectRoot).ufooDir, "chat");
   const historyFile = path.join(historyDir, "history.jsonl");
@@ -254,48 +155,8 @@ async function runChat(projectRoot) {
   const enqueueBusStatus = (...args) => statusLineController.enqueueBusStatus(...args);
   const resolveBusStatus = (...args) => statusLineController.resolveBusStatus(...args);
 
-  // Command completion panel
-  const completionPanel = blessed.box({
-    parent: screen,
-    bottom: currentInputHeight - 1,
-    left: 0,
-    width: "100%",
-    height: 0,
-    hidden: true,
-    wrap: false,
-    border: {
-      type: "line",
-      top: true,
-      left: false,
-      right: false,
-      bottom: false
-    },
-    style: {
-      border: { fg: "yellow" },
-      fg: "white"
-      // No bg - uses terminal default background
-    },
-    padding: {
-      left: 0,
-      right: 0,
-      top: 0,
-      bottom: 0
-    },
-    tags: true,
-  });
-
-  // Dashboard at very bottom
-  const dashboard = blessed.box({
-    parent: screen,
-    bottom: 0,
-    left: 0,
-    width: "100%",
-    height: 1,
-    style: { fg: "gray" },
-    tags: true,
-  });
-
   let agentViewController = null;
+  let terminalAdapterRouter = null;
   const agentSockets = createAgentSockets({
     onTermWrite: (text) => writeToAgentTerm(text),
     onPlaceCursor: (cursor) => placeAgentCursor(cursor),
@@ -304,55 +165,11 @@ async function runChat(projectRoot) {
     getViewingAgent: () => getViewingAgent(),
     sendBusRaw: (target, data) => {
       send({
-        type: "bus_send",
+        type: IPC_REQUEST_TYPES.BUS_SEND,
         target,
         message: JSON.stringify({ raw: true, data }),
       });
     },
-  });
-
-  // Bottom border line for input area (above dashboard)
-  const inputBottomLine = blessed.line({
-    parent: screen,
-    bottom: 1,
-    left: 1,
-    width: "100%-2",
-    orientation: "horizontal",
-    style: { fg: "gray" },
-  });
-
-  // Prompt indicator
-  const promptBox = blessed.box({
-    parent: screen,
-    bottom: 2,
-    left: 0,
-    width: 2,
-    height: currentInputHeight - 3,
-    content: ">",
-    style: { fg: "cyan" },
-  });
-
-  // Input area without left/right border
-  const input = blessed.textarea({
-    parent: screen,
-    bottom: 2,
-    left: 2,
-    width: "100%-2",
-    height: currentInputHeight - 3,
-    inputOnFocus: true,
-    keys: true,
-  });
-  // Avoid textarea's extra wrap margin (causes a phantom empty column)
-  input.type = "box";
-
-  // Top border line for input area (just above input)
-  const inputTopLine = blessed.line({
-    parent: screen,
-    bottom: currentInputHeight - 1,  // 4-1=3: above input(2) + inputHeight(1)
-    left: 1,
-    width: "100%-2",
-    orientation: "horizontal",
-    style: { fg: "gray" },
   });
 
   // Add cursor position tracking
@@ -485,14 +302,16 @@ async function runChat(projectRoot) {
   }
 
   function exitHandler() {
-    exitRequested = true;
+    if (daemonCoordinator) {
+      daemonCoordinator.markExit();
+    }
     exitAgentView();
     if (screen && screen.program && typeof screen.program.decrst === "function") {
       screen.program.decrst(2004);
     }
     statusLineController.destroy();
-    if (client) {
-      client.end();
+    if (daemonCoordinator) {
+      daemonCoordinator.close();
     }
     process.exit(0);
   }
@@ -639,7 +458,7 @@ async function runChat(projectRoot) {
   let selectedAgentIndex = -1;  // -1 = not in dashboard selection mode
   let targetAgent = null;       // Selected agent for direct messaging
   let focusMode = "input";      // "input" or "dashboard"
-  let dashboardView = "agents"; // "agents" | "mode" | "provider" | "resume"
+  let dashboardView = "agents"; // "agents" | "mode" | "provider"
   let selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
   const providerOptions = [
     { label: "codex", value: "codex-cli" },
@@ -651,13 +470,12 @@ async function runChat(projectRoot) {
     { label: "Start new session", value: false },
   ];
   let selectedResumeIndex = autoResume ? 0 : 1;
-  let restartInProgress = false;
   const DASH_HINTS = {
     agents: "←/→ select · Enter · ↓ mode · ↑ back",
     agentsEmpty: "↓ mode · ↑ back",
     mode: "←/→ select · Enter · ↓ provider · ↑ back",
-    provider: "←/→ select · Enter · ↓ resume · ↑ back",
-    resume: "←/→ select · Enter · ↑ back",
+    provider: "←/→ select · Enter · ↑ back",
+    resume: "",
   };
   const AGENT_BAR_HINTS = {
     normal: "↓ agents",
@@ -670,6 +488,70 @@ async function runChat(projectRoot) {
 
   function getViewingAgent() {
     return agentViewController ? agentViewController.getViewingAgent() : "";
+  }
+
+  function getAgentAdapter(agentId) {
+    if (!terminalAdapterRouter) return null;
+    const meta = activeAgentMetaMap ? activeAgentMetaMap.get(agentId) : null;
+    const agentLaunchMode = (meta && meta.launch_mode) || launchMode || "";
+    return terminalAdapterRouter.getAdapter({ launchMode: agentLaunchMode, agentId });
+  }
+
+  function getViewingAgentAdapter() {
+    const viewingAgent = getViewingAgent();
+    if (!viewingAgent) return null;
+    return getAgentAdapter(viewingAgent);
+  }
+
+  function canSendRaw(adapter) {
+    if (!adapter || !adapter.capabilities) return false;
+    return Boolean(
+      adapter.capabilities.supportsSocketProtocol
+      || adapter.capabilities.supportsInternalQueueLoop
+    );
+  }
+
+  function canResize(adapter) {
+    return Boolean(adapter && adapter.capabilities && adapter.capabilities.supportsSocketProtocol);
+  }
+
+  function canSnapshot(adapter) {
+    if (!adapter || !adapter.capabilities) return false;
+    return Boolean(
+      adapter.capabilities.supportsSnapshot
+      || adapter.capabilities.supportsSubscribeScreen
+      || adapter.capabilities.supportsSubscribeFull
+    );
+  }
+
+  function sendRawWithCapabilities(data) {
+    const adapter = getViewingAgentAdapter();
+    if (!canSendRaw(adapter)) return;
+    try {
+      adapter.sendRaw(data);
+    } catch {
+      // ignore unsupported errors
+    }
+  }
+
+  function sendResizeWithCapabilities(cols, rows) {
+    const adapter = getViewingAgentAdapter();
+    if (!canResize(adapter)) return;
+    try {
+      adapter.resize(cols, rows);
+    } catch {
+      // ignore unsupported errors
+    }
+  }
+
+  function requestSnapshotWithCapabilities() {
+    const adapter = getViewingAgentAdapter();
+    if (!canSnapshot(adapter)) return false;
+    try {
+      return adapter.snapshot();
+    } catch {
+      return false;
+    }
   }
 
   function isAgentViewUsesBus() {
@@ -805,12 +687,8 @@ async function runChat(projectRoot) {
   }
 
   function send(req) {
-    if (!client || client.destroyed) {
-      enqueueRequest(req);
-      void ensureConnected();
-      return;
-    }
-    client.write(`${JSON.stringify(req)}\n`);
+    if (!daemonCoordinator) return;
+    daemonCoordinator.send(req);
   }
 
   function updatePromptBox() {
@@ -886,7 +764,7 @@ async function runChat(projectRoot) {
     }
     const label = getAgentLabel(agentId);
     logMessage("status", `{white-fg}⚙{/white-fg} Closing ${label}...`);
-    send({ type: "close_agent", agent_id: agentId });
+    send({ type: IPC_REQUEST_TYPES.CLOSE_AGENT, agent_id: agentId });
   }
 
   function setAgentProvider(provider) {
@@ -902,30 +780,8 @@ async function runChat(projectRoot) {
   }
 
   async function restartDaemon() {
-    if (restartInProgress) return;
-    restartInProgress = true;
-    logMessage("status", "{white-fg}⚙{/white-fg} Restarting daemon...");
-    try {
-      if (client) {
-        client.removeAllListeners();
-        try {
-          client.end();
-        } catch {
-          // ignore
-        }
-      }
-      stopDaemon(projectRoot);
-      startDaemon(projectRoot, { forceResume: true });
-      const newClient = await connectClient();
-      if (newClient) {
-        attachClient(newClient);
-        logMessage("status", "{white-fg}✓{/white-fg} Daemon reconnected");
-      } else {
-        logMessage("error", "{white-fg}✗{/white-fg} Failed to reconnect to daemon");
-      }
-    } finally {
-      restartInProgress = false;
-    }
+    if (!daemonCoordinator) return;
+    return daemonCoordinator.restart();
   }
 
   settingsController = createSettingsController({
@@ -1098,10 +954,18 @@ async function runChat(projectRoot) {
     activator.activate(agentId).catch(() => {});
   }
 
+  terminalAdapterRouter = createTerminalAdapterRouter({
+    activateAgent,
+    sendRaw: (data) => agentSockets.sendRaw(data),
+    sendResize: (cols, rows) => agentSockets.sendResize(cols, rows),
+    requestSnapshot: (mode) => agentSockets.requestSnapshot(mode),
+  });
+
   const dashboardController = createDashboardKeyController({
     state: dashboardState,
     existsSync: fs.existsSync,
     getInjectSockPath,
+    getAgentAdapter,
     activateAgent,
     requestCloseAgent,
     enterAgentView,
@@ -1200,18 +1064,19 @@ async function runChat(projectRoot) {
       agentSockets.disconnectInput();
     },
     sendRaw: (data) => {
-      agentSockets.sendRaw(data);
+      sendRawWithCapabilities(data);
     },
     sendResize: (cols, rows) => {
-      agentSockets.sendResize(cols, rows);
+      sendResizeWithCapabilities(cols, rows);
     },
     requestScreenSnapshot: () => {
-      agentSockets.requestScreenSnapshot();
+      requestSnapshotWithCapabilities();
     },
   });
 
   function requestStatus() {
-    send({ type: "status" });
+    if (!daemonCoordinator) return;
+    daemonCoordinator.requestStatus();
   }
 
   const daemonMessageRouter = createDaemonMessageRouter({
@@ -1241,57 +1106,28 @@ async function runChat(projectRoot) {
     hasStream: (publisher) => streamTracker.hasStream(publisher),
   });
 
-  const detachClient = () => {
-    if (!client) return;
-    client.removeAllListeners("data");
-    client.removeAllListeners("close");
-    try {
-      client.end();
-      client.destroy();
-    } catch {
-      // ignore
+  daemonCoordinator = createDaemonCoordinator({
+    projectRoot,
+    daemonTransport,
+    handleMessage: (msg) => daemonMessageRouter.handleMessage(msg),
+    queueStatusLine,
+    resolveStatusLine,
+    logMessage,
+    stopDaemon,
+    startDaemon,
+  });
+
+  const connected = await daemonCoordinator.connect();
+  if (!connected) {
+    // Check if daemon failed to start
+    if (!isRunning(projectRoot)) {
+      const logFile = getUfooPaths(projectRoot).ufooDaemonLog;
+      // eslint-disable-next-line no-console
+      console.error("Failed to start ufoo daemon. Check logs at:", logFile);
+      throw new Error("Daemon failed to start. Check the daemon log for details.");
     }
-  };
-
-  const attachClient = (newClient) => {
-    if (!newClient) return;
-    detachClient();
-    client = newClient;
-    connectionLostNotified = false;
-    let buffer = "";
-    client.on("data", (data) => {
-      buffer += data.toString("utf8");
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() || "";
-      for (const line of lines.filter((l) => l.trim())) {
-        try {
-          const msg = JSON.parse(line);
-          const shouldStop = daemonMessageRouter.handleMessage(msg);
-          if (shouldStop) {
-            return;
-          }
-        } catch {
-          // ignore
-        }
-      }
-    });
-    const handleDisconnect = () => {
-      if (client === newClient) {
-        client = null;
-      }
-      if (exitRequested) return;
-      if (!connectionLostNotified) {
-        connectionLostNotified = true;
-        logMessage("status", "{white-fg}✗{/white-fg} Daemon disconnected");
-      }
-      void ensureConnected();
-    };
-    client.on("close", handleDisconnect);
-    client.on("error", handleDisconnect);
-    flushPendingRequests();
-  };
-
-  attachClient(client);
+    throw new Error("Failed to connect to ufoo daemon (timeout). The daemon may still be starting.");
+  }
 
   const commandExecutor = createCommandExecutor({
     projectRoot,
@@ -1444,7 +1280,7 @@ async function runChat(projectRoot) {
 
   // 定期刷新 dashboard 状态（兜底，daemon 会主动推送变化）
   setInterval(() => {
-    if (client && !client.destroyed) {
+    if (daemonCoordinator && daemonCoordinator.isConnected()) {
       requestStatus();
     }
   }, 30000);

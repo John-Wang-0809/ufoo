@@ -46,8 +46,13 @@ ufoo init --modules <selected_modules> --project $(pwd)
 ### 3. If bus module selected, auto-join bus
 
 ```bash
-SUBSCRIBER=$(ufoo bus join | tail -1)
-echo "Joined event bus: $SUBSCRIBER"
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+if [ -n "$SUBSCRIBER" ]; then
+  echo "Using existing subscriber ID: $SUBSCRIBER"
+else
+  SUBSCRIBER=$(ufoo bus join | tail -1)
+  echo "Joined event bus: $SUBSCRIBER"
+fi
 ```
 
 ### 4. Report initialization result
@@ -69,5 +74,5 @@ Next steps:
 ## Notes
 
 - If .ufoo/context, .ufoo/bus, or .ufoo/agent already exists, skip creation
-- After initialization, auto-join event bus (if bus enabled)
+- After initialization, reuse existing subscriber ID first, join only as fallback (if bus enabled)
 - AGENTS.md will have protocol description block injected

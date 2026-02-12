@@ -1,6 +1,7 @@
 const fs = require("fs");
 const { getUfooPaths } = require("../ufoo/paths");
 const { spawn, spawnSync } = require("child_process");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
 /**
  * 激活指定 agent 的终端
@@ -135,21 +136,36 @@ end tell`;
   async activate(agentId) {
     const info = this.getAgentInfo(agentId);
 
-    if (info.launch_mode === "internal" || info.launch_mode === "internal-pty") {
-      throw new Error("Internal mode agents cannot be activated (no terminal window)");
+    const activateTerminal = async () => {
+      if (info.tty) {
+        this.activateTerminalByTty(info.tty);
+        return;
+      }
+      throw new Error("Cannot activate: missing tty or tmux_pane for agent");
+    };
+
+    const activateTmux = async () => {
+      if (info.tmux_pane) {
+        await this.activateTmuxPane(info.tmux_pane);
+        return;
+      }
+      throw new Error("Cannot activate: missing tty or tmux_pane for agent");
+    };
+
+    const adapterRouter = createTerminalAdapterRouter({
+      activateTerminal,
+      activateTmux,
+    });
+    const adapter = adapterRouter.getAdapter({ launchMode: info.launch_mode, agentId });
+
+    if (!adapter.capabilities.supportsActivate) {
+      if (adapter.capabilities.supportsInternalQueueLoop) {
+        throw new Error("Internal mode agents cannot be activated (no terminal window)");
+      }
+      throw new Error("Cannot activate: missing tty or tmux_pane for agent");
     }
 
-    if (info.launch_mode === "tmux" && info.tmux_pane) {
-      await this.activateTmuxPane(info.tmux_pane);
-      return;
-    }
-
-    if (info.launch_mode === "terminal" && info.tty) {
-      this.activateTerminalByTty(info.tty);
-      return;
-    }
-
-    throw new Error("Cannot activate: missing tty or tmux_pane for agent");
+    await adapter.activate();
   }
 }
 

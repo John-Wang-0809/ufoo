@@ -27,7 +27,8 @@ ufoo ctx decisions -l          # List all decisions
 ufoo ctx decisions -n 1        # Show latest decision
 
 # Bus
-ufoo bus join                  # Join bus (auto by uclaude/ucodex)
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+[ -n "$SUBSCRIBER" ] || SUBSCRIBER=$(ufoo bus join | tail -1)
 ufoo bus check $SUBSCRIBER     # Check pending messages
 ufoo bus send "<id>" "<msg>"   # Send message
 ufoo bus status                # Show bus status
@@ -67,9 +68,12 @@ ufoo ctx decisions new "Short descriptive title"
 ### CRITICAL: `ubus` Command Behavior
 
 **When you receive `ubus`, you MUST:**
-1. Check pending messages: `ufoo bus check $SUBSCRIBER`
-2. **EXECUTE each task immediately** - Do NOT ask the user
-3. Reply to sender: `ufoo bus send "<publisher>" "<result>"`
+1. Resolve subscriber ID first (reuse existing ID, join only as fallback):
+   `SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"; [ -n "$SUBSCRIBER" ] || SUBSCRIBER=$(ufoo bus join | tail -1)`
+2. Check pending messages: `ufoo bus check $SUBSCRIBER`
+3. **EXECUTE each task immediately** - Do NOT ask the user
+4. Reply to sender: `ufoo bus send "<publisher>" "<result>"`
+5. **CRITICAL: Acknowledge messages after handling**: `ufoo bus ack $SUBSCRIBER`
 
 **Rules:**
 - Execute tasks immediately without asking

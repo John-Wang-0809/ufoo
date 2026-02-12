@@ -72,8 +72,11 @@ class UfooInit {
       fs.writeFileSync(agentsFile, content, "utf8");
     }
 
-    // CLAUDE.md 指向 AGENTS.md
-    fs.writeFileSync(claudeFile, "AGENTS.md\n", "utf8");
+    // 仅在不存在时创建 CLAUDE.md；存在时保留用户文件类型（普通文件或 symlink）
+    const claudeStat = this.safeLstat(claudeFile);
+    if (!claudeStat) {
+      fs.writeFileSync(claudeFile, "AGENTS.md\n", "utf8");
+    }
   }
 
   /**
@@ -111,36 +114,87 @@ class UfooInit {
       return;
     }
 
-    console.log("[template] Injecting ufoo template into AGENTS.md...");
-
-    const agentsFile = path.join(project, "AGENTS.md");
-    let content = fs.readFileSync(agentsFile, "utf8");
-
     const template = fs.readFileSync(this.agentsTemplate, "utf8");
+    const targets = this.resolveTemplateTargets(project);
+    if (targets.length === 0) {
+      console.log("[template] No target markdown files found, skipping");
+      return;
+    }
 
-    // 查找或添加 ufoo 标记块
+    const labels = targets.map((file) => path.relative(project, file) || path.basename(file));
+    console.log(`[template] Injecting ufoo template into: ${labels.join(", ")}`);
+
+    for (const file of targets) {
+      this.injectTemplateIntoFile(file, template);
+    }
+
+    console.log("[template] Done");
+  }
+
+  safeLstat(filePath) {
+    try {
+      return fs.lstatSync(filePath);
+    } catch {
+      return null;
+    }
+  }
+
+  resolveTemplateTargets(project) {
+    const agentsFile = path.resolve(path.join(project, "AGENTS.md"));
+    const claudeFile = path.resolve(path.join(project, "CLAUDE.md"));
+    const targets = new Set();
+
+    if (fs.existsSync(agentsFile)) {
+      targets.add(agentsFile);
+    }
+
+    const claudeStat = this.safeLstat(claudeFile);
+    if (!claudeStat) return Array.from(targets);
+
+    if (claudeStat.isSymbolicLink()) {
+      try {
+        const rawTarget = fs.readlinkSync(claudeFile);
+        const sourceFile = path.resolve(path.dirname(claudeFile), rawTarget);
+        const projectRoot = path.resolve(project);
+        const inProject =
+          sourceFile === projectRoot ||
+          sourceFile.startsWith(`${projectRoot}${path.sep}`);
+        if (inProject) {
+          targets.add(sourceFile);
+        } else {
+          console.warn(`[template] CLAUDE.md symlink target outside project, skipped: ${sourceFile}`);
+        }
+      } catch {
+        // ignore broken symlink
+      }
+      return Array.from(targets);
+    }
+
+    // CLAUDE.md 为独立文件时，双文件都注入模板
+    targets.add(claudeFile);
+    return Array.from(targets);
+  }
+
+  injectTemplateIntoFile(filePath, template) {
+    if (!fs.existsSync(filePath)) return;
+
+    let content = fs.readFileSync(filePath, "utf8");
     const marker = "<!-- ufoo-template -->";
     if (content.includes(marker)) {
-      // 替换现有块
       const startIdx = content.indexOf(marker);
       const endIdx = content.indexOf(marker, startIdx + marker.length);
-
       if (endIdx !== -1) {
         content =
           content.slice(0, startIdx) +
           `${marker}\n${template}\n${marker}` +
           content.slice(endIdx + marker.length);
       } else {
-        // 只有开始标记，追加到末尾
         content += `\n${marker}\n${template}\n${marker}\n`;
       }
     } else {
-      // 追加到末尾
       content += `\n${marker}\n${template}\n${marker}\n`;
     }
-
-    fs.writeFileSync(agentsFile, content, "utf8");
-    console.log("[template] Done");
+    fs.writeFileSync(filePath, content, "utf8");
   }
 
   /**

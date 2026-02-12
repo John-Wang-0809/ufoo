@@ -162,6 +162,20 @@ describe("chat commandExecutor", () => {
     expect(logs.some((entry) => entry.text.includes("nickname requires count=1"))).toBe(true);
   });
 
+  test("handleResumeCommand supports list subcommand", async () => {
+    const { executor, options, logs } = createHarness();
+
+    await executor.handleResumeCommand(["list", "codex-3"]);
+
+    expect(options.send).toHaveBeenCalledWith({
+      type: "list_recoverable_agents",
+      target: "codex-3",
+    });
+    expect(options.schedule).toHaveBeenCalled();
+    expect(options.requestStatus).toHaveBeenCalled();
+    expect(logs.some((entry) => entry.text.includes("Listing recoverable agents (codex-3)"))).toBe(true);
+  });
+
   test("handleDoctorCommand escapes thrown errors", async () => {
     const { executor, options, logs } = createHarness({
       createDoctor: jest.fn(() => ({ run: jest.fn(() => { throw new Error("boom"); }) })),

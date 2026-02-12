@@ -40,8 +40,9 @@ ufoo init --modules context,bus
 ### Join Bus
 
 ```bash
-SUBSCRIBER=$(ufoo bus join | tail -n 1)
-# Output: claude-code:a1b2c3
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+[ -n "$SUBSCRIBER" ] || SUBSCRIBER=$(ufoo bus join | tail -n 1)
+# Output: claude-code:a1b2c3 (or codex:def456)
 ```
 
 ### Check Pending Messages
@@ -74,7 +75,8 @@ ufoo bus status
 If you want to receive "new message alerts" while running Codex/Claude in another terminal, use **agent-side alert/listen** (avoids IME/accessibility permission/window positioning fragmentation issues):
 
 ```bash
-SUBSCRIBER=$(ufoo bus join | tail -n 1)
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+[ -n "$SUBSCRIBER" ] || SUBSCRIBER=$(ufoo bus join | tail -n 1)
 
 # Background alert: title badge + bell + optional macOS notification center
 ufoo bus alert "$SUBSCRIBER" 1 --notify --daemon
@@ -87,10 +89,11 @@ ufoo bus listen "$SUBSCRIBER" --from-beginning
 
 If you need **Claude A to notify Claude B / Codex C and have the target auto-execute** (e.g., auto-trigger `/ubus`), use the bus daemon:
 
-1) First `join` in each terminal session (records `tty`, also records `TMUX_PANE` if in tmux):
+1) Resolve subscriber in each terminal session first (records `tty`, also records `TMUX_PANE` if in tmux). Join only as fallback:
 
 ```bash
-SUBSCRIBER=$(ufoo bus join | tail -n 1)
+SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
+[ -n "$SUBSCRIBER" ] || SUBSCRIBER=$(ufoo bus join | tail -n 1)
 ```
 
 2) Start the bus daemon in the project (runs as background daemon):
