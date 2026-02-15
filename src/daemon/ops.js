@@ -323,7 +323,9 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
     bus.loadBusData();
     process.env.UFOO_PARENT_PID = String(originalPid);
 
-    const finalNickname = count > 1 ? `${nickname || agent}-${i + 1}` : (nickname || "");
+    // For ucode/ufoo agents, default nickname to "ucode" if not specified
+    const defaultNickname = agentType === "ufoo-code" ? "ucode" : agent;
+    const finalNickname = count > 1 ? `${nickname || defaultNickname}-${i + 1}` : (nickname || defaultNickname);
     const usePty = process.env.UFOO_INTERNAL_PTY !== "0";
     const launchMode = usePty ? "internal-pty" : "internal";
 

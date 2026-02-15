@@ -73,7 +73,7 @@ function extractAgentNickname(agentId = "") {
   // Common agent nickname mappings
   if (base === "ufoo-agent") return "ufoo";
   if (base === "claude-code") return "claude";
-  if (base === "ufoo-code") return "code";
+  if (base === "ufoo-code") return "ucode";
 
   // Return base name as-is for others
   return base;
