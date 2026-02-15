@@ -490,7 +490,9 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
       }
     }
     for (let i = 0; i < count; i += 1) {
-      const nick = count > 1 ? `${nickname || normalizedAgent}-${i + 1}` : (nickname || "");
+      // Use "ucode" as default nickname for ufoo/ucode agents
+      const defaultNick = normalizedAgent === "ufoo" ? "ucode" : normalizedAgent;
+      const nick = count > 1 ? `${nickname || defaultNick}-${i + 1}` : (nickname || "");
       // eslint-disable-next-line no-await-in-loop
       await spawnTmuxWindow(projectRoot, normalizedAgent, nick);
     }
@@ -503,7 +505,9 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
 
   const subscriberIds = [];
   for (let i = 0; i < count; i += 1) {
-    const nick = count > 1 ? `${nickname || normalizedAgent}-${i + 1}` : (nickname || "");
+    // Use "ucode" as default nickname for ufoo/ucode agents
+    const defaultNick = normalizedAgent === "ufoo" ? "ucode" : normalizedAgent;
+    const nick = count > 1 ? `${nickname || defaultNick}-${i + 1}` : (nickname || "");
     // eslint-disable-next-line no-await-in-loop
     const result = await spawnManagedTerminalAgent(projectRoot, normalizedAgent, nick, processManager);
     if (result.subscriberId) subscriberIds.push(result.subscriberId);

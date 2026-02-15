@@ -44,7 +44,9 @@ class NicknameManager {
    */
   generateAutoNickname(agentType) {
     const subscribers = this.busData.agents || {};
-    const prefix = agentType === "claude-code" ? "claude" : agentType;
+    const prefix = agentType === "claude-code" ? "claude"
+                 : agentType === "ufoo-code" ? "ucode"
+                 : agentType;
 
     // 找出所有相同前缀的昵称
     const existing = Object.values(subscribers)

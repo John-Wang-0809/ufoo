@@ -16,7 +16,9 @@ function readQueueTty(queueDir) {
 }
 
 function nicknamePrefixForType(agentType = "") {
-  return agentType === "claude-code" ? "claude" : String(agentType || "agent");
+  return agentType === "claude-code" ? "claude"
+       : agentType === "ufoo-code" ? "ucode"
+       : String(agentType || "agent");
 }
 
 function isRecoverableSessionId(sessionId = "") {
