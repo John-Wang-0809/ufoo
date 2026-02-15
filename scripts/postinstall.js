@@ -30,22 +30,19 @@ for (const platform of platforms) {
   }
 }
 
-// Install ufoo skills to ~/.claude/skills/ via symlinks
-// Skills auto-update when the package is updated since they're symlinks.
-try {
-  const pkgRoot = path.resolve(__dirname, "..");
-  const home = os.homedir();
-  const claudeSkillsDir = path.join(home, ".claude", "skills");
-
-  // Collect all skill directories
-  const skillSources = [];
+// Collect all skill sources from package
+function collectSkillSources(pkgRoot) {
+  const sources = [];
 
   // Top-level SKILLS/
   const topSkills = path.join(pkgRoot, "SKILLS");
   if (fs.existsSync(topSkills)) {
     for (const entry of fs.readdirSync(topSkills, { withFileTypes: true })) {
       if (entry.isDirectory()) {
-        skillSources.push({ name: entry.name, src: path.join(topSkills, entry.name) });
+        const skillMd = path.join(topSkills, entry.name, "SKILL.md");
+        if (fs.existsSync(skillMd)) {
+          sources.push({ name: entry.name, dir: path.join(topSkills, entry.name), md: skillMd });
+        }
       }
     }
   }
@@ -58,33 +55,48 @@ try {
       const modSkills = path.join(modulesDir, mod.name, "SKILLS");
       if (!fs.existsSync(modSkills)) continue;
       for (const entry of fs.readdirSync(modSkills, { withFileTypes: true })) {
-        if (entry.isDirectory()) {
-          skillSources.push({ name: entry.name, src: path.join(modSkills, entry.name) });
+        if (!entry.isDirectory()) continue;
+        const skillMd = path.join(modSkills, entry.name, "SKILL.md");
+        if (fs.existsSync(skillMd)) {
+          sources.push({ name: entry.name, dir: path.join(modSkills, entry.name), md: skillMd });
         }
       }
     }
   }
 
-  if (skillSources.length > 0) {
-    fs.mkdirSync(claudeSkillsDir, { recursive: true });
+  return sources;
+}
+
+function forceSymlink(target, linkPath) {
+  try {
+    const existing = fs.lstatSync(linkPath);
+    if (existing.isSymbolicLink() || existing.isFile() || existing.isDirectory()) {
+      fs.rmSync(linkPath, { recursive: true, force: true });
+    }
+  } catch {
+    // doesn't exist — fine
+  }
+  fs.symlinkSync(target, linkPath);
+}
+
+// Install ufoo skills as Claude Code slash commands (~/.claude/commands/<name>.md)
+// and as skill directories (~/.claude/skills/<name>/)
+try {
+  const pkgRoot = path.resolve(__dirname, "..");
+  const home = os.homedir();
+  const sources = collectSkillSources(pkgRoot);
+
+  if (sources.length > 0) {
+    // Slash commands: ~/.claude/commands/<name>.md -> SKILL.md
+    const commandsDir = path.join(home, ".claude", "commands");
+    fs.mkdirSync(commandsDir, { recursive: true });
 
     let installed = 0;
-    for (const { name, src } of skillSources) {
-      const dest = path.join(claudeSkillsDir, name);
-      try {
-        // Remove existing (symlink or dir) before creating fresh symlink
-        if (fs.existsSync(dest) || fs.lstatSync(dest).isSymbolicLink()) {
-          fs.rmSync(dest, { recursive: true, force: true });
-        }
-      } catch {
-        // lstatSync throws if path doesn't exist at all — fine
-      }
-      fs.symlinkSync(src, dest);
+    for (const { name, md } of sources) {
+      forceSymlink(md, path.join(commandsDir, `${name}.md`));
       installed += 1;
     }
-    if (installed > 0) {
-      console.log(`[postinstall] Installed ${installed} ufoo skill(s) to ${claudeSkillsDir}`);
-    }
+    console.log(`[postinstall] Installed ${installed} ufoo command(s) to ${commandsDir}`);
   }
 } catch (err) {
   // Non-fatal — skills can be installed manually via `ufoo skills install`
