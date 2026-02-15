@@ -877,6 +877,7 @@ function startDaemon({ projectRoot, provider, model, resumeMode = "auto" }) {
       return;
     }
     if (req.type === IPC_REQUEST_TYPES.LAUNCH_AGENT) {
+      log(`launch_agent received: agent=${req.agent} count=${req.count}`);
       const { agent, count, nickname } = req;
       const normalizedAgent = normalizeLaunchAgent(agent);
       if (!normalizedAgent) {

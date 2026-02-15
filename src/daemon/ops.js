@@ -24,9 +24,9 @@ function toBusAgentType(agent = "") {
 }
 
 function toTerminalBinary(agent = "") {
-  if (agent === "codex") return "./bin/ucodex.js";
-  if (agent === "claude") return "./bin/uclaude.js";
-  if (agent === "ufoo") return "./bin/ucode.js";
+  if (agent === "codex") return "ucodex";
+  if (agent === "claude") return "uclaude";
+  if (agent === "ufoo") return "ucode";
   return "";
 }
 
