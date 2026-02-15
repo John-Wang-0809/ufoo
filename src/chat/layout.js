@@ -43,6 +43,8 @@ function createChatLayout(options = {}) {
     vi: true,
     // Mouse handled globally (toggleable) to keep copy working
     mouse: false,
+    // Ensure proper wrapping and width calculation
+    wrap: true,
   });
 
   // Status line just above input

@@ -1381,6 +1381,8 @@ async function runChat(projectRoot) {
     resizeInput();
     if (completionController.isActive()) completionController.hide();
     input._updateCursor();
+    // Force recalculate logBox width to match terminal
+    logBox.width = screen.width;
     screen.render();
   });
   screen.render();
