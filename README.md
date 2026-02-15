@@ -83,12 +83,6 @@ ucode-1: Bug fixed. Running tests...
 > /decisions
 ```
 
-To import a local `pi-mono` checkout as a reference snapshot (reference-only):
-
-```bash
-npm run import:pi-mono -- /path/to/pi-mono
-```
-
 Native self-developed implementation lives under `src/code`.
 
 Prepare and verify `ucode` runtime wiring:

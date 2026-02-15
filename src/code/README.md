@@ -2,15 +2,7 @@
 
 `src/code/` is the self-developed core area for `ucode`.
 
-## Reference Repo (pi-mono)
-
-- Local reference repo path: `/Users/icy/Code/pi-mono`
-- Upstream reference URL: `https://github.com/badlogic/pi-mono`
-- Primary reference package: `https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent`
-
-Note:
-- `pi-mono` is reference-only for architecture and behavior alignment.
-- `ucode` NL core and TUI/runtime orchestration are implemented in `src/code/`.
+`ucode` NL core and TUI/runtime orchestration are implemented in `src/code/`.
 
 ## Current native scope (phase 1)
 
