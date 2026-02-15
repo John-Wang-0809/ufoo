@@ -32,6 +32,12 @@ SUBSCRIBER="${UFOO_SUBSCRIBER_ID:-$(ufoo bus whoami 2>/dev/null || true)}"
 ufoo bus check $SUBSCRIBER     # Check pending messages
 ufoo bus send "<id>" "<msg>"   # Send message
 ufoo bus status                # Show bus status
+
+# Runtime report (shared contract for assistant/ucodex/uclaude)
+ufoo report start "<task>" --task <id> --agent "$SUBSCRIBER" --scope public
+ufoo report progress "<detail>" --task <id> --agent "$SUBSCRIBER" --scope public
+ufoo report done "<summary>" --task <id> --agent "$SUBSCRIBER" --scope public
+ufoo report error "<reason>" --task <id> --agent "$SUBSCRIBER" --scope public
 ```
 
 ---

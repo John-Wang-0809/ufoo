@@ -150,6 +150,25 @@ function collectOptionValues(argv, name) {
   return values;
 }
 
+function parseJsonObject(text, fallback = {}) {
+  const raw = String(text || "").trim();
+  if (!raw) return fallback;
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Expected JSON object");
+  }
+  return parsed;
+}
+
+function normalizeReportPhase(action = "") {
+  const value = String(action || "").trim().toLowerCase();
+  if (value === "start") return "start";
+  if (value === "progress") return "progress";
+  if (value === "error" || value === "fail" || value === "failed") return "error";
+  if (value === "done" || value === "finish" || value === "finished") return "done";
+  return "";
+}
+
 function resolveOnlineAuthToken(opts) {
   if (!opts) return "";
   if (opts.authToken) return opts.authToken;
@@ -312,6 +331,147 @@ async function runCli(argv) {
         } catch (err) {
           console.error(err.message || String(err));
           process.exitCode = 1;
+        }
+      });
+
+    program
+      .command("report")
+      .description("Report agent task status to daemon/ufoo-agent")
+      .argument("<action>", "start|progress|done|error|list")
+      .argument("[message...]", "Task message/summary")
+      .option("--task <id>", "Task ID (default: task-<timestamp>)")
+      .option("--agent <id>", "Agent ID (default: UFOO_SUBSCRIBER_ID)")
+      .option("--scope <scope>", "Report visibility: public|private", "public")
+      .option("--controller <id>", "Controller ID for private channel", "ufoo-agent")
+      .option("--summary <text>", "Summary text for done")
+      .option("--error <text>", "Error text for error")
+      .option("--meta <json>", "JSON metadata object")
+      .option("-n, --num <n>", "List count", "20")
+      .option("--json", "Output as JSON")
+      .action(async (action, messageParts, opts) => {
+        const normalized = normalizeReportPhase(action);
+        const text = Array.isArray(messageParts) ? messageParts.join(" ").trim() : String(messageParts || "").trim();
+        const projectRoot = process.cwd();
+        const { listReports } = require("./report/store");
+
+        if ((action || "").toLowerCase() === "list") {
+          try {
+            const rows = listReports(projectRoot, {
+              num: parseInt(opts.num, 10),
+              agent: opts.agent || "",
+            });
+            if (opts.json) {
+              console.log(JSON.stringify(rows, null, 2));
+              return;
+            }
+            console.log(`=== Reports (${rows.length} shown) ===`);
+            rows.forEach((row) => {
+              const detail = row.phase === "error"
+                ? (row.error || row.summary || row.message || row.task_id)
+                : (row.summary || row.message || row.task_id);
+              console.log(`${row.ts || "-"} [${row.phase}] ${row.agent_id || "unknown-agent"} ${row.task_id || ""} ${detail}`);
+            });
+            if (rows.length === 0) console.log("No reports found.");
+          } catch (err) {
+            console.error(err.message || String(err));
+            process.exitCode = 1;
+          }
+          return;
+        }
+
+        if (!normalized) {
+          console.error("report action must be start|progress|done|error|list");
+          process.exitCode = 1;
+          return;
+        }
+
+        let meta = {};
+        try {
+          meta = parseJsonObject(opts.meta, {});
+        } catch (err) {
+          console.error(`Invalid --meta: ${err.message}`);
+          process.exitCode = 1;
+          return;
+        }
+
+        const agentId = String(opts.agent || process.env.UFOO_SUBSCRIBER_ID || "unknown-agent").trim() || "unknown-agent";
+        const taskId = String(opts.task || `task-${Date.now()}`).trim();
+        const summary = String(opts.summary || (normalized === "done" ? text : "")).trim();
+        const error = String(opts.error || (normalized === "error" ? text : "")).trim();
+        const report = {
+          phase: normalized,
+          task_id: taskId,
+          agent_id: agentId,
+          message: text,
+          summary,
+          error,
+          ok: normalized !== "error",
+          source: "cli",
+          scope: opts.scope || "public",
+          controller_id: opts.controller || "ufoo-agent",
+          meta,
+        };
+
+        try {
+          await ensureDaemonRunning(projectRoot);
+          const resp = await sendDaemonRequest(projectRoot, {
+            type: "agent_report",
+            report,
+          });
+          const out = resp?.data?.report || report;
+          if (opts.json) {
+            console.log(JSON.stringify(out, null, 2));
+            return;
+          }
+          const detail = out.phase === "error"
+            ? (out.error || out.summary || out.message || out.task_id)
+            : (out.summary || out.message || out.task_id);
+          console.log(`[report] ${out.phase} ${out.agent_id} ${out.task_id} ${detail}`);
+        } catch (err) {
+          console.error(err.message || String(err));
+          process.exitCode = 1;
+        }
+      });
+
+    program
+      .command("ucode")
+      .description("ucode core preparation helpers")
+      .argument("[action]", "doctor|prepare|build", "doctor")
+      .option("--skip-install", "Skip npm install even if node_modules is missing")
+      .action((action, opts) => {
+        const { inspectUcodeSetup, formatUcodeDoctor, prepareAndInspectUcode } = require("./agent/ucodeDoctor");
+        const { buildUcodeCore } = require("./agent/ucodeBuild");
+        const normalized = String(action || "doctor").trim().toLowerCase();
+        if (normalized !== "doctor" && normalized !== "prepare" && normalized !== "build") {
+          console.error("ucode action must be doctor|prepare|build");
+          process.exitCode = 1;
+          return;
+        }
+        if (normalized === "build") {
+          try {
+            const built = buildUcodeCore({
+              projectRoot: process.cwd(),
+              installIfMissing: !opts.skipInstall,
+              stdio: "inherit",
+            });
+            console.log("=== ucode build ===");
+            console.log(`workspace: ${built.workspaceRoot}`);
+            console.log(`core: ${built.coreRoot}`);
+            console.log(`dist: ${built.distCliPath}`);
+            console.log(`steps: ${built.steps.join(", ")}`);
+            return;
+          } catch (err) {
+            console.error(err.message || String(err));
+            process.exitCode = 1;
+            return;
+          }
+        }
+        const result = normalized === "prepare"
+          ? prepareAndInspectUcode({ projectRoot: process.cwd() })
+          : inspectUcodeSetup({ projectRoot: process.cwd() });
+        console.log(formatUcodeDoctor(result));
+        if (normalized === "prepare" && result.bootstrapPrepared && result.bootstrapPrepared.file) {
+          console.log(`prepared bootstrap: ${result.bootstrapPrepared.file}`);
         }
       });
 
@@ -672,8 +832,8 @@ async function runCli(argv) {
 
     program
       .command("ctx")
-      .description("Project context commands (doctor|lint|decisions)")
-      .argument("[subcmd]", "Subcommand (doctor|lint|decisions)", "doctor")
+      .description("Project context commands (doctor|lint|decisions|sync)")
+      .argument("[subcmd]", "Subcommand (doctor|lint|decisions|sync)", "doctor")
       .allowUnknownOption(true)
       .argument("[subargs...]", "Subcommand args")
       .action(async (subcmd, subargs = []) => {
@@ -730,6 +890,8 @@ async function runCli(argv) {
     console.log("  ufoo chat");
     console.log("  ufoo resume [nickname]");
     console.log("  ufoo recover [list [target] | run <target>] [--json]");
+    console.log("  ufoo report <start|progress|done|error|list> [message] [--task <id>] [--agent <id>]");
+    console.log("  ufoo ucode [doctor|prepare|build] [--skip-install]");
     console.log("  ufoo init [--modules <list>] [--project <dir>]");
     console.log("  ufoo skills list");
     console.log("  ufoo skills install <name|all> [--target <dir> | --codex | --agents]");
@@ -744,7 +906,7 @@ async function runCli(argv) {
     console.log("  ufoo online inbox <nickname> [--clear] [--unread]");
     console.log("  ufoo bus wake <target> [--reason <reason>] [--no-shake]");
     console.log("  ufoo bus <args...>    (JS bus implementation)");
-    console.log("  ufoo ctx <subcmd> ... (doctor|lint|decisions)");
+    console.log("  ufoo ctx <subcmd> ... (doctor|lint|decisions|sync)");
     console.log("");
     console.log("Notes:");
     console.log("  - For Codex notifications, use ufoo bus alert / ufoo bus listen");
@@ -857,6 +1019,159 @@ async function runCli(argv) {
         process.exitCode = 1;
       }
     })();
+    return;
+  }
+  if (cmd === "report") {
+    const action = String(rest[0] || "").toLowerCase();
+    const normalized = normalizeReportPhase(action);
+    const { listReports } = require("./report/store");
+
+    if (action === "list") {
+      const agentIdx = rest.indexOf("--agent");
+      const numIdx = rest.indexOf("--num");
+      const nIdx = rest.indexOf("-n");
+      const json = rest.includes("--json");
+      const agent = agentIdx !== -1 ? (rest[agentIdx + 1] || "") : "";
+      const numRaw = numIdx !== -1
+        ? rest[numIdx + 1]
+        : (nIdx !== -1 ? rest[nIdx + 1] : "20");
+      try {
+        const rows = listReports(process.cwd(), { agent, num: parseInt(numRaw, 10) });
+        if (json) {
+          console.log(JSON.stringify(rows, null, 2));
+          return;
+        }
+        console.log(`=== Reports (${rows.length} shown) ===`);
+        rows.forEach((row) => {
+          const detail = row.phase === "error"
+            ? (row.error || row.summary || row.message || row.task_id)
+            : (row.summary || row.message || row.task_id);
+          console.log(`${row.ts || "-"} [${row.phase}] ${row.agent_id || "unknown-agent"} ${row.task_id || ""} ${detail}`);
+        });
+        if (rows.length === 0) console.log("No reports found.");
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
+      return;
+    }
+
+    if (!normalized) {
+      console.error("report action must be start|progress|done|error|list");
+      process.exitCode = 1;
+      return;
+    }
+
+    const getOpt = (name, fallback = "") => {
+      const idx = rest.indexOf(name);
+      if (idx === -1 || idx + 1 >= rest.length) return fallback;
+      const value = rest[idx + 1];
+      if (!value || value.startsWith("--")) return fallback;
+      return value;
+    };
+
+    const isValueToken = (token) =>
+      token && !token.startsWith("--") && token !== action;
+    const message = rest.slice(1).filter((token, idx, arr) => {
+      if (!isValueToken(token)) return false;
+      const prev = arr[idx - 1] || "";
+      if (
+        prev === "--task"
+        || prev === "--agent"
+        || prev === "--scope"
+        || prev === "--controller"
+        || prev === "--summary"
+        || prev === "--error"
+        || prev === "--meta"
+        || prev === "--num"
+        || prev === "-n"
+      ) {
+        return false;
+      }
+      return true;
+    }).join(" ").trim();
+
+    let meta = {};
+    try {
+      meta = parseJsonObject(getOpt("--meta", ""), {});
+    } catch (err) {
+      console.error(`Invalid --meta: ${err.message}`);
+      process.exitCode = 1;
+      return;
+    }
+
+    const report = {
+      phase: normalized,
+      task_id: getOpt("--task", `task-${Date.now()}`),
+      agent_id: getOpt("--agent", process.env.UFOO_SUBSCRIBER_ID || "unknown-agent"),
+      message,
+      summary: getOpt("--summary", normalized === "done" ? message : ""),
+      error: getOpt("--error", normalized === "error" ? message : ""),
+      ok: normalized !== "error",
+      source: "cli",
+      scope: getOpt("--scope", "public"),
+      controller_id: getOpt("--controller", "ufoo-agent"),
+      meta,
+    };
+
+    (async () => {
+      try {
+        await ensureDaemonRunning(process.cwd());
+        const resp = await sendDaemonRequest(process.cwd(), {
+          type: "agent_report",
+          report,
+        });
+        const out = resp?.data?.report || report;
+        if (rest.includes("--json")) {
+          console.log(JSON.stringify(out, null, 2));
+          return;
+        }
+        const detail = out.phase === "error"
+          ? (out.error || out.summary || out.message || out.task_id)
+          : (out.summary || out.message || out.task_id);
+        console.log(`[report] ${out.phase} ${out.agent_id} ${out.task_id} ${detail}`);
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
+    })();
+    return;
+  }
+  if (cmd === "ucode") {
+    const action = String(rest[0] || "doctor").trim().toLowerCase();
+    const { inspectUcodeSetup, formatUcodeDoctor, prepareAndInspectUcode } = require("./agent/ucodeDoctor");
+    const { buildUcodeCore } = require("./agent/ucodeBuild");
+    const skipInstall = rest.includes("--skip-install");
+    if (action !== "doctor" && action !== "prepare" && action !== "build") {
+      console.error("ucode action must be doctor|prepare|build");
+      process.exitCode = 1;
+      return;
+    }
+    if (action === "build") {
+      try {
+        const built = buildUcodeCore({
+          projectRoot: process.cwd(),
+          installIfMissing: !skipInstall,
+          stdio: "inherit",
+        });
+        console.log("=== ucode build ===");
+        console.log(`workspace: ${built.workspaceRoot}`);
+        console.log(`core: ${built.coreRoot}`);
+        console.log(`dist: ${built.distCliPath}`);
+        console.log(`steps: ${built.steps.join(", ")}`);
+      } catch (err) {
+        console.error(err.message || String(err));
+        process.exitCode = 1;
+      }
+      return;
+    }
+    const result = action === "prepare"
+      ? prepareAndInspectUcode({ projectRoot: process.cwd() })
+      : inspectUcodeSetup({ projectRoot: process.cwd() });
+    console.log(formatUcodeDoctor(result));
+    if (action === "prepare" && result.bootstrapPrepared && result.bootstrapPrepared.file) {
+      console.log(`prepared bootstrap: ${result.bootstrapPrepared.file}`);
+    }
     return;
   }
   if (cmd === "init") {

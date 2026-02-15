@@ -84,19 +84,39 @@ describe("chat inputSubmitHandler", () => {
     expect(state.targetAgent).toBeNull();
   });
 
-  test("@target without message logs error", async () => {
-    const { options, handler } = createHarness({}, {
+  test("@target without message selects direct target when resolvable", async () => {
+    const { state, options, handler } = createHarness({}, {
       parseAtTarget: jest.fn(() => ({ target: "a", message: "" })),
+      resolveAgentId: jest.fn(() => "codex:1"),
+      setTargetAgent: jest.fn((id) => {
+        state.targetAgent = id;
+      }),
     });
 
     await handler.handleSubmit("@a");
 
+    expect(options.setTargetAgent).toHaveBeenCalledWith("codex:1");
     expect(options.logMessage).toHaveBeenCalledWith(
-      "error",
-      "{white-fg}✗{/white-fg} @target requires a message"
+      "status",
+      "{white-fg}⚙{/white-fg} Target selected: @ESC(a)"
     );
     expect(options.send).not.toHaveBeenCalled();
     expect(options.focusInput).toHaveBeenCalled();
+  });
+
+  test("@target without message logs error when target is unknown", async () => {
+    const { options, handler } = createHarness({}, {
+      parseAtTarget: jest.fn(() => ({ target: "unknown", message: "" })),
+      resolveAgentId: jest.fn(() => null),
+    });
+
+    await handler.handleSubmit("@unknown");
+
+    expect(options.logMessage).toHaveBeenCalledWith(
+      "error",
+      "{white-fg}✗{/white-fg} Unknown @target"
+    );
+    expect(options.send).not.toHaveBeenCalled();
   });
 
   test("@target sends resolved target and message", async () => {
@@ -110,7 +130,7 @@ describe("chat inputSubmitHandler", () => {
     expect(options.markPendingDelivery).toHaveBeenCalledWith("codex:1");
     expect(options.send).toHaveBeenCalledWith({
       type: "bus_send",
-      target: "alpha",
+      target: "codex:1",
       message: "ping",
     });
     expect(options.focusInput).toHaveBeenCalled();

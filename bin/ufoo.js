@@ -27,6 +27,10 @@ async function main() {
     try {
       await runPtyRunner({ projectRoot: process.cwd(), agentType });
     } catch (err) {
+      const normalized = String(agentType || "").trim().toLowerCase();
+      if (normalized === "ufoo" || normalized === "ucode" || normalized === "ufoo-code") {
+        throw err;
+      }
       // Fallback to headless runner if PTY is unavailable
       // eslint-disable-next-line no-console
       console.error(`[pty-runner] ${err.message || err}. Falling back to headless internal runner.`);

@@ -86,7 +86,7 @@ function isAgentPidAlive(pid) {
   if (!isPidAlive(pid)) return false;
   const cmd = getPidCommand(pid);
   if (!cmd) return true;
-  return /(claude|codex|node)/i.test(cmd);
+  return /(claude|codex|node|pi-mono|ufoo|ucode)/i.test(cmd);
 }
 
 /**
@@ -150,7 +150,7 @@ function getTtyProcessInfo(ttyPath) {
       return { alive: false, idle: false, hasAgent: false, shellPid: 0, processes: [] };
     }
     const shellNames = new Set(["zsh", "bash", "fish", "sh", "login"]);
-    const hasAgent = processes.some((p) => /(codex|claude|node)/i.test(p.comm));
+    const hasAgent = processes.some((p) => /(codex|claude|node|pi-mono|ufoo|ucode)/i.test(p.comm));
     const nonShell = processes.filter((p) => !shellNames.has(p.comm));
     const idle = !hasAgent && nonShell.length === 0;
     const shell = processes.find((p) => shellNames.has(p.comm));
@@ -184,7 +184,8 @@ function appendFileAtomic(filePath, content) {
  */
 function writeFileAtomic(filePath, content) {
   ensureDir(path.dirname(filePath));
-  const tmpFile = `${filePath}.tmp.${Date.now()}`;
+  // Include pid + random suffix to avoid collisions across concurrent writers in the same millisecond.
+  const tmpFile = `${filePath}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString("hex")}`;
   fs.writeFileSync(tmpFile, content, "utf8");
   fs.renameSync(tmpFile, filePath);
 }

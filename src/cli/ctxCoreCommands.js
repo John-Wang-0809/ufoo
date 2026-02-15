@@ -17,6 +17,7 @@ async function runCtxCommand(subcmd = "doctor", subargs = [], options = {}) {
 
   const DecisionsManager = require("../context/decisions");
   const ContextDoctor = require("../context/doctor");
+  const SyncManager = require("../context/sync");
 
   switch (subcmd) {
     case "doctor": {
@@ -96,6 +97,96 @@ async function runCtxCommand(subcmd = "doctor", subargs = [], options = {}) {
         });
       }
       return;
+    }
+    case "sync": {
+      const manager = new SyncManager(cwd);
+      const action = (subargs[0] || "list").toLowerCase();
+
+      if (action === "write" || action === "new" || action === "add") {
+        const create = {
+          message: "",
+          from: "",
+          for: "",
+          decision: "",
+          file: "",
+          tests: "",
+          verification: "",
+          risk: "",
+          next: "",
+        };
+
+        for (let i = 1; i < subargs.length; i++) {
+          const arg = subargs[i];
+          if (arg === "--from") {
+            create.from = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--for") {
+            create.for = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--decision") {
+            create.decision = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--file") {
+            create.file = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--tests") {
+            create.tests = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--verification") {
+            create.verification = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--risk") {
+            create.risk = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--next") {
+            create.next = subargs[++i] || "";
+            continue;
+          }
+          if (!arg.startsWith("-")) {
+            create.message = create.message ? `${create.message} ${arg}` : arg;
+          }
+        }
+
+        manager.write(create);
+        return;
+      }
+
+      if (action === "list" || action === "show" || action === "-l") {
+        const opts = {
+          num: 20,
+          for: "",
+          from: "",
+        };
+
+        for (let i = 1; i < subargs.length; i++) {
+          const arg = subargs[i];
+          if (arg === "-n" || arg === "--num") {
+            opts.num = parseInt(subargs[++i], 10);
+            continue;
+          }
+          if (arg === "--for") {
+            opts.for = subargs[++i] || "";
+            continue;
+          }
+          if (arg === "--from") {
+            opts.from = subargs[++i] || "";
+          }
+        }
+
+        manager.list(opts);
+        return;
+      }
+
+      throw new Error(
+        `Unknown ctx sync action: ${action}. Use 'list' or 'write'.`
+      );
     }
     default:
       throw createUnknownCtxError(subcmd);

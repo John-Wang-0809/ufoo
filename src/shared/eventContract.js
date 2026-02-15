@@ -10,6 +10,7 @@ const IPC_REQUEST_TYPES = {
   LIST_RECOVERABLE_AGENTS: "list_recoverable_agents",
   REGISTER_AGENT: "register_agent",
   AGENT_READY: "agent_ready",
+  AGENT_REPORT: "agent_report",
 };
 
 const IPC_RESPONSE_TYPES = {

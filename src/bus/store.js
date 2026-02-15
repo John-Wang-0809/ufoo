@@ -2,9 +2,48 @@
 
 const fs = require("fs");
 const path = require("path");
-const { getTimestamp, ensureDir } = require("./utils");
+const { getTimestamp, ensureDir, safeNameToSubscriber, getTtyProcessInfo } = require("./utils");
 const { getUfooPaths } = require("../ufoo/paths");
 const { loadAgentsData, saveAgentsData } = require("../ufoo/agentsStore");
+
+function readQueueTty(queueDir) {
+  try {
+    const value = fs.readFileSync(path.join(queueDir, "tty"), "utf8").trim();
+    return value || "";
+  } catch {
+    return "";
+  }
+}
+
+function nicknamePrefixForType(agentType = "") {
+  return agentType === "claude-code" ? "claude" : String(agentType || "agent");
+}
+
+function isRecoverableSessionId(sessionId = "") {
+  const text = String(sessionId || "").trim();
+  if (!text) return false;
+  if (text.includes(":") || text.includes("_")) return false;
+  return true;
+}
+
+function buildUsedNicknameSet(agents = {}) {
+  const set = new Set();
+  for (const meta of Object.values(agents || {})) {
+    if (!meta || meta.status !== "active") continue;
+    const nick = meta && typeof meta.nickname === "string" ? meta.nickname : "";
+    if (nick) set.add(nick);
+  }
+  return set;
+}
+
+function allocateRecoveredNickname(agentType, used) {
+  const prefix = nicknamePrefixForType(agentType);
+  let idx = 1;
+  while (used.has(`${prefix}-${idx}`)) idx += 1;
+  const nick = `${prefix}-${idx}`;
+  used.add(nick);
+  return nick;
+}
 
 class BusStore {
   constructor(projectRoot) {
@@ -25,7 +64,60 @@ class BusStore {
   }
 
   load() {
-    return loadAgentsData(this.agentsFile);
+    const data = loadAgentsData(this.agentsFile);
+    if (!data.agents || typeof data.agents !== "object") {
+      data.agents = {};
+    }
+
+    const queueRoot = path.join(this.busDir, "queues");
+    if (!fs.existsSync(queueRoot)) return data;
+
+    const usedNicknames = buildUsedNicknameSet(data.agents);
+    const now = getTimestamp();
+    let recovered = false;
+
+    for (const entry of fs.readdirSync(queueRoot)) {
+      const queueDir = path.join(queueRoot, entry);
+      let stat;
+      try {
+        stat = fs.statSync(queueDir);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) continue;
+
+      const subscriber = safeNameToSubscriber(entry);
+      const parts = subscriber.split(":");
+      if (parts.length !== 2) continue;
+      const [agentType, sessionId] = parts;
+      if (!agentType || !sessionId) continue;
+      if (!isRecoverableSessionId(sessionId)) continue;
+      if (data.agents[subscriber]) continue;
+
+      const tty = readQueueTty(queueDir);
+      const ttyInfo = tty ? getTtyProcessInfo(tty) : null;
+      const activeByTty = Boolean(ttyInfo && ttyInfo.alive && ttyInfo.hasAgent);
+      const nickname = activeByTty ? allocateRecoveredNickname(agentType, usedNicknames) : "";
+
+      data.agents[subscriber] = {
+        agent_type: agentType,
+        nickname,
+        status: activeByTty ? "active" : "inactive",
+        joined_at: now,
+        last_seen: now,
+        pid: 0,
+        tty,
+        tty_shell_pid: ttyInfo && ttyInfo.shellPid ? ttyInfo.shellPid : 0,
+        tmux_pane: "",
+        launch_mode: "",
+      };
+      recovered = true;
+    }
+
+    if (recovered) {
+      saveAgentsData(this.agentsFile, data);
+    }
+    return data;
   }
 
   save(busData) {

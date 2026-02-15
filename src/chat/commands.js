@@ -27,18 +27,33 @@ const COMMAND_TREE = {
     },
   },
   "/doctor": { desc: "Health check diagnostics" },
+  "/corn": {
+    desc: "Cron scheduler operations",
+    children: {
+      start: { desc: "Create cron task" },
+      list: { desc: "List cron tasks" },
+      stop: { desc: "Stop cron task by id or all" },
+    },
+  },
   "/init": { desc: "Initialize modules" },
   "/launch": {
     desc: "Launch new agent",
     children: {
       claude: { desc: "Launch Claude agent" },
       codex: { desc: "Launch Codex agent" },
+      ucode: { desc: "Launch ucode core agent" },
     },
   },
   "/resume": {
     desc: "Resume agents (optional nickname) or list recoverable targets",
     children: {
       list: { desc: "List recoverable agents (optional target)" },
+    },
+  },
+  "/settings": {
+    desc: "Settings operations",
+    children: {
+      ucode: { desc: "Manage ucode model provider config" },
     },
   },
   "/skills": {

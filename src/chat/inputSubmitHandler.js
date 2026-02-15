@@ -13,6 +13,7 @@ function createInputSubmitHandler(options = {}) {
     escapeBlessed = (value) => String(value || ""),
     markPendingDelivery = () => {},
     clearTargetAgent = () => {},
+    setTargetAgent = () => {},
     enterAgentView = () => {},
     getAgentAdapter = () => null,
     activateAgent = async () => {},
@@ -20,6 +21,7 @@ function createInputSubmitHandler(options = {}) {
     existsSync = () => false,
     commitInputHistory = () => {},
     focusInput = () => {},
+    renderScreen = () => {},  // Add renderScreen callback
   } = options;
 
   if (!state || typeof state !== "object") {
@@ -86,6 +88,7 @@ function createInputSubmitHandler(options = {}) {
         "user",
         `{cyan-fg}→{/cyan-fg} {magenta-fg}@${escapeBlessed(label)}{/magenta-fg} ${escapeBlessed(text)}`
       );
+      renderScreen();  // Immediately render the user message
       markPendingDelivery(state.targetAgent);
       send({ type: IPC_REQUEST_TYPES.BUS_SEND, target: state.targetAgent, message: text });
       clearTargetAgent();
@@ -96,7 +99,17 @@ function createInputSubmitHandler(options = {}) {
     const atTarget = parseAtTarget(text);
     if (atTarget) {
       if (!atTarget.message) {
-        logMessage("error", "{white-fg}✗{/white-fg} @target requires a message");
+        const resolvedTarget = resolveAgentId(atTarget.target) || "";
+        if (!resolvedTarget) {
+          logMessage("error", "{white-fg}✗{/white-fg} Unknown @target");
+          focusInput();
+          return;
+        }
+        setTargetAgent(resolvedTarget);
+        logMessage(
+          "status",
+          `{white-fg}⚙{/white-fg} Target selected: @${escapeBlessed(atTarget.target)}`
+        );
         focusInput();
         return;
       }
@@ -105,14 +118,16 @@ function createInputSubmitHandler(options = {}) {
         "user",
         `{cyan-fg}→{/cyan-fg} {magenta-fg}@${escapeBlessed(atTarget.target)}{/magenta-fg} ${escapeBlessed(atTarget.message)}`
       );
+      renderScreen();  // Immediately render the user message
       markPendingDelivery(resolvedTarget);
-      send({ type: IPC_REQUEST_TYPES.BUS_SEND, target: atTarget.target, message: atTarget.message });
+      send({ type: IPC_REQUEST_TYPES.BUS_SEND, target: resolvedTarget, message: atTarget.message });
       focusInput();
       return;
     }
 
     if (text.startsWith("/")) {
       logMessage("user", `{white-fg}→{/white-fg} ${escapeBlessed(text)}`);
+      renderScreen();  // Render slash command immediately
       try {
         await executeCommand(text);
       } catch (err) {
@@ -140,6 +155,7 @@ function createInputSubmitHandler(options = {}) {
       queueStatusLine("ufoo-agent processing");
       send({ type: IPC_REQUEST_TYPES.PROMPT, text });
       logMessage("user", `{white-fg}→{/white-fg} ${escapeBlessed(text)}`);
+      renderScreen();  // Render plain text message immediately
     }
 
     focusInput();

@@ -14,7 +14,8 @@ describe("chat text helpers", () => {
   });
 
   test("escapeBlessed escapes null and protects closing escape tag", () => {
-    expect(escapeBlessed(null)).toBe("{escape}{/escape}");
+    expect(escapeBlessed(null)).toBe("");
+    expect(escapeBlessed("")).toBe("");
     expect(escapeBlessed("a{/escape}b")).toBe("{escape}a{open}/escape{close}b{/escape}");
   });
 

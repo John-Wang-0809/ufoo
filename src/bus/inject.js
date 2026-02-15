@@ -248,6 +248,10 @@ class Injector {
    * 2. tmux send-keys（无需权限）
    */
   async inject(subscriber, commandOverride = "") {
+    if (String(subscriber || "").startsWith("ufoo-code:")) {
+      throw new Error(`Inject disabled for ${subscriber}. ufoo-code consumes bus internally.`);
+    }
+
     // 确定注入命令（codex 用 "ubus"，claude-code 用 "/ubus"）
     const command = commandOverride
       ? String(commandOverride)

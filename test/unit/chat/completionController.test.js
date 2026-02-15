@@ -45,6 +45,10 @@ function createHarness(overrides = {}) {
         desc: "Show status",
       },
     ],
+    getMentionCandidates: jest.fn(() => [
+      { id: "codex:1", label: "codex-1" },
+      { id: "claude:2", label: "claude-2" },
+    ]),
     normalizeCommandPrefix: jest.fn(),
     truncateText: jest.fn((value) => value),
     getCurrentInputHeight: jest.fn(() => 5),
@@ -86,15 +90,29 @@ describe("chat completionController", () => {
     expect(completionPanel.setContent).toHaveBeenCalledWith(expect.stringContaining("/bus"));
   });
 
-  test("launch subcommand mode includes fallback claude target", () => {
+  test("show supports @mention candidates", () => {
+    const { controller, input, completionPanel } = createHarness();
+    input.value = "@co";
+
+    controller.show(input.value);
+
+    expect(controller.isActive()).toBe(true);
+    expect(controller.getCommandCount()).toBe(1);
+    expect(completionPanel.hidden).toBe(false);
+    expect(completionPanel.setContent).toHaveBeenLastCalledWith(expect.stringContaining("@codex-1"));
+  });
+
+  test("launch subcommand mode includes fallback launch targets", () => {
     const { controller, input, completionPanel } = createHarness();
     input.value = "/launch ";
 
     controller.show(input.value);
 
     expect(controller.isActive()).toBe(true);
-    expect(controller.getCommandCount()).toBe(2);
+    expect(controller.getCommandCount()).toBe(3);
     expect(completionPanel.setContent).toHaveBeenLastCalledWith(expect.stringContaining("claude"));
+    expect(completionPanel.setContent).toHaveBeenLastCalledWith(expect.stringContaining("ucode"));
+    expect(completionPanel.setContent).not.toHaveBeenLastCalledWith(expect.stringContaining("ufoo"));
   });
 
   test("tab confirms selected command", () => {
@@ -107,6 +125,19 @@ describe("chat completionController", () => {
 
     expect(handled).toBe(true);
     expect(input.value).toBe("/status ");
+    expect(controller.isActive()).toBe(false);
+  });
+
+  test("tab confirms selected @mention", () => {
+    const { controller, input } = createHarness();
+    input.value = "@";
+
+    controller.show(input.value);
+    controller.jumpToLast();
+    const handled = controller.handleKey("", { name: "tab" });
+
+    expect(handled).toBe(true);
+    expect(input.value).toBe("@codex-1 ");
     expect(controller.isActive()).toBe(false);
   });
 

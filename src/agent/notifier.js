@@ -21,6 +21,7 @@ class AgentNotifier {
     this.stopped = false;
     this.autoTrigger = process.env.UFOO_AUTO_TRIGGER !== "0"; // 默认启用自动触发
     this.lastNickname = "";
+    this.lastUbusWakeCount = -1;
 
     // 计算队列文件路径
     const safeSub = subscriber.replace(/:/g, "_");
@@ -36,6 +37,10 @@ class AgentNotifier {
     const busDir = paths.busDir;
     this.injector = new Injector(busDir, paths.agentsFile);
     this.eventBus = new EventBus(projectRoot);
+  }
+
+  isUfooCodeSubscriber() {
+    return String(this.subscriber || "").startsWith("ufoo-code:");
   }
 
   /**
@@ -177,6 +182,11 @@ class AgentNotifier {
   }
 
   async deliverPending() {
+    if (this.isUfooCodeSubscriber()) {
+      // ufoo-code consumes bus queue internally; notifier must not inject text/commands.
+      return 0;
+    }
+
     const events = this.drainPending();
     if (events.length === 0) return 0;
     const failed = [];
@@ -261,11 +271,25 @@ class AgentNotifier {
 
     // Ensure pending delivery happens even if count doesn't change
     if (this.autoTrigger && currentCount > 0) {
-      try {
-        await this.deliverPending();
-      } catch {
-        // ignore delivery errors
+      if (this.isUfooCodeSubscriber()) {
+        if (this.lastUbusWakeCount !== currentCount) {
+          try {
+            await this.autoTriggerInput();
+            this.lastUbusWakeCount = currentCount;
+          } catch {
+            // ignore delivery errors
+          }
+        }
+      } else {
+        try {
+          await this.deliverPending();
+        } catch {
+          // ignore delivery errors
+        }
       }
+    }
+    if (currentCount <= 0) {
+      this.lastUbusWakeCount = -1;
     }
 
     this.lastCount = this.getMessageCount();

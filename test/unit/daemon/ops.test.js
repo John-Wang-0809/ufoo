@@ -132,6 +132,11 @@ describe("daemon ops closeAgent window close gate", () => {
     }, null, 2));
   }
 
+  function readAgents() {
+    const paths = getUfooPaths(projectRoot);
+    return JSON.parse(fs.readFileSync(paths.agentsFile, "utf8"));
+  }
+
   beforeEach(() => {
     if (fs.existsSync(projectRoot)) {
       fs.rmSync(projectRoot, { recursive: true, force: true });
@@ -171,6 +176,8 @@ describe("daemon ops closeAgent window close gate", () => {
     expect(result).toBe(true);
     expect(spawn.mock.calls.length).toBeGreaterThan(0);
     expect(killSpy).toHaveBeenCalledWith(12345, "SIGTERM");
+    const data = readAgents();
+    expect(data.agents["codex:a1"].status).toBe("inactive");
   });
 
   test("tmux mode skips window close even when tty is present", async () => {

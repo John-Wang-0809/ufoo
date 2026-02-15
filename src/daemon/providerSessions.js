@@ -14,11 +14,16 @@ function buildProbeMarker(nickname) {
 }
 
 /**
- * Build probe command: /ufoo <nickname> for claude-code, ufoo <nickname> for codex
+ * Build probe command:
+ * - claude-code: /ufoo <nickname>
+ * - codex: $ufoo <nickname>
  */
 function buildProbeCommand(agentType, nickname) {
-  const base = `ufoo ${nickname}`;
-  return agentType === "claude-code" ? `/${base}` : base;
+  const marker = String(nickname || "").trim();
+  if (agentType === "claude-code") {
+    return `/ufoo ${marker}`;
+  }
+  return `$ufoo ${marker}`;
 }
 
 function readLines(filePath) {
@@ -30,22 +35,30 @@ function readLines(filePath) {
   }
 }
 
+function escapeRegExp(value = "") {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function containsProbeCommand(text, marker) {
+  if (!text || !marker) return false;
+  const escapedMarker = escapeRegExp(marker);
+  const pattern = `(?:^|[\\s"'\\\`])(?:\\/ufoo|\\$ufoo|ufoo)\\s+${escapedMarker}(?=$|[\\s"'\\\`.,:;!?\\]\\)\\}])`;
+  const re = new RegExp(pattern);
+  return re.test(String(text));
+}
+
 /**
  * Check if a history record contains our probe marker
- * Searches for "/ufoo <marker>" or "ufoo <marker>" pattern
+ * Searches for probe marker command patterns:
+ * - "/ufoo <marker>" (claude)
+ * - "$ufoo <marker>" (codex)
+ * - "ufoo <marker>" (legacy compatibility)
  */
 function recordContainsMarker(record, marker, rawLine) {
   if (!marker) return false;
 
-  // Build both possible patterns
-  const patterns = [`/ufoo ${marker}`, `ufoo ${marker}`];
-
   // Check raw line first (fastest)
-  if (rawLine) {
-    for (const pattern of patterns) {
-      if (rawLine.includes(pattern)) return true;
-    }
-  }
+  if (containsProbeCommand(rawLine, marker)) return true;
 
   if (!record || typeof record !== "object") return false;
 
@@ -61,11 +74,7 @@ function recordContainsMarker(record, marker, rawLine) {
   ];
 
   for (const field of fields) {
-    if (typeof field === "string") {
-      for (const pattern of patterns) {
-        if (field.includes(pattern)) return true;
-      }
-    }
+    if (containsProbeCommand(field, marker)) return true;
   }
   return false;
 }
@@ -288,4 +297,10 @@ function scheduleProviderSessionProbe({
 module.exports = {
   scheduleProviderSessionProbe,
   loadProviderSessionCache,
+  __private: {
+    buildProbeCommand,
+    recordContainsMarker,
+    containsProbeCommand,
+    escapeRegExp,
+  },
 };

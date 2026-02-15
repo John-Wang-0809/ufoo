@@ -1,5 +1,6 @@
 const ContextDoctor = require("./doctor");
 const DecisionsManager = require("./decisions");
+const SyncManager = require("./sync");
 
 /**
  * Context management wrapper for chat commands
@@ -9,6 +10,7 @@ class UfooContext {
     this.projectRoot = projectRoot;
     this.doctorInstance = new ContextDoctor(projectRoot);
     this.decisionsManager = new DecisionsManager(projectRoot);
+    this.syncManager = new SyncManager(projectRoot);
   }
 
   /**
@@ -31,7 +33,22 @@ class UfooContext {
   async status() {
     const decisions = this.decisionsManager.readDecisions();
     const openDecisions = decisions.filter(d => d.status === "open");
-    console.log(`Context: ${openDecisions.length} open decision(s), ${decisions.length} total`);
+    const sync = this.syncManager.parseLines();
+    console.log(`Context: ${openDecisions.length} open decision(s), ${decisions.length} total, ${sync.length} sync note(s)`);
+  }
+
+  /**
+   * Append a sync note
+   */
+  async syncWrite(options = {}) {
+    return this.syncManager.write(options);
+  }
+
+  /**
+   * Show sync notes
+   */
+  async listSync(options = {}) {
+    return this.syncManager.list(options);
   }
 }
 

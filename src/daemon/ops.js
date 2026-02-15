@@ -8,6 +8,35 @@ const { isAgentPidAlive, getTtyProcessInfo } = require("../bus/utils");
 const { isITerm2 } = require("../terminal/detect");
 const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 
+function normalizeLaunchAgent(agent = "") {
+  const value = String(agent || "").trim().toLowerCase();
+  if (value === "codex") return "codex";
+  if (value === "claude" || value === "claude-code") return "claude";
+  if (value === "ufoo" || value === "ucode" || value === "ufoo-code") return "ufoo";
+  return "";
+}
+
+function toBusAgentType(agent = "") {
+  if (agent === "codex") return "codex";
+  if (agent === "claude") return "claude-code";
+  if (agent === "ufoo") return "ufoo-code";
+  return "";
+}
+
+function toTerminalBinary(agent = "") {
+  if (agent === "codex") return "./bin/ucodex.js";
+  if (agent === "claude") return "./bin/uclaude.js";
+  if (agent === "ufoo") return "./bin/ucode.js";
+  return "";
+}
+
+function toTmuxBinary(agent = "") {
+  if (agent === "codex") return "ucodex";
+  if (agent === "claude") return "uclaude";
+  if (agent === "ufoo") return "ucode";
+  return "";
+}
+
 function resolveAgentId(projectRoot, agentId) {
   if (!agentId) return agentId;
   if (agentId.includes(":")) return agentId;
@@ -17,7 +46,8 @@ function resolveAgentId(projectRoot, agentId) {
     const entries = Object.entries(bus.agents || {});
     const match = entries.find(([, meta]) => meta?.nickname === agentId);
     if (match) return match[0];
-    const targetType = agentId === "claude" ? "claude-code" : agentId;
+    const normalized = normalizeLaunchAgent(agentId);
+    const targetType = toBusAgentType(normalized) || agentId;
     const candidates = entries
       .filter(([, meta]) => meta?.agent_type === targetType && meta?.status === "active")
       .map(([id]) => id);
@@ -26,6 +56,21 @@ function resolveAgentId(projectRoot, agentId) {
     // ignore
   }
   return agentId;
+}
+
+function markAgentInactive(projectRoot, agentId) {
+  if (!agentId) return false;
+  const filePath = getUfooPaths(projectRoot).agentsFile;
+  const data = loadAgentsData(filePath);
+  const meta = data.agents?.[agentId];
+  if (!meta) return false;
+  data.agents[agentId] = {
+    ...meta,
+    status: "inactive",
+    last_seen: new Date().toISOString(),
+  };
+  saveAgentsData(filePath, data);
+  return true;
 }
 
 
@@ -186,7 +231,10 @@ function buildTitleCmd(title) {
 }
 
 function buildResumeCommand(projectRoot, agent, sessionId) {
-  const binary = agent === "codex" ? "./bin/ucodex.js" : "./bin/uclaude.js";
+  const binary = toTerminalBinary(agent);
+  if (!binary) {
+    throw new Error(`unsupported agent for resume: ${agent}`);
+  }
   const args = buildResumeArgs(agent, sessionId);
   const argText = args.length > 0 ? ` ${args.map(shellEscape).join(" ")}` : "";
   const skipProbeEnv = "UFOO_SKIP_SESSION_PROBE=1 ";
@@ -215,8 +263,12 @@ async function tryReuseTerminal(projectRoot, subscriberId, meta, agent, sessionI
  * Spawn managed terminal agent - open a real Terminal session to run the agent
  */
 async function spawnManagedTerminalAgent(projectRoot, agent, nickname = "", processManager = null, extraArgs = [], extraEnv = "") {
-  const binary = agent === "codex" ? "./bin/ucodex.js" : "./bin/uclaude.js";
-  const agentType = agent === "codex" ? "codex" : "claude-code";
+  const normalizedAgent = normalizeLaunchAgent(agent);
+  const binary = toTerminalBinary(normalizedAgent);
+  const agentType = toBusAgentType(normalizedAgent);
+  if (!binary || !agentType) {
+    throw new Error(`unsupported agent type: ${agent}`);
+  }
   const existing = listSubscribers(projectRoot, agentType);
   const runDir = getUfooPaths(projectRoot).runDir;
   fs.mkdirSync(runDir, { recursive: true });
@@ -259,7 +311,11 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
 
     // 预生成 session ID
     const sessionId = crypto.randomBytes(4).toString("hex");
-    const agentType = agent === "codex" ? "codex" : "claude-code";
+    const normalizedAgent = normalizeLaunchAgent(agent);
+    const agentType = toBusAgentType(normalizedAgent);
+    if (!agentType) {
+      throw new Error(`unsupported agent type: ${agent}`);
+    }
     const subscriberId = `${agentType}:${sessionId}`;
     subscriberIds.push(subscriberId);
 
@@ -356,7 +412,12 @@ async function spawnInternalAgent(projectRoot, agent, count = 1, nickname = "", 
 
 function spawnTmuxWindow(projectRoot, agent, nickname = "", extraArgs = [], extraEnv = "") {
   return new Promise((resolve, reject) => {
-    const binary = agent === "codex" ? "ucodex" : "uclaude";
+    const normalizedAgent = normalizeLaunchAgent(agent);
+    const binary = toTmuxBinary(normalizedAgent);
+    if (!binary) {
+      reject(new Error(`unsupported agent type: ${agent}`));
+      return;
+    }
     const nickEnv = nickname ? `UFOO_NICKNAME=${shellEscape(nickname)} ` : "";
     const modeEnv = "UFOO_LAUNCH_MODE=tmux ";
     const ttyEnv = "UFOO_TTY_OVERRIDE=$(tty) ";
@@ -395,9 +456,13 @@ function spawnTmuxWindow(projectRoot, agent, nickname = "", extraArgs = [], extr
 async function launchAgent(projectRoot, agent, count = 1, nickname = "", processManager = null) {
   const config = loadConfig(projectRoot);
   const mode = config.launchMode || "terminal";
+  const normalizedAgent = normalizeLaunchAgent(agent);
+  if (!normalizedAgent) {
+    throw new Error(`unsupported agent type: ${agent}`);
+  }
 
   if (mode === "internal") {
-    const result = await spawnInternalAgent(projectRoot, agent, count, nickname, processManager);
+    const result = await spawnInternalAgent(projectRoot, normalizedAgent, count, nickname, processManager);
     return { mode: "internal", subscriberIds: result.subscriberIds };
   }
   if (mode === "tmux") {
@@ -423,9 +488,9 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
       }
     }
     for (let i = 0; i < count; i += 1) {
-      const nick = count > 1 ? `${nickname || agent}-${i + 1}` : (nickname || "");
+      const nick = count > 1 ? `${nickname || normalizedAgent}-${i + 1}` : (nickname || "");
       // eslint-disable-next-line no-await-in-loop
-      await spawnTmuxWindow(projectRoot, agent, nick);
+      await spawnTmuxWindow(projectRoot, normalizedAgent, nick);
     }
     return { mode: "tmux" };
   }
@@ -436,9 +501,9 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
 
   const subscriberIds = [];
   for (let i = 0; i < count; i += 1) {
-    const nick = count > 1 ? `${nickname || agent}-${i + 1}` : (nickname || "");
+    const nick = count > 1 ? `${nickname || normalizedAgent}-${i + 1}` : (nickname || "");
     // eslint-disable-next-line no-await-in-loop
-    const result = await spawnManagedTerminalAgent(projectRoot, agent, nick, processManager);
+    const result = await spawnManagedTerminalAgent(projectRoot, normalizedAgent, nick, processManager);
     if (result.subscriberId) subscriberIds.push(result.subscriberId);
   }
 
@@ -448,6 +513,7 @@ async function launchAgent(projectRoot, agent, count = 1, nickname = "", process
 function normalizeAgentType(agentType) {
   if (agentType === "claude-code") return "claude";
   if (agentType === "codex") return "codex";
+  if (agentType === "ufoo-code") return "ufoo";
   return agentType;
 }
 
@@ -602,16 +668,29 @@ async function closeAgent(projectRoot, agentId) {
   }
   const adapterRouter = createTerminalAdapterRouter();
   const adapter = adapterRouter.getAdapter({ launchMode, agentId: resolvedId });
-  if (adapter.capabilities.supportsWindowClose && tty) {
-    await closeTerminalWindowByTty(tty, terminalApp);
+  const canCloseWindow = adapter.capabilities.supportsWindowClose && tty;
+
+  // Close process first for faster state transition in chat.
+  let sentSignal = false;
+  if (pid) {
+    try {
+      process.kill(pid, "SIGTERM");
+      sentSignal = true;
+    } catch {
+      sentSignal = false;
+    }
   }
-  if (!pid) return false;
-  try {
-    process.kill(pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
+
+  if (sentSignal || (!pid && canCloseWindow)) {
+    markAgentInactive(projectRoot, resolvedId);
   }
+
+  if (canCloseWindow) {
+    // Non-blocking: don't hold close response on AppleScript window operations.
+    void closeTerminalWindowByTty(tty, terminalApp).catch(() => false);
+  }
+
+  return sentSignal || (!pid && canCloseWindow);
 }
 
 module.exports = { launchAgent, closeAgent, getRecoverableAgents, resumeAgents };

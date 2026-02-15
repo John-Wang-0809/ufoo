@@ -75,16 +75,18 @@ function buildSystemPrompt(context) {
   const hasAgents = context.agents && context.agents.length > 0;
   const agentGuidance = hasAgents
     ? ""
-    : "\n- IMPORTANT: No agents are currently online. To execute tasks, you MUST launch agents using ops.launch.\n- Example: {\"reply\":\"Creating agent\",\"ops\":[{\"action\":\"launch\",\"agent\":\"claude\",\"count\":1}]}";
+    : "\n- IMPORTANT: No coding agents are currently online. For lightweight exploration or temporary command execution, prefer top-level assistant_call.\n- Use ops.launch only when persistent coding-agent sessions are necessary.";
 
   return [
     "You are ufoo-agent, a headless routing controller.",
+    "You can call a private execution helper via top-level assistant_call (not visible on bus).",
     "Return ONLY valid JSON. No extra text.",
     "Schema:",
     "{",
     '  "reply": "string",',
+    '  "assistant_call": {"kind":"explore|bash|mixed","task":"string","context":"optional","expect":"optional","provider":"codex|claude|ufoo (optional)","model":"optional","timeout_ms":60000},',
     '  "dispatch": [{"target":"broadcast|<agent-id>|<nickname>","message":"string"}],',
-    '  "ops": [{"action":"launch|close|rename","agent":"codex|claude","count":1,"agent_id":"id","nickname":"optional"}],',
+    '  "ops": [{"action":"launch|close|rename|cron","agent":"codex|claude|ucode","count":1,"agent_id":"id","nickname":"optional","operation":"start|list|stop","every":"30m","interval_ms":1800000,"target":"agent-id|nickname|csv","targets":["agent-id"],"prompt":"message","id":"task-id|all"}],',
     '  "disambiguate": {"prompt":"string","candidates":[{"agent_id":"id","reason":"string"}]}',
     "}",
     "Rules:",
@@ -92,6 +94,13 @@ function buildSystemPrompt(context) {
     "- If multiple possible agents, use disambiguate with candidates and no dispatch.",
     "- If user specifies a nickname for a new agent, include ops.launch with nickname so daemon can rename.",
     "- If user requests rename, use ops.rename with agent_id and nickname (do NOT launch).",
+    "- For scheduled follow-up (cron/corn), use ops.cron with operation=start and include every+target(s)+prompt.",
+    "- To check scheduled tasks, use ops.cron with operation=list.",
+    "- To stop scheduled tasks, use ops.cron with operation=stop and id (or id=all).",
+    "- Use top-level assistant_call for project exploration, temporary shell tasks, and quick execution support.",
+    "- assistant_call fields: kind (explore|bash|mixed), task (required), context/expect (optional), provider (codex|claude|ufoo, optional), model/timeout_ms (optional).",
+    "- Prefer assistant_call over launching coding agents when the task is short-lived.",
+    "- Legacy compatibility: if model emits ops.assistant_call, daemon will still process it.",
     "- If no action needed, return reply with empty dispatch/ops.",
     agentGuidance,
     "",

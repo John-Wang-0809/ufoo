@@ -14,6 +14,15 @@ const SEQ_LOCK_TIMEOUT_MS = 5000;
 const SEQ_LOCK_POLL_MS = 25;
 const SEQ_LOCK_STALE_MS = 30000;
 
+function normalizeAgentTypeAlias(value = "") {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return "";
+  if (text === "codex") return "codex";
+  if (text === "claude" || text === "claude-code") return "claude-code";
+  if (text === "ufoo" || text === "ucode" || text === "ufoo-code") return "ufoo-code";
+  return text;
+}
+
 /**
  * 消息管理器
  */
@@ -175,6 +184,13 @@ class MessageManager {
    */
   resolveTarget(target) {
     const nicknameManager = new NicknameManager(this.busData);
+    const normalizedTarget = normalizeAgentTypeAlias(target);
+
+    // 0. Exact subscriber ID match (allows ids without ":" e.g. "ufoo-agent")
+    const subscribers = this.busData.agents || {};
+    if (target && typeof target === "string" && subscribers[target]) {
+      return [target];
+    }
 
     // 1. 尝试作为订阅者 ID
     if (target.includes(":")) {
@@ -188,11 +204,10 @@ class MessageManager {
     }
 
     // 3. 尝试作为代理类型（匹配所有该类型的订阅者）
-    const subscribers = this.busData.agents || {};
     const isActive = (meta) => !meta || meta.status === "active";
 
     const byType = Object.entries(subscribers)
-      .filter(([, meta]) => meta.agent_type === target && isActive(meta))
+      .filter(([, meta]) => normalizeAgentTypeAlias(meta.agent_type) === normalizedTarget && isActive(meta))
       .map(([id]) => id);
 
     if (byType.length > 0) {
@@ -214,12 +229,13 @@ class MessageManager {
    * 检查目标是否匹配订阅者
    */
   targetMatches(target, subscriber) {
+    const normalizedTarget = normalizeAgentTypeAlias(target);
     // 精确匹配
     if (target === subscriber) return true;
 
     // 代理类型匹配
     const meta = this.busData.agents?.[subscriber];
-    if (meta && target === meta.agent_type) return true;
+    if (meta && normalizedTarget === normalizeAgentTypeAlias(meta.agent_type)) return true;
 
     // 昵称匹配
     if (meta && target === meta.nickname) return true;
@@ -383,16 +399,14 @@ class MessageManager {
    * 智能路由解析（找出所有匹配的候选者）
    */
   async resolve(myId, targetType) {
+    const normalizedTargetType = normalizeAgentTypeAlias(targetType);
     const subscribers = this.busData.agents || {};
     const candidates = Object.entries(subscribers)
       .filter(([id, meta]) => {
         if (id === myId) return false; // 排除自己
         if (meta.status !== "active") return false;
 
-        // 匹配代理类型
-        if (targetType === "codex" && meta.agent_type === "codex") return true;
-        if (targetType === "claude" && meta.agent_type === "claude-code") return true;
-        if (targetType === meta.agent_type) return true;
+        if (normalizeAgentTypeAlias(meta.agent_type) === normalizedTargetType) return true;
 
         return false;
       })

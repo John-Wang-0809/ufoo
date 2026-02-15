@@ -88,6 +88,20 @@ class ReadyDetector {
   }
 
   /**
+   * 检测ufoo-code/ucode的ready标记
+   */
+  _detectUfooCodeReady(text) {
+    if (/(?:^|\n)(?:ufoo|ucode|pi-mono)>\s*$/m.test(text)) {
+      return true;
+    }
+    // 与 codex 路径保持一致的兜底：行首/行尾的单独 ">"
+    if (/(?:^|\n)>\s*$/.test(text)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * 处理PTY输出数据
    * @param {Buffer|string} data - PTY输出数据
    */
@@ -121,6 +135,8 @@ class ReadyDetector {
       isReady = this._detectClaudeCodeReady(this.buffer);
     } else if (this.agentType === "codex") {
       isReady = this._detectCodexReady(this.buffer);
+    } else if (this.agentType === "ufoo" || this.agentType === "ucode" || this.agentType === "ufoo-code") {
+      isReady = this._detectUfooCodeReady(this.buffer);
     }
 
     if (isReady) {

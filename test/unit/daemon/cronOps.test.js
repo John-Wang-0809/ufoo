@@ -1,0 +1,113 @@
+const {
+  createDaemonCronController,
+  normalizeCronTargets,
+  resolveCronOperation,
+  resolveCronIntervalMs,
+} = require("../../../src/daemon/cronOps");
+
+describe("daemon cronOps", () => {
+  test("starts task and dispatches on tick", async () => {
+    const timers = [];
+    const dispatch = jest.fn().mockResolvedValue(undefined);
+    const setIntervalFn = jest.fn((fn, ms) => {
+      const timer = { fn, ms, id: `t${timers.length + 1}` };
+      timers.push(timer);
+      return timer;
+    });
+    const clearIntervalFn = jest.fn();
+
+    const controller = createDaemonCronController({
+      dispatch,
+      setIntervalFn,
+      clearIntervalFn,
+      nowFn: () => 1000,
+      log: jest.fn(),
+    });
+
+    const started = controller.handleCronOp({
+      action: "cron",
+      operation: "start",
+      every: "30m",
+      target: "codex-3",
+      prompt: "follow up",
+    });
+
+    expect(started.ok).toBe(true);
+    expect(started.task.id).toBe("c1");
+    expect(started.task.interval).toBe("30m");
+    expect(setIntervalFn).toHaveBeenCalledWith(expect.any(Function), 1800000);
+
+    timers[0].fn();
+    await Promise.resolve();
+
+    expect(dispatch).toHaveBeenCalledWith({
+      taskId: "c1",
+      target: "codex-3",
+      message: "follow up",
+    });
+
+    const listed = controller.handleCronOp({ action: "cron", operation: "list" });
+    expect(listed.ok).toBe(true);
+    expect(listed.count).toBe(1);
+    expect(listed.tasks[0].id).toBe("c1");
+
+    const stopped = controller.handleCronOp({ action: "cron", operation: "stop", id: "c1" });
+    expect(stopped.ok).toBe(true);
+    expect(clearIntervalFn).toHaveBeenCalledWith(timers[0]);
+  });
+
+  test("supports stop all", () => {
+    const timers = [];
+    const setIntervalFn = jest.fn((fn, ms) => {
+      const timer = { fn, ms, id: `t${timers.length + 1}` };
+      timers.push(timer);
+      return timer;
+    });
+    const clearIntervalFn = jest.fn();
+
+    const controller = createDaemonCronController({
+      dispatch: jest.fn(),
+      setIntervalFn,
+      clearIntervalFn,
+      nowFn: () => 1000,
+      log: jest.fn(),
+    });
+
+    controller.handleCronOp({ operation: "start", every: "10s", target: "codex:1", prompt: "ping" });
+    controller.handleCronOp({ operation: "start", every: "20s", target: "codex:2", prompt: "pong" });
+
+    const stopped = controller.handleCronOp({ operation: "stop", id: "all" });
+    expect(stopped.ok).toBe(true);
+    expect(stopped.stopped).toBe(2);
+    expect(clearIntervalFn).toHaveBeenCalledTimes(2);
+  });
+
+  test("validates start payload", () => {
+    const controller = createDaemonCronController({ dispatch: jest.fn(), log: jest.fn() });
+
+    expect(controller.handleCronOp({ operation: "start", every: "500ms", target: "codex:1", prompt: "x" })).toEqual(
+      expect.objectContaining({ ok: false, error: "invalid cron interval (min 1s)" })
+    );
+    expect(controller.handleCronOp({ operation: "start", every: "10s", prompt: "x" })).toEqual(
+      expect.objectContaining({ ok: false, error: "cron start requires at least one target" })
+    );
+    expect(controller.handleCronOp({ operation: "start", every: "10s", target: "codex:1" })).toEqual(
+      expect.objectContaining({ ok: false, error: "cron start requires prompt" })
+    );
+  });
+
+  test("normalizes cron helpers", () => {
+    expect(resolveCronOperation({ operation: "ls" })).toBe("ls");
+    expect(resolveCronOperation({ list: true })).toBe("list");
+    expect(resolveCronOperation({ id: "c1" })).toBe("stop");
+
+    expect(resolveCronIntervalMs({ interval_ms: 10000 })).toBe(10000);
+    expect(resolveCronIntervalMs({ every: "5m" })).toBe(300000);
+
+    expect(normalizeCronTargets({ targets: ["codex:1", " codex:1 ", "claude:2"] })).toEqual([
+      "codex:1",
+      "claude:2",
+    ]);
+    expect(normalizeCronTargets({ target: "codex:1, codex:2" })).toEqual(["codex:1", "codex:2"]);
+  });
+});

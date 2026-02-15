@@ -138,6 +138,15 @@ function createDaemonMessageRouter(options = {}) {
       resolveStatusLine("{gray-fg}✓{/gray-fg} Done");
     }
 
+    if (Array.isArray(payload.ops) && payload.ops.length > 0) {
+      const hasStateMutation = payload.ops.some((op) =>
+        op && (op.action === "close" || op.action === "launch" || op.action === "rename" || op.action === "cron")
+      );
+      if (hasStateMutation) {
+        requestStatus();
+      }
+    }
+
     renderScreen();
     return false;
   }

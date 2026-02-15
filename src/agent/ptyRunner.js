@@ -90,14 +90,18 @@ function buildPrompt(text, marker) {
 }
 
 function resolveCommand(agentType) {
+  const normalizedAgent = String(agentType || "").trim().toLowerCase();
   const rawCmd = String(process.env.UFOO_PTY_CMD || "").trim();
   if (rawCmd) {
     const rawArgs = String(process.env.UFOO_PTY_ARGS || "").trim();
     const args = rawArgs ? rawArgs.split(/\s+/).filter(Boolean) : [];
     return { command: rawCmd, args };
   }
-  if (agentType === "claude" || agentType === "claude-code") {
+  if (normalizedAgent === "claude" || normalizedAgent === "claude-code") {
     return { command: "claude", args: [] };
+  }
+  if (normalizedAgent === "ufoo" || normalizedAgent === "ucode" || normalizedAgent === "ufoo-code") {
+    return { command: "ucode", args: [] };
   }
   return { command: "codex", args: ["--no-alt-screen", "--sandbox", "workspace-write"] };
 }

@@ -2,7 +2,13 @@ const path = require("path");
 const blessed = require("blessed");
 const { execSync } = require("child_process");
 const fs = require("fs");
-const { loadConfig, saveConfig, normalizeLaunchMode, normalizeAgentProvider } = require("../config");
+const {
+  loadConfig,
+  saveConfig,
+  normalizeLaunchMode,
+  normalizeAgentProvider,
+  normalizeAssistantEngine,
+} = require("../config");
 const { socketPath, isRunning } = require("../daemon");
 const UfooInit = require("../init");
 const AgentActivator = require("../bus/activate");
@@ -28,6 +34,7 @@ const { createInputListenerController } = require("./inputListenerController");
 const { createDaemonMessageRouter } = require("./daemonMessageRouter");
 const { createChatLogController } = require("./chatLogController");
 const { createPasteController } = require("./pasteController");
+const { createCronScheduler } = require("./cronScheduler");
 const { createAgentViewController } = require("./agentViewController");
 const { createSettingsController } = require("./settingsController");
 const { createChatLayout } = require("./layout");
@@ -78,7 +85,14 @@ async function runChat(projectRoot) {
   const config = loadConfig(projectRoot);
   let launchMode = config.launchMode;
   let agentProvider = config.agentProvider;
+  let assistantEngine = normalizeAssistantEngine(config.assistantEngine);
   let autoResume = config.autoResume !== false;
+  let cronScheduler = {
+    addTask: () => null,
+    listTasks: () => [],
+    stopTask: () => false,
+    stopAll: () => 0,
+  };
 
   // Dynamic input height settings
   // Layout: topLine(1) + content + bottomLine(1) + dashboard(1)
@@ -305,6 +319,7 @@ async function runChat(projectRoot) {
     if (daemonCoordinator) {
       daemonCoordinator.markExit();
     }
+    cronScheduler.stopAll();
     exitAgentView();
     if (screen && screen.program && typeof screen.program.decrst === "function") {
       screen.program.decrst(2004);
@@ -322,6 +337,10 @@ async function runChat(projectRoot) {
     completionPanel,
     promptBox,
     commandRegistry: COMMAND_REGISTRY,
+    getMentionCandidates: () => activeAgents.map((id) => ({
+      id,
+      label: getAgentLabel(id),
+    })),
     normalizeCommandPrefix,
     truncateText,
     getCurrentInputHeight: () => currentInputHeight,
@@ -458,13 +477,24 @@ async function runChat(projectRoot) {
   let selectedAgentIndex = -1;  // -1 = not in dashboard selection mode
   let targetAgent = null;       // Selected agent for direct messaging
   let focusMode = "input";      // "input" or "dashboard"
-  let dashboardView = "agents"; // "agents" | "mode" | "provider"
+  let dashboardView = "agents"; // "agents" | "mode" | "provider" | "assistant" | "cron"
+  let reportPendingTotal = 0;
   let selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
   const providerOptions = [
     { label: "codex", value: "codex-cli" },
     { label: "claude", value: "claude-cli" },
   ];
   let selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
+  const assistantOptions = [
+    { label: "auto", value: "auto" },
+    { label: "codex", value: "codex" },
+    { label: "claude", value: "claude" },
+    { label: "ufoo", value: "ufoo" },
+  ];
+  let selectedAssistantIndex = Math.max(
+    0,
+    assistantOptions.findIndex((opt) => opt.value === assistantEngine)
+  );
   const resumeOptions = [
     { label: "Resume previous session", value: true },
     { label: "Start new session", value: false },
@@ -474,7 +504,9 @@ async function runChat(projectRoot) {
     agents: "←/→ select · Enter · ↓ mode · ↑ back",
     agentsEmpty: "↓ mode · ↑ back",
     mode: "←/→ select · Enter · ↓ provider · ↑ back",
-    provider: "←/→ select · Enter · ↑ back",
+    provider: "←/→ select · Enter · ↓ assistant · ↑ back",
+    assistant: "←/→ select · Enter · ↓ cron · ↑ back",
+    cron: "Ctrl+X close · ↑ back",
     resume: "",
   };
   const AGENT_BAR_HINTS = {
@@ -691,6 +723,21 @@ async function runChat(projectRoot) {
     daemonCoordinator.send(req);
   }
 
+  cronScheduler = createCronScheduler({
+    dispatch: ({ taskId, target, message }) => {
+      send({
+        type: IPC_REQUEST_TYPES.BUS_SEND,
+        target,
+        message,
+      });
+      queueStatusLine(`cron:${taskId} -> ${target}`);
+    },
+    onChange: () => {
+      renderDashboard();
+      screen.render();
+    },
+  });
+
   function updatePromptBox() {
     if (targetAgent) {
       const label = getAgentLabel(targetAgent);
@@ -773,6 +820,12 @@ async function runChat(projectRoot) {
     }
   }
 
+  function setAssistantEngine(value) {
+    if (settingsController) {
+      settingsController.setAssistantEngine(value);
+    }
+  }
+
   function setAutoResume(value) {
     if (settingsController) {
       settingsController.setAutoResume(value);
@@ -789,6 +842,7 @@ async function runChat(projectRoot) {
     saveConfig,
     normalizeLaunchMode,
     normalizeAgentProvider,
+    normalizeAssistantEngine,
     fsModule: fs,
     getUfooPaths,
     logMessage,
@@ -809,6 +863,14 @@ async function runChat(projectRoot) {
     setSelectedProviderIndex: (value) => {
       selectedProviderIndex = value;
     },
+    getAssistantEngine: () => assistantEngine,
+    setAssistantEngineState: (value) => {
+      assistantEngine = value;
+    },
+    setSelectedAssistantIndex: (value) => {
+      selectedAssistantIndex = value;
+    },
+    assistantOptions,
     getAutoResume: () => autoResume,
     setAutoResumeState: (value) => {
       autoResume = value;
@@ -837,12 +899,17 @@ async function runChat(projectRoot) {
       getAgentLabel,
       launchMode,
       agentProvider,
+      assistantEngine,
       autoResume,
       selectedModeIndex,
       selectedProviderIndex,
+      selectedAssistantIndex,
       selectedResumeIndex,
+      cronTasks: cronScheduler.listTasks(),
       providerOptions,
+      assistantOptions,
       resumeOptions,
+      pendingReports: reportPendingTotal,
       dashHints: DASH_HINTS,
     });
     agentListWindowStart = computed.windowStart;
@@ -851,6 +918,9 @@ async function runChat(projectRoot) {
 
   function updateDashboard(status) {
     activeAgents = status.active || [];
+    reportPendingTotal = Number.isFinite(status?.reports?.pending_total)
+      ? status.reports.pending_total
+      : 0;
     const metaList = Array.isArray(status.active_meta) ? status.active_meta : [];
     let fallbackMap = null;
     if (metaList.length === 0 && activeAgents.length > 0) {
@@ -912,6 +982,10 @@ async function runChat(projectRoot) {
     clampAgentWindow();
     selectedModeIndex = launchMode === "internal" ? 2 : (launchMode === "tmux" ? 1 : 0);
     selectedProviderIndex = agentProvider === "claude-cli" ? 1 : 0;
+    selectedAssistantIndex = Math.max(
+      0,
+      assistantOptions.findIndex((opt) => opt.value === assistantEngine)
+    );
     selectedResumeIndex = autoResume ? 0 : 1;
     // Immediately set @target when first agent is selected
     if (selectedAgentIndex >= 0 && selectedAgentIndex < activeAgents.length) {
@@ -936,11 +1010,15 @@ async function runChat(projectRoot) {
     activeAgentMetaMap: { get: () => activeAgentMetaMap },
     selectedModeIndex: { get: () => selectedModeIndex, set: (value) => { selectedModeIndex = value; } },
     selectedProviderIndex: { get: () => selectedProviderIndex, set: (value) => { selectedProviderIndex = value; } },
+    selectedAssistantIndex: { get: () => selectedAssistantIndex, set: (value) => { selectedAssistantIndex = value; } },
     selectedResumeIndex: { get: () => selectedResumeIndex, set: (value) => { selectedResumeIndex = value; } },
     launchMode: { get: () => launchMode },
     agentProvider: { get: () => agentProvider },
+    assistantEngine: { get: () => assistantEngine },
     autoResume: { get: () => autoResume },
+    cronTasks: { get: () => cronScheduler.listTasks() },
     providerOptions: { get: () => providerOptions },
+    assistantOptions: { get: () => assistantOptions },
     resumeOptions: { get: () => resumeOptions },
     agentOutputSuppressed: {
       get: () => getAgentOutputSuppressed(),
@@ -978,6 +1056,7 @@ async function runChat(projectRoot) {
     exitDashboardMode,
     setLaunchMode,
     setAgentProvider,
+    setAssistantEngine,
     setAutoResume,
     clampAgentWindow,
     clampAgentWindowWithSelection,
@@ -1144,6 +1223,10 @@ async function runChat(projectRoot) {
     restartDaemon,
     send,
     requestStatus,
+    createCronTask: ({ intervalMs, targets, prompt }) =>
+      cronScheduler.addTask({ intervalMs, targets, prompt }),
+    listCronTasks: () => cronScheduler.listTasks(),
+    stopCronTask: (id) => cronScheduler.stopTask(id),
     activateAgent: async (target) => {
       const activator = new AgentActivator(projectRoot);
       await activator.activate(target);
@@ -1173,6 +1256,11 @@ async function runChat(projectRoot) {
     escapeBlessed,
     markPendingDelivery,
     clearTargetAgent,
+    setTargetAgent: (agentId) => {
+      targetAgent = agentId || null;
+      updatePromptBox();
+      screen.render();
+    },
     enterAgentView,
     activateAgent: async (agentId) => {
       const activator = new AgentActivator(projectRoot);
@@ -1184,12 +1272,14 @@ async function runChat(projectRoot) {
       if (inputHistoryController) inputHistoryController.commitSubmittedText(text);
     },
     focusInput: () => input.focus(),
+    renderScreen: () => screen.render(),  // Add renderScreen callback
   });
 
   input.on("submit", async (value) => {
     input.clearValue();
-    screen.render();
+    screen.render(); // Render cleared input
     await inputSubmitHandler.handleSubmit(value);
+    // No need for second render - handleSubmit now calls renderScreen() internally
   });
 
   screen.key(["C-c"], exitHandler);

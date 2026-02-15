@@ -49,6 +49,16 @@ function createHarness(overrides = {}) {
     createContext: jest.fn(() => context),
     createSkills: jest.fn(() => skills),
     activateAgent: jest.fn().mockResolvedValue(undefined),
+    loadConfig: jest.fn(() => ({
+      ucodeProvider: "",
+      ucodeModel: "",
+      ucodeBaseUrl: "",
+      ucodeApiKey: "",
+    })),
+    saveConfig: jest.fn(),
+    createCronTask: jest.fn((payload) => ({ id: "c1", ...payload, summary: "c1@10s->codex:1: run" })),
+    listCronTasks: jest.fn(() => []),
+    stopCronTask: jest.fn(() => false),
     sleep: jest.fn(() => Promise.resolve()),
     schedule: jest.fn((fn) => fn()),
   };
@@ -162,6 +172,28 @@ describe("chat commandExecutor", () => {
     expect(logs.some((entry) => entry.text.includes("nickname requires count=1"))).toBe(true);
   });
 
+  test("handleLaunchCommand accepts ucode alias and sends ufoo launch", async () => {
+    const { executor, options } = createHarness();
+
+    await executor.handleLaunchCommand(["ucode", "nickname=core"]);
+
+    expect(options.send).toHaveBeenCalledWith({
+      type: "launch_agent",
+      agent: "ufoo",
+      count: 1,
+      nickname: "core",
+    });
+  });
+
+  test("handleLaunchCommand rejects ufoo alias input", async () => {
+    const { executor, options, logs } = createHarness();
+
+    await executor.handleLaunchCommand(["ufoo", "nickname=core2"]);
+
+    expect(options.send).not.toHaveBeenCalled();
+    expect(logs.some((entry) => entry.text.includes("Unknown agent type. Use: claude, codex, or ucode"))).toBe(true);
+  });
+
   test("handleResumeCommand supports list subcommand", async () => {
     const { executor, options, logs } = createHarness();
 
@@ -176,6 +208,56 @@ describe("chat commandExecutor", () => {
     expect(logs.some((entry) => entry.text.includes("Listing recoverable agents (codex-3)"))).toBe(true);
   });
 
+  test("handleCornCommand creates cron task with interval/targets/prompt", async () => {
+    const { executor, options, logs } = createHarness({
+      createCronTask: jest.fn((payload) => ({ id: "c7", ...payload })),
+    });
+
+    await executor.handleCornCommand([
+      "start",
+      "every=10s",
+      "target=codex:1,claude:2",
+      "prompt=run smoke",
+    ]);
+
+    expect(options.createCronTask).toHaveBeenCalledWith({
+      intervalMs: 10000,
+      targets: ["codex:1", "claude:2"],
+      prompt: "run smoke",
+    });
+    expect(logs.some((entry) => entry.text.includes("Cron started c7: every 10s"))).toBe(true);
+  });
+
+  test("handleCornCommand list and stop", async () => {
+    const { executor, options, logs } = createHarness({
+      listCronTasks: jest.fn(() => [
+        { id: "c1", summary: "c1@10s->codex:1: run smoke" },
+      ]),
+      stopCronTask: jest.fn((id) => id === "c1"),
+    });
+
+    await executor.handleCornCommand(["list"]);
+    await executor.handleCornCommand(["stop", "c1"]);
+
+    expect(options.listCronTasks).toHaveBeenCalled();
+    expect(options.stopCronTask).toHaveBeenCalledWith("c1");
+    expect(logs.some((entry) => entry.text.includes("c1@10s->codex:1: run smoke"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("Stopped cron task c1"))).toBe(true);
+  });
+
+  test("executeCommand routes /corn", async () => {
+    const { executor, options } = createHarness({
+      parseCommand: jest.fn(() => ({
+        command: "corn",
+        args: ["start", "every=5s", "target=codex:1", "prompt=ping"],
+      })),
+      createCronTask: jest.fn(() => ({ id: "c9", intervalMs: 5000, targets: ["codex:1"], prompt: "ping" })),
+    });
+
+    await expect(executor.executeCommand("/corn start every=5s target=codex:1 prompt=ping")).resolves.toBe(true);
+    expect(options.createCronTask).toHaveBeenCalled();
+  });
+
   test("handleDoctorCommand escapes thrown errors", async () => {
     const { executor, options, logs } = createHarness({
       createDoctor: jest.fn(() => ({ run: jest.fn(() => { throw new Error("boom"); }) })),
@@ -185,5 +267,87 @@ describe("chat commandExecutor", () => {
 
     expect(options.escapeBlessed).toHaveBeenCalledWith("boom");
     expect(logs.some((entry) => entry.text.includes("Doctor check failed: ESC(boom)"))).toBe(true);
+  });
+
+  test("handleUcodeConfigCommand show prints masked values", async () => {
+    const { executor, options, logs } = createHarness({
+      loadConfig: jest.fn(() => ({
+        ucodeProvider: "anthropic",
+        ucodeModel: "claude-opus-4-6",
+        ucodeBaseUrl: "https://api.example.invalid",
+        ucodeApiKey: "cr_1234567890abcdef",
+      })),
+    });
+
+    await executor.handleUcodeConfigCommand(["show"]);
+
+    expect(options.loadConfig).toHaveBeenCalledWith("/tmp/ufoo");
+    expect(logs.some((entry) => entry.text.includes("provider: anthropic"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("model: claude-opus-4-6"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("url: https://api.example.invalid"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("key: cr_1...cdef"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("transport: anthropic-messages"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("url supports generic gateway base"))).toBe(true);
+  });
+
+  test("handleUcodeConfigCommand set writes mapped fields", async () => {
+    const { executor, options, logs } = createHarness();
+
+    await executor.handleUcodeConfigCommand([
+      "set",
+      "provider=openai",
+      "model=gpt-5.1-codex",
+      "url=https://api.openai.com/v1",
+      "key=sk-secret-0000",
+    ]);
+
+    expect(options.saveConfig).toHaveBeenCalledWith("/tmp/ufoo", {
+      ucodeProvider: "openai",
+      ucodeModel: "gpt-5.1-codex",
+      ucodeBaseUrl: "https://api.openai.com/v1",
+      ucodeApiKey: "sk-secret-0000",
+    });
+    expect(logs.some((entry) => entry.text.includes("ucode config updated"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("key: sk-s...0000"))).toBe(true);
+    expect(logs.some((entry) => entry.text.includes("transport: openai-chat"))).toBe(true);
+  });
+
+  test("executeCommand does not route removed /ucodeconfig alias", async () => {
+    const { executor, options } = createHarness({
+      parseCommand: jest.fn(() => ({ command: "ucodeconfig", args: ["clear", "all"] })),
+    });
+
+    await expect(executor.executeCommand("/ucodeconfig clear all")).resolves.toBe(true);
+
+    expect(options.saveConfig).not.toHaveBeenCalled();
+  });
+
+  test("executeCommand routes /settings ucode to ucode config handler", async () => {
+    const { executor, options } = createHarness({
+      parseCommand: jest.fn(() => ({ command: "settings", args: ["ucode", "set", "provider=anthropic", "model=claude-opus-4-6"] })),
+    });
+
+    await expect(executor.executeCommand("/settings ucode set provider=anthropic model=claude-opus-4-6")).resolves.toBe(true);
+
+    expect(options.saveConfig).toHaveBeenCalledWith("/tmp/ufoo", {
+      ucodeProvider: "anthropic",
+      ucodeModel: "claude-opus-4-6",
+    });
+  });
+
+  test("handleSettingsCommand defaults /settings ucode to show", async () => {
+    const { executor, options, logs } = createHarness({
+      loadConfig: jest.fn(() => ({
+        ucodeProvider: "anthropic",
+        ucodeModel: "claude-opus-4-6",
+        ucodeBaseUrl: "",
+        ucodeApiKey: "",
+      })),
+    });
+
+    await executor.handleSettingsCommand(["ucode"]);
+
+    expect(options.loadConfig).toHaveBeenCalledWith("/tmp/ufoo");
+    expect(logs.some((entry) => entry.text.includes("ucode config:"))).toBe(true);
   });
 });

@@ -6,6 +6,8 @@ function createHarness(overrides = {}) {
     selectedModeIndex: 0,
     agentProvider: "codex-cli",
     selectedProviderIndex: 0,
+    assistantEngine: "auto",
+    selectedAssistantIndex: 0,
     autoResume: true,
     selectedResumeIndex: 0,
   };
@@ -20,6 +22,7 @@ function createHarness(overrides = {}) {
   const restartDaemon = jest.fn();
   const normalizeLaunchMode = jest.fn((value) => value);
   const normalizeAgentProvider = jest.fn((value) => value);
+  const normalizeAssistantEngine = jest.fn((value) => value);
   const getUfooPaths = jest.fn(() => ({ agentDir: "/tmp/agent-dir" }));
 
   const controller = createSettingsController({
@@ -27,6 +30,7 @@ function createHarness(overrides = {}) {
     saveConfig,
     normalizeLaunchMode,
     normalizeAgentProvider,
+    normalizeAssistantEngine,
     fsModule,
     getUfooPaths,
     logMessage,
@@ -47,6 +51,19 @@ function createHarness(overrides = {}) {
     setSelectedProviderIndex: (value) => {
       state.selectedProviderIndex = value;
     },
+    getAssistantEngine: () => state.assistantEngine,
+    setAssistantEngineState: (value) => {
+      state.assistantEngine = value;
+    },
+    setSelectedAssistantIndex: (value) => {
+      state.selectedAssistantIndex = value;
+    },
+    assistantOptions: [
+      { label: "auto", value: "auto" },
+      { label: "codex", value: "codex" },
+      { label: "claude", value: "claude" },
+      { label: "ufoo", value: "ufoo" },
+    ],
     getAutoResume: () => state.autoResume,
     setAutoResumeState: (value) => {
       state.autoResume = value;
@@ -118,6 +135,18 @@ describe("chat settingsController", () => {
     expect(state.autoResume).toBe(false);
     expect(state.selectedResumeIndex).toBe(1);
     expect(saveConfig).toHaveBeenCalledWith("/repo", { autoResume: false });
+    expect(restartDaemon).not.toHaveBeenCalled();
+  });
+
+  test("setAssistantEngine updates config without daemon restart", () => {
+    const { controller, state, saveConfig, restartDaemon } = createHarness();
+
+    const changed = controller.setAssistantEngine("ufoo");
+
+    expect(changed).toBe(true);
+    expect(state.assistantEngine).toBe("ufoo");
+    expect(state.selectedAssistantIndex).toBe(3);
+    expect(saveConfig).toHaveBeenCalledWith("/repo", { assistantEngine: "ufoo" });
     expect(restartDaemon).not.toHaveBeenCalled();
   });
 });

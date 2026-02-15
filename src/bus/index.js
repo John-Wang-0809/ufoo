@@ -131,7 +131,7 @@ class EventBus {
   /**
    * 加入总线
    */
-  async join(sessionId, agentType, nickname = null) {
+  async join(sessionId, agentType, nickname = null, options = {}) {
     this.ensureBus();
     this.loadBusData();
 
@@ -167,7 +167,8 @@ class EventBus {
     const result = await this.subscriberManager.join(
       sessionId,
       agentType,
-      nickname
+      nickname,
+      options
     );
 
     this.saveBusData();

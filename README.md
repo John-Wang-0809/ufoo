@@ -6,7 +6,7 @@ Multi-agent AI collaboration toolkit for Claude Code and OpenAI Codex.
 
 - **Event Bus** - Real-time inter-agent messaging (`ufoo bus`)
 - **Context Sharing** - Shared decisions and project context (`ufoo ctx`)
-- **Agent Wrappers** - Auto-initialization for Claude Code (`uclaude`) and Codex (`ucodex`)
+- **Agent Wrappers** - Auto-initialization for Claude Code (`uclaude`), Codex (`ucodex`), and ufoo core (`ucode`)
   - **PTY Wrapper** - Intelligent terminal emulation with ready detection
   - **Smart Probe Injection** - Waits for agent initialization before injecting commands
 - **Skills System** - Extensible agent capabilities (`ufoo skills`)
@@ -25,7 +25,45 @@ ufoo init
 # Or use agent wrappers (auto-init + bus join)
 uclaude   # instead of 'claude'
 ucodex    # instead of 'codex'
+ucode     # ufoo self-developed coding agent entry
 ```
+
+To import a local `pi-mono` checkout as a reference snapshot (reference-only):
+
+```bash
+npm run import:pi-mono -- /path/to/pi-mono
+```
+
+Native self-developed implementation lives under `src/code`.
+
+Prepare and verify `ucode` runtime wiring:
+
+```bash
+ufoo ucode doctor
+ufoo ucode prepare
+ufoo ucode build
+```
+
+Try native core queue runtime (WIP):
+
+```bash
+ucode-core submit --tool read --args-json '{"path":"README.md"}'
+ucode-core run-once --json
+ucode-core list --json
+```
+
+Configure `ucode` provider/model/API in `.ufoo/config.json` (ufoo-managed):
+
+```json
+{
+  "ucodeProvider": "openai",
+  "ucodeModel": "gpt-5.1-codex",
+  "ucodeBaseUrl": "https://api.openai.com/v1",
+  "ucodeApiKey": "sk-***"
+}
+```
+
+`ucode` writes these into a dedicated runtime directory (`.ufoo/agent/ucode/pi-agent`) and uses them for native planner/engine calls.
 
 ## Architecture
 
@@ -58,7 +96,7 @@ Bus state lives in `.ufoo/agent/all-agents.json` (metadata), `.ufoo/bus/*` (queu
 | `ufoo daemon --start|--stop|--status` | Manage ufoo daemon |
 | `ufoo chat` | Launch ufoo chat UI (also default when no args) |
 | `ufoo resume [nickname]` | Resume agent sessions (optional nickname) |
-| `ufoo bus join` | Join event bus (auto by uclaude/ucodex) |
+| `ufoo bus join` | Join event bus (auto by uclaude/ucodex/ucode) |
 | `ufoo bus send <id> <msg>` | Send message to agent |
 | `ufoo bus check <id>` | Check pending messages |
 | `ufoo bus status` | Show bus status |
@@ -78,12 +116,14 @@ ufoo/
 │   ├── ufoo         # Main CLI entry (bash)
 │   ├── ufoo.js      # Node wrapper
 │   ├── uclaude      # Claude Code wrapper
-│   └── ucodex       # Codex wrapper
+│   ├── ucodex       # Codex wrapper
+│   └── ucode        # ufoo core wrapper
 ├── SKILLS/          # Global skills (uinit, ustatus)
 ├── src/
 │   ├── bus/         # Event bus implementation (JS)
 │   ├── daemon/      # Daemon + chat bridge
-│   └── agent/       # Agent launch/runtime
+│   ├── agent/       # Agent launch/runtime
+│   └── code/        # Native ucode core implementation
 ├── scripts/         # Legacy helpers (bash, deprecated)
 ├── modules/
 │   ├── context/     # Decision/context protocol

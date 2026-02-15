@@ -9,6 +9,7 @@ const { isAgentPidAlive } = require("../bus/utils");
 const { showBanner } = require("../utils/banner");
 const AgentNotifier = require("./notifier");
 const { getUfooPaths } = require("../ufoo/paths");
+const { createTerminalAdapterRouter } = require("../terminal/adapterRouter");
 const PtyWrapper = require("./ptyWrapper");
 const ReadyDetector = require("./readyDetector");
 
@@ -31,6 +32,21 @@ async function connectWithRetry(sockPath, retries, delayMs) {
     }
   }
   return null;
+}
+
+async function probeDaemonSocket(sockPath) {
+  try {
+    const client = await connectSocket(sockPath);
+    try {
+      client.end();
+      client.destroy();
+    } catch {
+      // ignore cleanup errors
+    }
+    return { ok: true, code: "" };
+  } catch (err) {
+    return { ok: false, code: err && err.code ? err.code : "" };
+  }
 }
 
 function normalizeTty(ttyPath) {
@@ -138,6 +154,12 @@ function resolveLaunchMode() {
   return "terminal";
 }
 
+function shouldShowLaunchBanner(agentType = "") {
+  if (process.env.UFOO_SUPPRESS_LAUNCHER_BANNER === "1") return false;
+  void agentType;
+  return true;
+}
+
 /**
  * Agent 启动器
  * 统一处理 agent 启动流程：初始化、daemon 注册、banner、命令执行
@@ -211,19 +233,34 @@ class AgentLauncher {
    * 确保 daemon 正在运行
    */
   async ensureDaemon() {
-    const pidFile = getUfooPaths(this.cwd).ufooDaemonPid;
+    const paths = getUfooPaths(this.cwd);
+    const pidFile = paths.ufooDaemonPid;
+    const sockFile = paths.ufooSock;
 
-    if (fs.existsSync(pidFile)) {
-      const pidStr = fs.readFileSync(pidFile, "utf8").trim();
-      if (pidStr) {
-        const pid = parseInt(pidStr, 10);
-        try {
-          process.kill(pid, 0); // Check if alive
-          return "running";
-        } catch {
-          // Dead, start new
-        }
-      }
+    const existingProbe = await probeDaemonSocket(sockFile);
+    if (existingProbe.ok) return "running";
+    if (existingProbe.code === "EPERM" && fs.existsSync(pidFile)) {
+      // Sandbox may deny socket connect probes; keep prior behavior.
+      return "running";
+    }
+
+    // Stale daemon runtime markers can block restart with false-positive "running".
+    // Clean local runtime markers only when socket probe failed.
+    try {
+      if (fs.existsSync(pidFile)) fs.unlinkSync(pidFile);
+    } catch {
+      // ignore
+    }
+    try {
+      if (fs.existsSync(sockFile)) fs.unlinkSync(sockFile);
+    } catch {
+      // ignore
+    }
+    try {
+      const lockFile = path.join(paths.runDir, "daemon.lock");
+      if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+    } catch {
+      // ignore
     }
 
     // Start daemon using correct command
@@ -233,23 +270,23 @@ class AgentLauncher {
       detached: true,
     });
 
-    // Wait for daemon socket to be ready
-    const sockFile = getUfooPaths(this.cwd).ufooSock;
+    // Wait for daemon socket to be ready and reachable
+    let lastProbeCode = "";
     for (let i = 0; i < 30; i++) {
-      if (fs.existsSync(sockFile)) {
-        try {
-          const stat = fs.statSync(sockFile);
-          if (stat.isSocket()) {
-            break;
-          }
-        } catch {
-          // Continue waiting
-        }
+      const probe = await probeDaemonSocket(sockFile);
+      if (probe.ok) {
+        return "started";
       }
+      if (probe.code === "EPERM" && fs.existsSync(pidFile)) {
+        return "started";
+      }
+      lastProbeCode = probe.code || lastProbeCode;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
-    return "started";
+    throw new Error(
+      `Failed to start ufoo daemon${lastProbeCode ? ` (${lastProbeCode})` : ""}`
+    );
   }
 
   /**
@@ -423,17 +460,22 @@ class AgentLauncher {
       if (finalNickname) process.env.UFOO_NICKNAME = finalNickname;
       process.env.UFOO_AGENT_TYPE = this.agentType;
 
-      // 5. 显示 banner
-      showBanner({
-        agentType: this.agentType,
-        sessionId,
-        nickname: finalNickname,
-        daemonStatus,
-      });
+      // 5. 显示 banner（ucode 自带 TUI banner，这里避免重复）
+      if (shouldShowLaunchBanner(this.agentType)) {
+        showBanner({
+          agentType: this.agentType,
+          sessionId,
+          nickname: finalNickname,
+          daemonStatus,
+        });
+      }
 
-      // 6. 启动消息通知监听器
-      const notifier = new AgentNotifier(this.cwd, subscriberId);
-      notifier.start();
+      // 6. 启动消息通知监听器（ufoo-code 改为内部 bus 轮询消费）
+      const shouldStartNotifier = String(this.agentType || "").trim().toLowerCase() !== "ufoo-code";
+      if (shouldStartNotifier) {
+        const notifier = new AgentNotifier(this.cwd, subscriberId);
+        notifier.start();
+      }
 
       // 7. 启动命令（PTY wrapper或直接spawn）
 
@@ -600,6 +642,11 @@ class AgentLauncher {
                 try {
                   const req = JSON.parse(line);
                   if (req.type === "inject" && req.command) {
+                    const normalizedAgentType = String(this.agentType || "").trim().toLowerCase();
+                    if (normalizedAgentType === "ufoo-code" || normalizedAgentType === "ucode" || normalizedAgentType === "ufoo") {
+                      client.write(JSON.stringify({ ok: false, error: "inject disabled for ufoo-code (internal bus loop)" }) + "\n");
+                      continue;
+                    }
                     // 注入命令到PTY（带延迟确保输入完成）
                     wrapper.write(req.command);
                     setTimeout(() => {

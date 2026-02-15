@@ -17,6 +17,7 @@ function createDashboardKeyController(options = {}) {
     exitDashboardMode = () => {},
     setLaunchMode = () => {},
     setAgentProvider = () => {},
+    setAssistantEngine = () => {},
     setAutoResume = () => {},
     clampAgentWindow = () => {},
     clampAgentWindowWithSelection = () => {},
@@ -228,7 +229,11 @@ function createDashboardKeyController(options = {}) {
     }
 
     if (key.name === "down") {
-      // Resume setting is no longer part of dashboard navigation.
+      state.dashboardView = "assistant";
+      const list = Array.isArray(state.assistantOptions) ? state.assistantOptions : [];
+      const nextIndex = list.findIndex((opt) => opt.value === state.assistantEngine);
+      state.selectedAssistantIndex = nextIndex >= 0 ? nextIndex : 0;
+      renderDashboardAndScreen();
       return true;
     }
 
@@ -246,6 +251,84 @@ function createDashboardKeyController(options = {}) {
     }
 
     if (key.name === "escape") {
+      exitDashboardMode(false);
+      return true;
+    }
+
+    return true;
+  }
+
+  function handleAssistantKey(key) {
+    const options = Array.isArray(state.assistantOptions) ? state.assistantOptions : [];
+    if (options.length === 0) {
+      if (key.name === "up") {
+        state.dashboardView = "provider";
+        renderDashboardAndScreen();
+        return true;
+      }
+      if (key.name === "escape" || key.name === "enter" || key.name === "return") {
+        exitDashboardMode(false);
+        return true;
+      }
+      return true;
+    }
+
+    if (key.name === "left") {
+      state.selectedAssistantIndex = state.selectedAssistantIndex <= 0
+        ? options.length - 1
+        : state.selectedAssistantIndex - 1;
+      renderDashboardAndScreen();
+      return true;
+    }
+
+    if (key.name === "right") {
+      state.selectedAssistantIndex = state.selectedAssistantIndex >= options.length - 1
+        ? 0
+        : state.selectedAssistantIndex + 1;
+      renderDashboardAndScreen();
+      return true;
+    }
+
+    if (key.name === "up") {
+      state.dashboardView = "provider";
+      renderDashboardAndScreen();
+      return true;
+    }
+
+    if (key.name === "down") {
+      state.dashboardView = "cron";
+      renderDashboardAndScreen();
+      return true;
+    }
+
+    if (key.name === "enter" || key.name === "return") {
+      const selected = options[state.selectedAssistantIndex];
+      if (selected) setAssistantEngine(selected.value);
+      exitDashboardMode(false);
+      return true;
+    }
+
+    if (key.name === "escape") {
+      exitDashboardMode(false);
+      return true;
+    }
+
+    return true;
+  }
+
+  function handleCronKey(key) {
+    if (key.name === "up") {
+      state.dashboardView = "assistant";
+      renderDashboardAndScreen();
+      return true;
+    }
+
+    if (key.name === "x" && key.ctrl) {
+      exitDashboardMode(false);
+      return true;
+    }
+
+    if (key.name === "escape" || key.name === "enter" || key.name === "return") {
       exitDashboardMode(false);
       return true;
     }
@@ -380,7 +463,9 @@ function createDashboardKeyController(options = {}) {
 
     if (state.dashboardView === "mode") return handleModeKey(key);
     if (state.dashboardView === "provider") return handleProviderKey(key);
+    if (state.dashboardView === "assistant") return handleAssistantKey(key);
     if (state.dashboardView === "resume") return handleResumeKey(key);
+    if (state.dashboardView === "cron") return handleCronKey(key);
 
     return handleAgentsKey(key);
   }

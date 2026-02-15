@@ -181,6 +181,41 @@ describe("ReadyDetector", () => {
     });
   });
 
+  describe("ufoo-code detection", () => {
+    test("should detect ucode prompt", () => {
+      const detector = new ReadyDetector("ufoo-code");
+      let readyCalled = false;
+      detector.onReady(() => {
+        readyCalled = true;
+      });
+
+      detector.processOutput("ucode> ");
+      expect(readyCalled).toBe(true);
+    });
+
+    test("should detect pi-mono prompt", () => {
+      const detector = new ReadyDetector("ufoo-code");
+      let readyCalled = false;
+      detector.onReady(() => {
+        readyCalled = true;
+      });
+
+      detector.processOutput("pi-mono> ");
+      expect(readyCalled).toBe(true);
+    });
+
+    test("should not detect false positive from inline > symbol", () => {
+      const detector = new ReadyDetector("ufoo-code");
+      let readyCalled = false;
+      detector.onReady(() => {
+        readyCalled = true;
+      });
+
+      detector.processOutput("expression: a > b\n");
+      expect(readyCalled).toBe(false);
+    });
+  });
+
   describe("edge cases", () => {
     test("should handle Buffer input", () => {
       const detector = new ReadyDetector("claude-code");

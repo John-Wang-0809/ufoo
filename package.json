@@ -1,6 +1,6 @@
 {
   "name": "u-foo",
-  "version": "1.0.6",
+  "version": "1.1.8",
   "description": "Multi-Agent Workspace Protocol. Just add u. claude → uclaude, codex → ucodex.",
   "license": "SEE LICENSE IN LICENSE",
   "homepage": "https://ufoo.dev",
@@ -18,7 +18,11 @@
   "bin": {
     "ufoo": "bin/ufoo.js",
     "uclaude": "bin/uclaude.js",
-    "ucodex": "bin/ucodex.js"
+    "ucodex": "bin/ucodex.js",
+    "ucode": "bin/ucode.js",
+    "ucode-core": "bin/ucode-core.js",
+    "ufoo-assistant-agent": "bin/ufoo-assistant-agent.js",
+    "ufoo-engine": "bin/ufoo-engine.js"
   },
   "files": [
     "bin/",
@@ -36,6 +40,7 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
+    "import:pi-mono": "node scripts/import-pi-mono.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"

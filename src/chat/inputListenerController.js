@@ -39,6 +39,11 @@ function createInputListenerController(options = {}) {
     throw new Error("createInputListenerController requires completionController");
   }
 
+  function shouldShowCompletion(value = "") {
+    const text = String(value || "");
+    return text.startsWith("/") || text.startsWith("@");
+  }
+
   function render(textarea) {
     if (textarea && textarea.screen && typeof textarea.screen.render === "function") {
       textarea.screen.render();
@@ -64,6 +69,10 @@ function createInputListenerController(options = {}) {
     if (key && key.ctrl && keyName === "x") {
       const focusMode = getFocusMode();
       const dashboardView = getDashboardView();
+      if (focusMode === "dashboard" && dashboardView !== "agents") {
+        handleDashboardKey(key);
+        return;
+      }
       const selectedAgentIndex = getSelectedAgentIndex();
       const activeAgents = getActiveAgents();
       const targetAgent = getTargetAgent();
@@ -236,7 +245,7 @@ function createInputListenerController(options = {}) {
         updateCursor(textarea);
         updateDraftFromInput();
 
-        if (textarea.value.startsWith("/")) {
+        if (shouldShowCompletion(textarea.value)) {
           completionController.show(textarea.value);
         } else {
           completionController.hide();
@@ -275,7 +284,7 @@ function createInputListenerController(options = {}) {
       updateCursor(textarea);
       updateDraftFromInput();
 
-      if (textarea.value.startsWith("/")) {
+      if (shouldShowCompletion(textarea.value)) {
         completionController.show(textarea.value);
       } else if (completionController.isActive()) {
         completionController.hide();

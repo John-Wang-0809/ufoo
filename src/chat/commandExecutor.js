@@ -2,6 +2,9 @@ const path = require("path");
 const EventBus = require("../bus");
 const { IPC_REQUEST_TYPES } = require("../shared/eventContract");
 const UfooInit = require("../init");
+const { loadConfig: loadProjectConfig, saveConfig: saveProjectConfig } = require("../config");
+const { resolveTransport } = require("../code/nativeRunner");
+const { parseIntervalMs, formatIntervalMs } = require("./cronScheduler");
 
 function defaultCreateDoctor(projectRoot) {
   const UfooDoctor = require("../doctor");
@@ -59,6 +62,11 @@ function createCommandExecutor(options = {}) {
     createContext = defaultCreateContext,
     createSkills = defaultCreateSkills,
     activateAgent = async () => {},
+    loadConfig = loadProjectConfig,
+    saveConfig = saveProjectConfig,
+    createCronTask = () => null,
+    listCronTasks = () => [],
+    stopCronTask = () => false,
     sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     schedule = (fn, ms) => setTimeout(fn, ms),
   } = options;
@@ -342,15 +350,16 @@ function createCommandExecutor(options = {}) {
 
   async function handleLaunchCommand(args = []) {
     if (args.length === 0) {
-      logMessage("error", "{white-fg}✗{/white-fg} Usage: /launch <claude|codex> [nickname=<name>] [count=<n>]");
+      logMessage("error", "{white-fg}✗{/white-fg} Usage: /launch <claude|codex|ucode> [nickname=<name>] [count=<n>]");
       return;
     }
 
-    const agentType = args[0];
-    if (agentType !== "claude" && agentType !== "codex") {
-      logMessage("error", "{white-fg}✗{/white-fg} Unknown agent type. Use: claude or codex");
+    const agentType = String(args[0] || "").trim().toLowerCase();
+    if (agentType !== "claude" && agentType !== "codex" && agentType !== "ucode") {
+      logMessage("error", "{white-fg}✗{/white-fg} Unknown agent type. Use: claude, codex, or ucode");
       return;
     }
+    const normalizedAgent = agentType === "ucode" ? "ufoo" : agentType;
 
     const parsedOptions = {};
     for (let i = 1; i < args.length; i += 1) {
@@ -370,10 +379,10 @@ function createCommandExecutor(options = {}) {
 
     try {
       const label = nickname ? ` (${nickname})` : "";
-      logMessage("system", `{white-fg}⚙{/white-fg} Launching ${agentType}${label}...`);
+      logMessage("system", `{white-fg}⚙{/white-fg} Launching ${normalizedAgent}${label}...`);
       send({
         type: IPC_REQUEST_TYPES.LAUNCH_AGENT,
-        agent: agentType,
+        agent: normalizedAgent,
         count: Number.isFinite(count) ? count : 1,
         nickname,
       });
@@ -399,6 +408,228 @@ function createCommandExecutor(options = {}) {
     logMessage("system", `{white-fg}⚙{/white-fg} Resuming agents${label}...`);
     send({ type: IPC_REQUEST_TYPES.RESUME_AGENTS, target });
     schedule(requestStatus, 1000);
+  }
+
+  function parseCronTargets(raw = "") {
+    return String(raw || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  async function handleCornCommand(args = []) {
+    const action = String(args[0] || "").trim().toLowerCase();
+    if (action === "list" || action === "ls") {
+      const tasks = Array.isArray(listCronTasks()) ? listCronTasks() : [];
+      if (tasks.length === 0) {
+        logMessage("system", "{cyan-fg}Cron:{/cyan-fg} none");
+        return;
+      }
+      logMessage("system", `{cyan-fg}Cron:{/cyan-fg} ${tasks.length} task(s)`);
+      for (const task of tasks) {
+        logMessage("system", `  • ${task.summary || task.id}`);
+      }
+      return;
+    }
+
+    if (action === "stop" || action === "rm" || action === "remove") {
+      const target = String(args[1] || "").trim();
+      if (!target) {
+        logMessage("error", "{white-fg}✗{/white-fg} Usage: /corn stop <id|all>");
+        return;
+      }
+      if (target === "all") {
+        const tasks = Array.isArray(listCronTasks()) ? listCronTasks() : [];
+        let stopped = 0;
+        for (const task of tasks) {
+          if (task && task.id && stopCronTask(task.id)) stopped += 1;
+        }
+        logMessage("system", `{white-fg}✓{/white-fg} Stopped ${stopped} cron task(s)`);
+        return;
+      }
+      if (!stopCronTask(target)) {
+        logMessage("error", `{white-fg}✗{/white-fg} Cron task not found: ${target}`);
+        return;
+      }
+      logMessage("system", `{white-fg}✓{/white-fg} Stopped cron task ${target}`);
+      return;
+    }
+
+    const startArgs = action === "start" ? args.slice(1) : args;
+    const kv = parseUcodeConfigKv(startArgs);
+    const nonKvParts = startArgs.filter((item) => !String(item || "").includes("="));
+
+    const intervalRaw = String(
+      kv.every || kv.interval || kv.interval_ms || kv.ms || ""
+    ).trim();
+    const targetsRaw = String(
+      kv.target || kv.targets || kv.agent || kv.agents || ""
+    ).trim();
+    const prompt = String(
+      kv.prompt || kv.message || kv.msg || nonKvParts.join(" ") || ""
+    ).trim();
+
+    if (!intervalRaw || !targetsRaw || !prompt) {
+      logMessage(
+        "error",
+        "{white-fg}✗{/white-fg} Usage: /corn start every=<10s|5m> target=<agent1,agent2> prompt=\"...\""
+      );
+      return;
+    }
+
+    const intervalMs = parseIntervalMs(intervalRaw);
+    if (!Number.isFinite(intervalMs) || intervalMs < 1000) {
+      logMessage("error", "{white-fg}✗{/white-fg} Invalid interval (min 1s)");
+      return;
+    }
+
+    const targets = parseCronTargets(targetsRaw);
+    if (targets.length === 0) {
+      logMessage("error", "{white-fg}✗{/white-fg} At least one target agent is required");
+      return;
+    }
+
+    const task = createCronTask({
+      intervalMs,
+      targets,
+      prompt,
+    });
+    if (!task) {
+      logMessage("error", "{white-fg}✗{/white-fg} Failed to create cron task");
+      return;
+    }
+
+    logMessage(
+      "system",
+      `{white-fg}✓{/white-fg} Cron started ${task.id}: every ${formatIntervalMs(intervalMs)} -> ${targets.join(", ")}`
+    );
+  }
+
+  async function handleSettingsCommand(args = []) {
+    const section = String(args[0] || "").trim().toLowerCase();
+    if (!section) {
+      logMessage("error", "{white-fg}✗{/white-fg} Usage: /settings ucode [show|set|clear ...]");
+      return;
+    }
+
+    if (section === "ucode") {
+      const subArgs = args.slice(1);
+      if (subArgs.length === 0) {
+        await handleUcodeConfigCommand(["show"]);
+      } else {
+        await handleUcodeConfigCommand(subArgs);
+      }
+      return;
+    }
+
+    logMessage("error", "{white-fg}✗{/white-fg} Unknown settings section. Use: ucode");
+  }
+
+  function parseUcodeConfigKv(args = []) {
+    const parsed = {};
+    for (const raw of args) {
+      if (!raw || !String(raw).includes("=")) continue;
+      const [keyRaw, ...valueParts] = String(raw).split("=");
+      const key = String(keyRaw || "").trim().toLowerCase();
+      const value = valueParts.join("=").trim();
+      if (!key) continue;
+      parsed[key] = value;
+    }
+    return parsed;
+  }
+
+  function maskSecret(value = "") {
+    const text = String(value || "");
+    if (!text) return "(unset)";
+    if (text.length <= 8) return "***";
+    return `${text.slice(0, 4)}...${text.slice(-4)}`;
+  }
+
+  function inferUcodeTransport(provider = "", url = "") {
+    return resolveTransport({
+      provider: String(provider || "").trim(),
+      baseUrl: String(url || "").trim(),
+    });
+  }
+
+  async function handleUcodeConfigCommand(args = []) {
+    const first = String(args[0] || "").trim().toLowerCase();
+    const hasInlineKv = args.some((item) => String(item || "").includes("="));
+    const action = (!first || hasInlineKv) ? "set" : first;
+
+    if (action === "show" || action === "status") {
+      const config = loadConfig(projectRoot) || {};
+      const provider = String(config.ucodeProvider || "").trim();
+      const model = String(config.ucodeModel || "").trim();
+      const url = String(config.ucodeBaseUrl || "").trim();
+      const key = String(config.ucodeApiKey || "").trim();
+      const transport = inferUcodeTransport(provider, url);
+      logMessage("system", "{cyan-fg}ucode config:{/cyan-fg}");
+      logMessage("system", `  • provider: ${provider || "(unset)"}`);
+      logMessage("system", `  • model: ${model || "(unset)"}`);
+      logMessage("system", `  • url: ${url || "(unset)"}`);
+      logMessage("system", `  • key: ${maskSecret(key)}`);
+      logMessage("system", `  • transport: ${transport} (auto)`);
+      logMessage("system", "  • tip: url supports generic gateway base, transport is auto-detected");
+      return;
+    }
+
+    if (action === "set") {
+      const kvArgs = hasInlineKv ? args : args.slice(1);
+      const kv = parseUcodeConfigKv(kvArgs);
+      const updates = {};
+      if (Object.prototype.hasOwnProperty.call(kv, "provider")) updates.ucodeProvider = String(kv.provider || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "model")) updates.ucodeModel = String(kv.model || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "url")) updates.ucodeBaseUrl = String(kv.url || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "baseurl")) updates.ucodeBaseUrl = String(kv.baseurl || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "base_url")) updates.ucodeBaseUrl = String(kv.base_url || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "key")) updates.ucodeApiKey = String(kv.key || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "apikey")) updates.ucodeApiKey = String(kv.apikey || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "api_key")) updates.ucodeApiKey = String(kv.api_key || "").trim();
+      if (Object.prototype.hasOwnProperty.call(kv, "token")) updates.ucodeApiKey = String(kv.token || "").trim();
+
+      if (Object.keys(updates).length === 0) {
+        logMessage("error", "{white-fg}✗{/white-fg} Usage: /settings ucode set provider=<openai|anthropic> model=<id> url=<baseUrl> key=<apiKey>");
+        return;
+      }
+      saveConfig(projectRoot, updates);
+      logMessage("system", "{white-fg}✓{/white-fg} ucode config updated");
+      if (Object.prototype.hasOwnProperty.call(updates, "ucodeProvider")) {
+        logMessage("system", `  • provider: ${updates.ucodeProvider || "(unset)"}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, "ucodeModel")) {
+        logMessage("system", `  • model: ${updates.ucodeModel || "(unset)"}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, "ucodeBaseUrl")) {
+        logMessage("system", `  • url: ${updates.ucodeBaseUrl || "(unset)"}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(updates, "ucodeApiKey")) {
+        logMessage("system", `  • key: ${maskSecret(updates.ucodeApiKey)}`);
+      }
+      const nextConfig = loadConfig(projectRoot) || {};
+      logMessage("system", `  • transport: ${inferUcodeTransport(nextConfig.ucodeProvider, nextConfig.ucodeBaseUrl)} (auto)`);
+      return;
+    }
+
+    if (action === "clear") {
+      const fieldsRaw = args.slice(1).map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
+      const fields = fieldsRaw.length === 0 ? ["all"] : fieldsRaw;
+      const updates = {};
+      const clearAll = fields.includes("all");
+      if (clearAll || fields.includes("provider")) updates.ucodeProvider = "";
+      if (clearAll || fields.includes("model")) updates.ucodeModel = "";
+      if (clearAll || fields.includes("url") || fields.includes("baseurl") || fields.includes("base_url")) updates.ucodeBaseUrl = "";
+      if (clearAll || fields.includes("key") || fields.includes("apikey") || fields.includes("api_key") || fields.includes("token")) updates.ucodeApiKey = "";
+      if (Object.keys(updates).length === 0) {
+        logMessage("error", "{white-fg}✗{/white-fg} Usage: /settings ucode clear [provider|model|url|key|all]");
+        return;
+      }
+      saveConfig(projectRoot, updates);
+      logMessage("system", "{white-fg}✓{/white-fg} ucode config cleared");
+      return;
+    }
+
+    logMessage("error", "{white-fg}✗{/white-fg} Unknown settings ucode action. Use: show, set, clear");
   }
 
   async function executeCommand(text) {
@@ -435,6 +666,12 @@ function createCommandExecutor(options = {}) {
       case "resume":
         await handleResumeCommand(args);
         return true;
+      case "corn":
+        await handleCornCommand(args);
+        return true;
+      case "settings":
+        await handleSettingsCommand(args);
+        return true;
       default:
         logMessage("error", `{white-fg}✗{/white-fg} Unknown command: /${command}`);
         return true;
@@ -452,6 +689,9 @@ function createCommandExecutor(options = {}) {
     handleSkillsCommand,
     handleLaunchCommand,
     handleResumeCommand,
+    handleCornCommand,
+    handleSettingsCommand,
+    handleUcodeConfigCommand,
   };
 }
 

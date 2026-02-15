@@ -106,6 +106,16 @@ describe('MessageManager', () => {
       expect(targets).toEqual(['claude-code:abc123']);
     });
 
+    it('should resolve exact subscriber id even without colon', () => {
+      busData.agents['ufoo-agent'] = {
+        agent_type: 'codex',
+        nickname: 'ufoo-agent',
+        status: 'active',
+      };
+      const targets = manager.resolveTarget('ufoo-agent');
+      expect(targets).toEqual(['ufoo-agent']);
+    });
+
     it('should resolve nickname to subscriber', () => {
       const targets = manager.resolveTarget('architect');
       expect(targets).toEqual(['claude-code:abc123']);
@@ -115,6 +125,21 @@ describe('MessageManager', () => {
       const targets = manager.resolveTarget('codex');
       expect(targets).toEqual(['codex:xyz789']);
       expect(targets).not.toContain('codex:def456'); // inactive
+    });
+
+    it('should resolve alias "claude" to claude-code subscribers', () => {
+      const targets = manager.resolveTarget('claude');
+      expect(targets).toEqual(['claude-code:abc123']);
+    });
+
+    it('should resolve alias "ufoo" to ufoo-code subscribers', () => {
+      busData.agents['ufoo-code:core001'] = {
+        agent_type: 'ufoo-code',
+        nickname: 'ufoo-1',
+        status: 'active',
+      };
+      const targets = manager.resolveTarget('ufoo');
+      expect(targets).toEqual(['ufoo-code:core001']);
     });
 
     it('should resolve wildcard to all active subscribers', () => {
@@ -157,6 +182,16 @@ describe('MessageManager', () => {
 
     it('should match agent type', () => {
       expect(manager.targetMatches('codex', 'codex:xyz789')).toBe(true);
+    });
+
+    it('should match ufoo aliases to ufoo-code agent type', () => {
+      busData.agents['ufoo-code:core001'] = {
+        agent_type: 'ufoo-code',
+        nickname: 'ufoo-1',
+        status: 'active',
+      };
+      expect(manager.targetMatches('ufoo', 'ufoo-code:core001')).toBe(true);
+      expect(manager.targetMatches('ucode', 'ufoo-code:core001')).toBe(true);
     });
 
     it('should match nickname', () => {
@@ -436,6 +471,16 @@ describe('MessageManager', () => {
       const result = await manager.resolve('codex:xyz789', 'claude');
 
       expect(result.single).toBe('claude-code:abc123');
+    });
+
+    it('should support "ufoo" alias for "ufoo-code"', async () => {
+      busData.agents['ufoo-code:core001'] = {
+        agent_type: 'ufoo-code',
+        nickname: 'ufoo-1',
+        status: 'active',
+      };
+      const result = await manager.resolve('codex:xyz789', 'ufoo');
+      expect(result.single).toBe('ufoo-code:core001');
     });
 
     it('should include candidate metadata', async () => {

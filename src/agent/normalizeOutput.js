@@ -3,7 +3,7 @@ function extractTextFromObject(obj) {
   if (obj.structured_output && typeof obj.structured_output === "object") {
     return JSON.stringify(obj.structured_output);
   }
-  const candidates = ["output", "text", "message", "content", "output_text", "result"];
+  const candidates = ["reply", "output", "text", "message", "content", "output_text", "result"];
   for (const key of candidates) {
     const val = obj[key];
     if (typeof val === "string") return val;

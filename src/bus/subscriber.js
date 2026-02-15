@@ -1,5 +1,5 @@
 const fs = require("fs");
-const { getTimestamp, isAgentPidAlive, isValidTty, getTtyProcessInfo } = require("./utils");
+const { getTimestamp, isAgentPidAlive, isMetaActive, isValidTty, getTtyProcessInfo } = require("./utils");
 const NicknameManager = require("./nickname");
 const { spawnSync } = require("child_process");
 
@@ -274,16 +274,7 @@ class SubscriberManager {
     if (!this.busData.agents) return [];
 
     return Object.entries(this.busData.agents)
-      .filter(([, meta]) => {
-        if (meta.status !== "active") return false;
-
-        // 检查进程是否存活（如果有 pid）
-        if (meta.pid && !isAgentPidAlive(meta.pid)) {
-          return false;
-        }
-
-        return true;
-      })
+      .filter(([, meta]) => isMetaActive(meta))
       .map(([id, meta]) => ({ id, ...meta }));
   }
 
@@ -310,10 +301,7 @@ class SubscriberManager {
     if (!this.busData.agents) return;
 
     for (const [id, meta] of Object.entries(this.busData.agents)) {
-      // 如果有 PID，检查进程是否存活
-      const ttyInfo = meta.tty ? getTtyProcessInfo(meta.tty) : null;
-      const ttyHasAgent = ttyInfo ? ttyInfo.hasAgent : false;
-      if (meta.pid && !isAgentPidAlive(meta.pid) && !ttyHasAgent && meta.status === "active") {
+      if (meta.status === "active" && !isMetaActive(meta)) {
         meta.status = "inactive";
         meta.last_seen = getTimestamp();
       }

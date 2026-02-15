@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { getUfooPaths } = require("../ufoo/paths");
 const { isMetaActive } = require("../bus/utils");
+const { readReportSummary } = require("../report/store");
 
 function readBus(projectRoot) {
   const busPath = getUfooPaths(projectRoot).agentsFile;
@@ -60,11 +61,28 @@ function isHiddenSubscriber(id, meta) {
   return false;
 }
 
-function buildStatus(projectRoot) {
+function normalizeCronTasks(raw = []) {
+  const items = Array.isArray(raw) ? raw : [];
+  return items.map((task) => ({
+    id: String(task && task.id ? task.id : ""),
+    intervalMs: Number(task && task.intervalMs ? task.intervalMs : 0) || 0,
+    interval: String(task && task.interval ? task.interval : ""),
+    targets: Array.isArray(task && task.targets) ? task.targets.slice() : [],
+    prompt: String(task && task.prompt ? task.prompt : ""),
+    summary: String(task && task.summary ? task.summary : ""),
+    createdAt: Number(task && task.createdAt ? task.createdAt : 0) || 0,
+    lastRunAt: Number(task && task.lastRunAt ? task.lastRunAt : 0) || 0,
+    tickCount: Number(task && task.tickCount ? task.tickCount : 0) || 0,
+  }));
+}
+
+function buildStatus(projectRoot, options = {}) {
   const bus = readBus(projectRoot);
   const decisions = readDecisions(projectRoot);
   const unread = readUnread(projectRoot);
+  const reports = readReportSummary(projectRoot);
   const subscribers = bus ? Object.keys(bus.agents || {}) : [];
+  const cronTasks = normalizeCronTasks(options.cronTasks || []);
 
   const activeEntries = bus
     ? Object.entries(bus.agents || {})
@@ -89,6 +107,11 @@ function buildStatus(projectRoot) {
     active_meta: activeMeta,
     unread,
     decisions,
+    reports,
+    cron: {
+      count: cronTasks.length,
+      tasks: cronTasks,
+    },
   };
 }
 

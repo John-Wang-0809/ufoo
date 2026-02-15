@@ -103,4 +103,43 @@ describe("BusDaemon delivery ownership", () => {
     expect(daemon.injector.inject).toHaveBeenCalledTimes(1);
     expect(daemon.injector.inject).toHaveBeenCalledWith(subscriber, "legacy message");
   });
+
+  test("skips daemon injection for ufoo-code and keeps pending queue", async () => {
+    const subscriber = "ufoo-code:ee8094d2";
+    fs.writeFileSync(
+      agentsFile,
+      JSON.stringify({
+        agents: {
+          [subscriber]: {
+            launch_mode: "",
+            agent_type: "ufoo-code",
+            nickname: "ufoo-code-1",
+            status: "active",
+          },
+        },
+      }),
+      "utf8"
+    );
+
+    writePending(busDir, subscriber, [
+      {
+        seq: 1,
+        event: "message",
+        publisher: "ufoo-agent",
+        target: subscriber,
+        data: { message: "hello ucode" },
+      },
+    ]);
+
+    const daemon = new BusDaemon(busDir, agentsFile, daemonDir, 2000);
+    daemon.injector.inject = jest.fn().mockResolvedValue(undefined);
+
+    await daemon.checkQueues();
+
+    expect(daemon.injector.inject).not.toHaveBeenCalled();
+
+    const pendingFile = path.join(busDir, "queues", safeName(subscriber), "pending.jsonl");
+    const pendingRaw = fs.readFileSync(pendingFile, "utf8");
+    expect(pendingRaw).toContain("hello ucode");
+  });
 });

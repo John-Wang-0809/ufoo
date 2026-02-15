@@ -244,6 +244,19 @@ class BusDaemon {
         console.log(`[daemon] ${now} New message for ${subscriber} (${lastCount} -> ${count})${note}`);
 
         try {
+          const agentType = String((meta && meta.agent_type) || "").trim().toLowerCase();
+          const isUfooCode = subscriber.startsWith("ufoo-code:")
+            || agentType === "ufoo-code"
+            || agentType === "ucode"
+            || agentType === "ufoo";
+          if (isUfooCode) {
+            // ufoo-code queue is consumed internally by ucode itself.
+            // Bus daemon should not inject any command/text into terminal.
+            if (wakeActive) fs.rmSync(wakePath, { force: true });
+            this.setLastCount(safeName, count);
+            continue;
+          }
+
           const events = this.drainPending(pendingFile);
           const failed = [];
           for (const evt of events) {

@@ -90,6 +90,17 @@ describe("chat inputListenerController", () => {
     expect(options.requestCloseAgent).toHaveBeenCalledWith("codex:1");
   });
 
+  test("ctrl+x in non-agents dashboard view delegates to dashboard handler", () => {
+    const { controller, options, textarea } = createHarness({
+      getFocusMode: jest.fn(() => "dashboard"),
+      getDashboardView: jest.fn(() => "cron"),
+    });
+
+    controller.handleKey("", { name: "x", ctrl: true }, textarea);
+    expect(options.handleDashboardKey).toHaveBeenCalledWith({ name: "x", ctrl: true });
+    expect(options.requestCloseAgent).not.toHaveBeenCalled();
+  });
+
   test("shift+enter inserts newline", () => {
     const { controller, options, textarea } = createHarness();
     controller.handleKey("", { name: "enter", shift: true }, textarea);
@@ -155,6 +166,17 @@ describe("chat inputListenerController", () => {
     expect(completionController.show).toHaveBeenCalledWith("/a");
   });
 
+  test("backspace keeps @mention completion active", () => {
+    const { controller, completionController, state, textarea } = createHarness();
+    textarea.value = "@ab";
+    state.cursorPos = 3;
+
+    controller.handleKey("", { name: "backspace" }, textarea);
+
+    expect(textarea.value).toBe("@a");
+    expect(completionController.show).toHaveBeenCalledWith("@a");
+  });
+
   test("printable char inserts and updates completion", () => {
     const { controller, options, completionController, state, textarea } = createHarness();
     textarea.value = "/a";
@@ -168,5 +190,16 @@ describe("chat inputListenerController", () => {
     expect(options.resizeInput).toHaveBeenCalled();
     expect(options.updateDraftFromInput).toHaveBeenCalled();
     expect(completionController.show).toHaveBeenCalledWith("/ab");
+  });
+
+  test("printable char under @mention shows completion", () => {
+    const { controller, completionController, state, textarea } = createHarness();
+    textarea.value = "@a";
+    state.cursorPos = 2;
+
+    controller.handleKey("b", { name: "b" }, textarea);
+
+    expect(textarea.value).toBe("@ab");
+    expect(completionController.show).toHaveBeenCalledWith("@ab");
   });
 });

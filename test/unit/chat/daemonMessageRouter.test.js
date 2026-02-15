@@ -188,4 +188,18 @@ describe("chat daemonMessageRouter", () => {
       "{white-fg}✗{/white-fg} Error: boom"
     );
   });
+
+  test("response with close op triggers status refresh", () => {
+    const { router, options } = createHarness();
+
+    router.handleMessage({
+      type: IPC_RESPONSE_TYPES.RESPONSE,
+      data: {
+        reply: "Closed codex:1",
+        ops: [{ action: "close", agent_id: "codex:1" }],
+      },
+    });
+
+    expect(options.requestStatus).toHaveBeenCalled();
+  });
 });

@@ -1,6 +1,7 @@
 const FALLBACK_LAUNCH_SUBCOMMANDS = [
   { cmd: "claude", desc: "Launch Claude agent" },
   { cmd: "codex", desc: "Launch Codex agent" },
+  { cmd: "ucode", desc: "Launch ucode core agent" },
 ];
 
 function createCompletionController(options = {}) {
@@ -10,6 +11,7 @@ function createCompletionController(options = {}) {
     completionPanel,
     promptBox,
     commandRegistry = [],
+    getMentionCandidates = () => [],
     normalizeCommandPrefix = () => {},
     truncateText = (text) => String(text || ""),
     getCurrentInputHeight = () => 4,
@@ -95,6 +97,41 @@ function createCompletionController(options = {}) {
   }
 
   function buildCommands(filterText) {
+    const mentionMatch = String(filterText || "").match(/^@([^\s]*)$/);
+    if (mentionMatch) {
+      const mentionFilter = String(mentionMatch[1] || "").trim().toLowerCase();
+      const rawCandidates = Array.isArray(getMentionCandidates()) ? getMentionCandidates() : [];
+      const seen = new Set();
+      const items = [];
+      for (const item of rawCandidates) {
+        const id = String(item && item.id ? item.id : "").trim();
+        const label = String(item && item.label ? item.label : id).trim();
+        if (!id && !label) continue;
+        const rawToken = label || id;
+        const normalizedToken = rawToken.replace(/^@+/, "");
+        if (!normalizedToken || /\s/.test(normalizedToken)) continue;
+        const tokenLower = normalizedToken.toLowerCase();
+        const idLower = id.toLowerCase();
+        if (
+          mentionFilter
+          && !tokenLower.startsWith(mentionFilter)
+          && !idLower.startsWith(mentionFilter)
+        ) {
+          continue;
+        }
+        if (seen.has(normalizedToken)) continue;
+        seen.add(normalizedToken);
+        const desc = id && id !== normalizedToken ? id : "";
+        items.push({
+          cmd: `@${normalizedToken}`,
+          desc,
+          isMention: true,
+          mentionTarget: normalizedToken,
+        });
+      }
+      return items.sort((a, b) => a.cmd.localeCompare(b.cmd));
+    }
+
     const endsWithSpace = /\s$/.test(filterText);
     const trimmed = filterText.trim();
     if (!trimmed) {
@@ -209,6 +246,13 @@ function createCompletionController(options = {}) {
     const trimmed = current.trim();
     const endsWithSpace = /\s$/.test(current);
 
+    if (selected.isMention) {
+      const mentionTarget = String(selected.mentionTarget || selected.cmd || "").replace(/^@+/, "");
+      const completedCore = `@${mentionTarget}`;
+      const isComplete = (trimmed === completedCore && endsWithSpace) || trimmed.startsWith(`${completedCore} `);
+      return { text: `${completedCore} `, isComplete };
+    }
+
     if (selected.isSubcommand) {
       const parts = trimmed.split(/\s+/);
       const base = parts[0] || "";
@@ -240,7 +284,10 @@ function createCompletionController(options = {}) {
     if (!state.active || state.commands.length === 0) return;
 
     const selected = state.commands[state.index];
-    if (selected.isSubcommand) {
+    if (selected.isMention) {
+      const mentionTarget = String(selected.mentionTarget || selected.cmd || "").replace(/^@+/, "");
+      input.value = `@${mentionTarget} `;
+    } else if (selected.isSubcommand) {
       const parts = input.value.split(/\s+/);
       parts[parts.length - 1] = selected.cmd;
       input.value = `${parts.join(" ")} `;
@@ -327,6 +374,9 @@ function createCompletionController(options = {}) {
     if (ch === " ") {
       const currentInput = (input.value || "").trim();
       if (currentInput.startsWith("/") && !currentInput.includes(" ")) {
+        return false;
+      }
+      if (currentInput.startsWith("@") && !currentInput.includes(" ")) {
         return false;
       }
       hide();

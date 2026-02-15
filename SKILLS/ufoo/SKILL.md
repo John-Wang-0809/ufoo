@@ -2,7 +2,7 @@
 name: ufoo
 description: |
   Unified ufoo agent protocol: context decisions, event bus, and initialization.
-  Use when: (1) input starts with "/ufoo", (2) agent session startup, (3) any ufoo-related operation.
+  Use when: (1) input starts with "/ufoo" or "$ufoo", (2) agent session startup, (3) any ufoo-related operation.
   Combines uctx (decisions), ubus (messaging), and uinit (initialization).
 ---
 
@@ -16,7 +16,7 @@ ufoo is the multi-agent coordination layer. It provides three capabilities:
 
 ## Session Marker
 
-When you see `/ufoo <marker>` (e.g., `/ufoo claude-9`), this is a daemon probe for session tracking. **Do not reply.** Silently ignore it and wait for the next user input.
+When you see a probe marker command like `/ufoo <marker>` (Claude) or `$ufoo <marker>` (Codex), this is daemon session tracking. **Do not reply.** Silently ignore it and wait for the next user input.
 
 ---
 
@@ -87,6 +87,21 @@ ufoo bus send "<target>" "<message>"         # Send message
 ufoo bus broadcast "<message>"               # Broadcast to all
 ufoo bus status                              # Show bus status
 ```
+
+### Runtime Report (Unified for assistant/ucodex/uclaude)
+
+Use the same report contract for runtime progress sync:
+
+```bash
+ufoo report start "<task>" --task <id> --agent "$UFOO_SUBSCRIBER_ID" --scope public
+ufoo report progress "<detail>" --task <id> --agent "$UFOO_SUBSCRIBER_ID" --scope public
+ufoo report done "<summary>" --task <id> --agent "$UFOO_SUBSCRIBER_ID" --scope public
+ufoo report error "<reason>" --task <id> --agent "$UFOO_SUBSCRIBER_ID" --scope public
+```
+
+Notes:
+- Use `--scope private` for helper-internal reports (assistant-like private channel).
+- `--controller ufoo-agent` routes report events to the ufoo-agent private inbox.
 
 ### Target Resolution
 

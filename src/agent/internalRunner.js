@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const { getUfooPaths } = require("../ufoo/paths");
 const { spawnSync } = require("child_process");
+const EventBus = require("../bus");
 const { runCliAgent } = require("./cliRunner");
 const { normalizeCliOutput } = require("./normalizeOutput");
 
@@ -37,6 +38,30 @@ function safeSubscriber(subscriber) {
   return subscriber.replace(/:/g, "_");
 }
 
+function createBusSender(projectRoot, subscriber) {
+  const eventBus = new EventBus(projectRoot);
+  let sendQueue = Promise.resolve();
+
+  function enqueue(target, message) {
+    if (!target || !message) return;
+    sendQueue = sendQueue
+      .then(() => eventBus.send(target, message, subscriber))
+      .catch(() => {
+        // ignore per-message bus send errors to keep runner loop alive
+      });
+  }
+
+  async function flush() {
+    try {
+      await sendQueue;
+    } catch {
+      // ignore flush errors
+    }
+  }
+
+  return { enqueue, flush };
+}
+
 function drainQueue(queueFile) {
   if (!fs.existsSync(queueFile)) return [];
   const processingFile = `${queueFile}.processing.${process.pid}.${Date.now()}`;
@@ -70,11 +95,20 @@ function drainQueue(queueFile) {
   return content.split(/\r?\n/).filter(Boolean);
 }
 
-async function handleEvent(projectRoot, agentType, provider, model, subscriber, nickname, evt, cliSessionState) {
+async function handleEvent(projectRoot, agentType, provider, model, subscriber, nickname, evt, cliSessionState, busSender) {
   if (!evt || !evt.data || !evt.data.message) return;
   const prompt = evt.data.message;
   const publisher = evt.publisher || "unknown";
   const sandbox = "workspace-write";
+  const streamState = { emitted: false, lastChar: "" };
+
+  const emitStreamDelta = (delta) => {
+    const text = String(delta || "");
+    if (!text) return;
+    streamState.emitted = true;
+    streamState.lastChar = text.slice(-1);
+    busSender.enqueue(publisher, JSON.stringify({ stream: true, delta: text }));
+  };
 
   let res = await runCliAgent({
     provider,
@@ -83,6 +117,7 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
     sessionId: cliSessionState.cliSessionId,
     sandbox,
     cwd: projectRoot,
+    onStreamDelta: emitStreamDelta,
   });
 
   // Handle session errors with immediate retry (only for claude)
@@ -100,6 +135,7 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
         sessionId: null, // Let runCliAgent generate new session
         sandbox,
         cwd: projectRoot,
+        onStreamDelta: emitStreamDelta,
       });
     }
   }
@@ -117,13 +153,25 @@ async function handleEvent(projectRoot, agentType, provider, model, subscriber, 
     reply = `[internal:${agentType}] error: ${res.error || "unknown error"}`;
   }
 
+  if (streamState.emitted) {
+    if (!res.ok) {
+      if (streamState.lastChar !== "\n") {
+        busSender.enqueue(publisher, JSON.stringify({ stream: true, delta: "\n" }));
+      }
+      busSender.enqueue(publisher, JSON.stringify({ stream: true, delta: reply }));
+    }
+    busSender.enqueue(
+      publisher,
+      JSON.stringify({ stream: true, done: true, reason: res.ok ? "complete" : "error" })
+    );
+    await busSender.flush();
+    return;
+  }
+
   if (!reply) return;
 
-  spawnSync("ufoo", ["bus", "send", publisher, reply], {
-    cwd: projectRoot,
-    env: { ...process.env, AI_BUS_PUBLISHER: subscriber },
-    stdio: "ignore",
-  });
+  busSender.enqueue(publisher, reply);
+  await busSender.flush();
 }
 
 async function runInternalRunner({ projectRoot, agentType = "codex" }) {
@@ -133,8 +181,13 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
 
   const queueDir = path.join(getUfooPaths(projectRoot).busQueuesDir, safeSubscriber(subscriber));
   const queueFile = path.join(queueDir, "pending.jsonl");
-  const provider = agentType === "codex" ? "codex-cli" : "claude-cli";
+  const normalizedAgentType = String(agentType || "").trim().toLowerCase();
+  if (normalizedAgentType === "ufoo" || normalizedAgentType === "ucode" || normalizedAgentType === "ufoo-code") {
+    throw new Error("ufoo core is not supported by headless internal runner; use internal-pty");
+  }
+  const provider = normalizedAgentType === "codex" ? "codex-cli" : "claude-cli";
   const model = process.env.UFOO_AGENT_MODEL || "";
+  const busSender = createBusSender(projectRoot, subscriber);
 
   // Session state management for CLI continuity
   // Use stable path based on nickname (if exists) or agent type, NOT subscriber ID
@@ -206,7 +259,17 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
 
           for (const evt of events) {
             // eslint-disable-next-line no-await-in-loop
-            await handleEvent(projectRoot, parsedAgentType, provider, model, subscriber, nickname, evt, cliSessionState);
+            await handleEvent(
+              projectRoot,
+              parsedAgentType,
+              provider,
+              model,
+              subscriber,
+              nickname,
+              evt,
+              cliSessionState,
+              busSender
+            );
           }
 
           // Persist CLI session state after processing (only if changed and for claude)
@@ -236,4 +299,8 @@ async function runInternalRunner({ projectRoot, agentType = "codex" }) {
   }
 }
 
-module.exports = { runInternalRunner };
+module.exports = {
+  runInternalRunner,
+  createBusSender,
+  handleEvent,
+};

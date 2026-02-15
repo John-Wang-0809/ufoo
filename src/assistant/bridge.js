@@ -1,10 +1,20 @@
 const { spawn } = require("child_process");
+const path = require("path");
 
 function resolveAssistantCommand() {
   const raw = String(process.env.UFOO_ASSISTANT_CMD || "ufoo-assistant-agent").trim();
+  if (!raw || raw === "ufoo-assistant-agent") {
+    return {
+      command: process.execPath,
+      args: [path.resolve(__dirname, "../../bin/ufoo-assistant-agent.js")],
+    };
+  }
   const parts = raw.split(/\s+/).filter(Boolean);
   if (parts.length === 0) {
-    return { command: "ufoo-assistant-agent", args: [] };
+    return {
+      command: process.execPath,
+      args: [path.resolve(__dirname, "../../bin/ufoo-assistant-agent.js")],
+    };
   }
   return { command: parts[0], args: parts.slice(1) };
 }
@@ -54,6 +64,7 @@ function normalizeResponse(parsed, fallbackError = "") {
 async function runAssistantTask({
   projectRoot,
   provider = "",
+  fallbackProvider = "",
   model = "",
   task = "",
   kind = "mixed",
@@ -68,6 +79,7 @@ async function runAssistantTask({
       request_id: `assistant-${startedAt}`,
       project_root: projectRoot,
       provider,
+      fallback_provider: fallbackProvider,
       model,
       task,
       kind,
@@ -156,4 +168,5 @@ module.exports = {
   runAssistantTask,
   parseAssistantOutput,
   normalizeResponse,
+  resolveAssistantCommand,
 };

@@ -9,8 +9,9 @@ function neutralizeBlessedCommaTags(text) {
 }
 
 function escapeBlessed(text) {
-  if (text == null) return "{escape}{/escape}";
+  if (text == null) return "";
   const raw = neutralizeBlessedCommaTags(text);
+  if (!raw) return "";
   // Avoid allowing payload to terminate escape mode.
   const safe = raw.replace(/\{\/escape\}/g, "{open}/escape{close}");
   return `{escape}${safe}{/escape}`;
