@@ -40,7 +40,6 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
-    "import:pi-mono": "node scripts/import-pi-mono.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage"
