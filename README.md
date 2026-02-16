@@ -1,5 +1,7 @@
 # ufoo
 
+[中文文档](README.zh-CN.md)
+
 🤖 Multi-agent AI collaboration framework for orchestrating Claude Code, OpenAI Codex, and custom AI agents.
 
 📦 **npm**: [https://www.npmjs.com/package/u-foo](https://www.npmjs.com/package/u-foo)

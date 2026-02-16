@@ -1,6 +1,8 @@
 # ufoo
 
-多Agent AI 协作工具包，支持 Claude Code 和 OpenAI Codex。
+[English](README.md)
+
+🤖 多Agent AI 协作框架，支持 Claude Code、OpenAI Codex 和自定义 AI Agent 的编排协作。
 
 ## 功能特性
 
