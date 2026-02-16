@@ -22,6 +22,7 @@
       <nav class="nav">
         <a href="docs.html" class="nav-link">Docs</a>
         <a href="https://github.com/Icyoung/ufoo" class="nav-link">GitHub</a>
+        <a href="https://www.npmjs.com/package/u-foo" class="nav-link">npm</a>
         <a href="#getting-started" class="nav-cta">Get Started</a>
       </nav>
     </div>
@@ -37,7 +38,7 @@
 
       <div class="badge">
         <span class="badge-dot"></span>
-        <span>v1.0.6 // works with Claude Code &amp; Codex CLI</span>
+        <span>v1.2.3 // works with Claude Code, Codex CLI &amp; ucode</span>
       </div>
 
       <h1 class="hero-title">Just Add <span class="highlight">u</span>.<br>That's It.</h1>
@@ -60,7 +61,7 @@
         </div>
         <div class="terminal-content">
           <div class="line"><span class="prompt">$</span> npm install <span class="u">u</span><span class="white">-foo</span></div>
-          <div class="line success">+ u-foo@1.0.6 installed in 0.8s</div>
+          <div class="line success">+ u-foo@1.2.3 installed in 0.8s</div>
           <div class="line"><span class="prompt">$</span> <span class="u">u</span><span class="white">foo</span><span class="dim"> init</span></div>
           <div class="line success">✓ Workspace ready at .ufoo/</div>
           <div class="line spacer"></div>
@@ -69,11 +70,14 @@
           <div class="line spacer"></div>
           <div class="line"><span class="prompt">$</span> <span class="u">u</span><span class="white">codex</span><span class="dim"> --nickname </span><span class="u">dev</span></div>
           <div class="line"><span class="dim">[</span><span class="u">u</span><span class="purple">bus</span><span class="dim">]</span> <span class="dim">@dev joined workspace</span></div>
-          <div class="line"><span class="dim">[</span><span class="u">u</span><span class="purple">bus</span><span class="dim">]</span> <span class="success">@pm ↔ @dev routing enabled ✓</span></div>
+          <div class="line spacer"></div>
+          <div class="line"><span class="prompt">$</span> <span class="u">u</span><span class="white">code</span></div>
+          <div class="line"><span class="dim">[</span><span class="u">u</span><span class="purple">bus</span><span class="dim">]</span> <span class="dim">@ucode-1 joined workspace</span></div>
+          <div class="line"><span class="dim">[</span><span class="u">u</span><span class="purple">bus</span><span class="dim">]</span> <span class="success">@pm ↔ @dev ↔ @ucode-1 routing enabled ✓</span></div>
         </div>
       </div>
 
-      <p class="hero-note"># npm install u-foo &amp;&amp; uclaude. that's the entire learning curve.</p>
+      <p class="hero-note"># npm install -g u-foo &amp;&amp; uclaude. that's the entire learning curve.</p>
     </div>
   </section>
 
@@ -92,7 +96,8 @@
         <p>Don't change your workflow. Just add '<span class="u">u</span>' prefix.</p>
         <div class="feature-code">
           <code>$ claude → $ <span class="u">u</span>claude</code><br>
-          <code>$ codex → $ <span class="u">u</span>codex</code>
+          <code>$ codex → $ <span class="u">u</span>codex</code><br>
+          <code>$ <span class="u">u</span>code <span class="dim"># built-in coding agent</span></code>
         </div>
         <p class="feature-note">That's it. <span class="u">u</span><span class="purple">bus</span> auto-communication and <span class="u">u</span><span class="purple">ctx</span> context sharing are enabled by default.</p>
       </div>
@@ -239,7 +244,7 @@
 
     <div class="footer-bottom">
       <span>© 2026 UFOO Protocol // Built by humans, orchestrated by agents</span>
-      <span>git:master @ v1.0.6</span>
+      <span>git:master @ v1.2.3</span>
     </div>
   </footer>
 

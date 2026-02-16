@@ -23,7 +23,7 @@
       <nav class="nav">
         <a href="docs.html" class="nav-link active">Docs</a>
         <a href="https://github.com/Icyoung/ufoo" class="nav-link">GitHub</a>
-        <a href="index.html#whats-new" class="nav-link">Changelog</a>
+        <a href="https://www.npmjs.com/package/u-foo" class="nav-link">npm</a>
         <a href="index.html#getting-started" class="nav-cta">Get Started</a>
       </nav>
     </div>
@@ -44,6 +44,7 @@
           <a href="#commands" class="docs-nav-link">Commands</a>
           <a href="#uclaude" class="docs-nav-link">uclaude</a>
           <a href="#ucodex" class="docs-nav-link">ucodex</a>
+          <a href="#ucode" class="docs-nav-link">ucode</a>
         </div>
         <div class="docs-nav-section">
           <h5>Core Modules</h5>
@@ -89,11 +90,11 @@
         <p>Verify installation:</p>
         <div class="docs-code">
           <pre><code><span class="prompt">$</span> ufoo --version
-<span class="success">1.0.6</span>
+<span class="success">1.2.3</span>
 
 <span class="prompt">$</span> ufoo doctor
 <span class="success">&#x2713;</span> Node.js v22.x detected
-<span class="success">&#x2713;</span> u-foo@1.0.6 installed globally
+<span class="success">&#x2713;</span> u-foo@1.2.3 installed globally
 <span class="success">&#x2713;</span> claude CLI found
 <span class="success">&#x2713;</span> codex CLI found</code></pre>
         </div>
@@ -151,7 +152,7 @@
         <p>UFOO creates a shared workspace layer between AI agents:</p>
 
         <div class="docs-code arch-diagram">
-          <pre><code>  <span class="u">uclaude</span>          <span class="u">ucodex</span>          <span class="dim">other...</span>
+          <pre><code>  <span class="u">uclaude</span>          <span class="u">ucodex</span>          <span class="u">ucode</span>
      |                |                |
      &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x252c;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;
                       |
@@ -374,6 +375,24 @@
         <p>Works exactly like <code>uclaude</code> but launches the Codex CLI instead.</p>
       </section>
 
+      <!-- ucode -->
+      <section id="ucode" class="docs-section">
+        <h1><span class="u">u</span>code</h1>
+        <p>Built-in self-developed coding agent. Supports multi-turn conversations, streaming output, and native tool execution (read, write, edit, bash).</p>
+
+        <div class="docs-code">
+          <pre><code><span class="prompt">$</span> ucode
+
+<span class="dim">Options:</span>
+  --tui               Launch interactive TUI mode (default)
+  --provider &lt;name&gt;   Set LLM provider (openai, anthropic)
+  --model &lt;name&gt;      Set model name
+  --resume &lt;id&gt;       Resume a previous session</code></pre>
+        </div>
+
+        <p>ucode joins the workspace bus automatically and can receive tasks from other agents via <code>/ubus</code>.</p>
+      </section>
+
       <!-- Event Bus -->
       <section id="event-bus" class="docs-section">
         <h1>Event Bus</h1>
@@ -459,7 +478,7 @@
 <span class="success">&#x2713;</span> Daemon stopped</code></pre>
         </div>
 
-        <h3>v1.0.6: Single Daemon Guarantee</h3>
+        <h3>Single Daemon Guarantee</h3>
         <p>Only one daemon instance runs per workspace. The system detects and prevents duplicate daemons, resolving the multi-daemon conflicts present in earlier versions.</p>
       </section>
 
@@ -527,7 +546,7 @@
       <!-- Ready Detection -->
       <section id="ready-detection" class="docs-section">
         <h1>Ready Detection</h1>
-        <p>Introduced in v1.0.5, the ReadyDetector monitors PTY output to determine when an agent is ready to accept input.</p>
+        <p>The ReadyDetector monitors PTY output to determine when an agent is ready to accept input.</p>
 
         <h3>Detection Strategy</h3>
         <div class="docs-code">
@@ -572,7 +591,7 @@
 
       <!-- Footer inside docs -->
       <div class="docs-footer">
-        <p>UFOO v1.0.6 &mdash; <a href="https://github.com/Icyoung/ufoo">GitHub</a> &middot; <a href="https://www.npmjs.com/package/u-foo">npm</a></p>
+        <p>UFOO v1.2.3 &mdash; <a href="https://github.com/Icyoung/ufoo">GitHub</a> &middot; <a href="https://www.npmjs.com/package/u-foo">npm</a></p>
       </div>
     </main>
   </div>
